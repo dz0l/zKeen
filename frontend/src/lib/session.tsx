@@ -109,12 +109,16 @@ async function loadAuthenticatedData(
   setVersions(versionRes);
 
   const saved = loadClashConnection();
-  if (saved.port || saved.unix) {
-    setClash(saved);
-  } else {
-    const detected = await detectClashFromConfig();
-    setClash(detected ?? saved);
-  }
+  const detected = await detectClashFromConfig();
+  const merged = detected
+    ? {
+        port: detected.port || saved.port || "9090",
+        secret: detected.secret ?? saved.secret ?? "",
+        unix: detected.unix ?? saved.unix ?? "",
+      }
+    : saved;
+  saveClashConnection(merged);
+  setClash(merged);
 }
 
 export function SessionProvider({ children }: { children: ReactNode }) {

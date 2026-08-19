@@ -7,7 +7,7 @@ import { useT } from "../lib/i18n";
 
 export function OnboardingGate({ children }: { children: React.ReactNode }) {
   const t = useT();
-  const { booting, clash } = useSession();
+  const { booting, clash, setClash, refreshSession } = useSession();
   const [done, setDone] = useState(isOnboardingComplete);
   const [url, setUrl] = useState("");
   const [hwid, setHwid] = useState("");
@@ -23,8 +23,10 @@ export function OnboardingGate({ children }: { children: React.ReactNode }) {
     setError("");
     try {
       if (!skipUrl && url.trim()) {
-        await applySubscriptionUrl(url.trim(), clash, hwid.trim());
+        const result = await applySubscriptionUrl(url.trim(), clash, hwid.trim());
+        setClash(result.clash);
       }
+      await refreshSession();
       completeOnboarding();
       setDone(true);
     } catch (err) {

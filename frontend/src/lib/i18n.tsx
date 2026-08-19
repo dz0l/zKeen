@@ -215,6 +215,9 @@ const translations: Translations = {
 
     // Proxies API
     "proxies.loadError": "Не удалось загрузить proxy-группы",
+    "proxies.mihomoOffline": "Mihomo не отвечает на Clash API (порт 9090). Ядро не запущено или активен другой core.",
+    "proxies.startMihomo": "Запустить mihomo",
+    "proxies.startError": "Не удалось запустить mihomo",
     "proxies.switchError": "Не удалось переключить узел",
 
     // Status API
@@ -451,6 +454,9 @@ const translations: Translations = {
     "auth.passwordMismatch": "Passwords do not match",
     "auth.failed": "Authentication failed",
     "proxies.loadError": "Failed to load proxy groups",
+    "proxies.mihomoOffline": "Mihomo Clash API (port 9090) is not reachable. Core is stopped or another core is active.",
+    "proxies.startMihomo": "Start mihomo",
+    "proxies.startError": "Failed to start mihomo",
     "proxies.switchError": "Failed to switch node",
     "status.actionError": "Action failed",
     "settings.saveClash": "Save Clash API",

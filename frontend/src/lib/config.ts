@@ -1,4 +1,10 @@
-import { apiJson, clashJson, type ClashConnection } from "./api";
+import { ApiError, apiJson, clashJson, parseClashFromYaml, saveClashConnection, type ClashConnection } from "./api";
+
+export interface ControlInfo {
+  cores: string[];
+  currentCore: string;
+  running: boolean;
+}
 
 export interface ConfigItem {
   file: string;
@@ -56,6 +62,83 @@ export async function saveMihomoConfig(
   });
 }
 
+function mergeClashConnection(
+  clash: ClashConnection,
+  parsed: Partial<ClashConnection>,
+): ClashConnection {
+  return {
+    port: parsed.port || clash.port || "9090",
+    secret: parsed.secret ?? clash.secret ?? "",
+    unix: parsed.unix ?? clash.unix ?? "",
+  };
+}
+
+async function resolveClashConnection(clash: ClashConnection): Promise<ClashConnection> {
+  const loaded = await fetchMihomoConfig();
+  if (!loaded) return clash;
+  const parsed = parseClashFromYaml(loaded.content);
+  const merged = mergeClashConnection(clash, parsed);
+  saveClashConnection(merged);
+  return merged;
+}
+
+export async function waitForClashApi(
+  clash: ClashConnection,
+  attempts = 24,
+  delayMs = 500,
+): Promise<void> {
+  let lastError: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await clashJson<{ version?: string }>("version", clash);
+      return;
+    } catch (err) {
+      lastError = err;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastError instanceof ApiError
+    ? lastError
+    : new ApiError(502, "Mihomo API not reachable on 127.0.0.1:9090");
+}
+
+/** Switch to mihomo and wait until Clash API responds (zashboard talks to a running core). */
+export async function ensureMihomoRunning(clash: ClashConnection): Promise<ClashConnection> {
+  const conn = await resolveClashConnection(clash);
+  const control = await apiJson<ControlInfo & { success: boolean }>("/api/control");
+
+  if (control.currentCore !== "mihomo") {
+    await apiJson("/api/control", {
+      method: "POST",
+      body: JSON.stringify({ action: "switchCore", core: "mihomo" }),
+    });
+  } else {
+    try {
+      await clashJson("version", conn);
+      return conn;
+    } catch {
+      await apiJson("/api/control", {
+        method: "POST",
+        body: JSON.stringify({ action: "start" }),
+      });
+    }
+  }
+
+  await waitForClashApi(conn);
+  return conn;
+}
+
+export function isClashConnectionError(err: unknown): boolean {
+  if (!(err instanceof ApiError)) return false;
+  const msg = err.message.toLowerCase();
+  return (
+    msg.includes("error sending request") ||
+    msg.includes("connection refused") ||
+    msg.includes("not reachable") ||
+    msg.includes("connect timeout")
+  );
+}
+
 async function reloadMihomoCore(): Promise<void> {
   try {
     await apiJson("/api/control", {
@@ -74,18 +157,17 @@ export async function reloadClashConfig(clash: ClashConnection): Promise<void> {
   });
 }
 
-/** zashboard-style: reload config on disk, then refresh proxy-provider */
-export async function applyMihomoConfigChanges(clash: ClashConnection): Promise<void> {
+/** zashboard-style: ensure mihomo is up, reload config, refresh proxy-provider */
+export async function applyMihomoConfigChanges(clash: ClashConnection): Promise<ClashConnection> {
+  const conn = await ensureMihomoRunning(clash);
   try {
-    await reloadClashConfig(clash);
+    await reloadClashConfig(conn);
   } catch {
     await reloadMihomoCore();
+    await waitForClashApi(conn);
   }
-  try {
-    await refreshProxyProvider(DEFAULT_PROVIDER, clash);
-  } catch {
-    /* provider refresh optional if core still reloading */
-  }
+  await refreshProxyProvider(DEFAULT_PROVIDER, conn);
+  return conn;
 }
 
 export async function refreshProxyProvider(
@@ -189,7 +271,7 @@ export async function applySubscriptionUrl(
   url: string,
   clash: ClashConnection,
   hwid = "",
-): Promise<{ path: string }> {
+): Promise<{ path: string; clash: ClashConnection }> {
   const loaded = await fetchMihomoConfig();
   if (!loaded) {
     throw new Error(
@@ -198,6 +280,8 @@ export async function applySubscriptionUrl(
   }
   const updated = updateSubscriptionProvider(loaded.content, { url, hwid });
   await saveMihomoConfig(loaded.path, updated, false);
-  await applyMihomoConfigChanges(clash);
-  return { path: normalizeMihomoConfigPath(loaded.path) };
+  return {
+    path: normalizeMihomoConfigPath(loaded.path),
+    clash: await applyMihomoConfigChanges(clash),
+  };
 }

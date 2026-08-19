@@ -5,14 +5,14 @@ import { useT } from "../lib/i18n";
 import { useMihomoConfig } from "../lib/useMihomoConfig";
 import { useSession } from "../lib/session";
 import { ApiError } from "../lib/api";
-import { DEFAULT_PROVIDER, applyMihomoConfigChanges, refreshProxyProvider } from "../lib/config";
+import { DEFAULT_PROVIDER, applyMihomoConfigChanges, ensureMihomoRunning, refreshProxyProvider } from "../lib/config";
 
 type ConfigTab = "editor" | "quick";
 
 export function ConfigPage() {
   const { mode } = useApp();
   const t = useT();
-  const { clash } = useSession();
+  const { clash, setClash, refreshSession } = useSession();
   const cfg = useMihomoConfig();
   const [tab, setTab] = useState<ConfigTab>(mode === "safe" ? "quick" : "editor");
   const [validated, setValidated] = useState<boolean | null>(null);
@@ -77,7 +77,9 @@ export function ConfigPage() {
     setActionError("");
     try {
       await cfg.save(false);
-      await applyMihomoConfigChanges(clash);
+      const conn = await applyMihomoConfigChanges(clash);
+      setClash(conn);
+      await refreshSession();
       setValidated(null);
     } catch (err) {
       setActionError(err instanceof ApiError ? err.message : t("config.saveError"));
@@ -288,7 +290,7 @@ function QuickSettingsTab({
   saving: boolean;
 }) {
   const t = useT();
-  const { clash } = useSession();
+  const { clash, setClash } = useSession();
   const [refreshing, setRefreshing] = useState(false);
   const [localError, setLocalError] = useState("");
 
@@ -296,7 +298,9 @@ function QuickSettingsTab({
     setRefreshing(true);
     setLocalError("");
     try {
-      await refreshProxyProvider(DEFAULT_PROVIDER, clash);
+      const conn = await ensureMihomoRunning(clash);
+      setClash(conn);
+      await refreshProxyProvider(DEFAULT_PROVIDER, conn);
     } catch (err) {
       setLocalError(err instanceof ApiError ? err.message : t("config.refreshError"));
     } finally {

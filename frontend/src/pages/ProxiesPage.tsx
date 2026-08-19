@@ -4,6 +4,7 @@ import { IconChevron } from "../components/icons";
 import { useT } from "../lib/i18n";
 import { useSession } from "../lib/session";
 import { ApiError, clashJson } from "../lib/api";
+import { ensureMihomoRunning, isClashConnectionError } from "../lib/config";
 import {
   isProxyGroup,
   type ClashDelayResponse,
@@ -50,7 +51,7 @@ function selectedMap(data: ClashProxiesResponse): Record<string, string> {
 
 export function ProxiesPage() {
   const t = useT();
-  const { clash, settings } = useSession();
+  const { clash, setClash, settings } = useSession();
   const [groups, setGroups] = useState<ProxyGroup[]>([]);
   const [selected, setSelected] = useState<Record<string, string>>({});
   const [delays, setDelays] = useState<Record<string, number>>({});
@@ -58,22 +59,44 @@ export function ProxiesPage() {
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [offline, setOffline] = useState(false);
+  const [starting, setStarting] = useState(false);
   const [busy, setBusy] = useState("");
   const [testing, setTesting] = useState(false);
 
   const loadProxies = useCallback(async () => {
     setLoading(true);
     setError("");
+    setOffline(false);
     try {
       const data = await clashJson<ClashProxiesResponse>("proxies", clash);
       setGroups(mapGroups(data));
       setSelected(selectedMap(data));
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : t("proxies.loadError"));
+      if (isClashConnectionError(err)) {
+        setOffline(true);
+        setError(t("proxies.mihomoOffline"));
+      } else {
+        setError(err instanceof ApiError ? err.message : t("proxies.loadError"));
+      }
     } finally {
       setLoading(false);
     }
   }, [clash, t]);
+
+  const startMihomo = useCallback(async () => {
+    setStarting(true);
+    setError("");
+    try {
+      const conn = await ensureMihomoRunning(clash);
+      setClash(conn);
+      await loadProxies();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : t("proxies.startError"));
+    } finally {
+      setStarting(false);
+    }
+  }, [clash, setClash, loadProxies, t]);
 
   useEffect(() => {
     loadProxies();
@@ -179,8 +202,13 @@ export function ProxiesPage() {
   return (
     <div className="page-enter space-y-4">
       {error && (
-        <div className="rounded-xl border border-zk-coral/25 bg-zk-coral/10 px-3 py-2 text-center text-xs text-zk-coral">
-          {error}
+        <div className="rounded-xl border border-zk-coral/25 bg-zk-coral/10 px-3 py-3 text-center text-xs text-zk-coral space-y-2">
+          <p>{error}</p>
+          {offline && (
+            <Button size="sm" variant="primary" disabled={starting} onClick={startMihomo}>
+              {starting ? t("app.loading") : t("proxies.startMihomo")}
+            </Button>
+          )}
         </div>
       )}
 
