@@ -5,13 +5,14 @@ import { useT } from "../lib/i18n";
 import { useMihomoConfig } from "../lib/useMihomoConfig";
 import { useSession } from "../lib/session";
 import { ApiError } from "../lib/api";
-import { DEFAULT_PROVIDER, refreshProxyProvider } from "../lib/config";
+import { DEFAULT_PROVIDER, applyMihomoConfigChanges, refreshProxyProvider } from "../lib/config";
 
 type ConfigTab = "editor" | "quick";
 
 export function ConfigPage() {
   const { mode } = useApp();
   const t = useT();
+  const { clash } = useSession();
   const cfg = useMihomoConfig();
   const [tab, setTab] = useState<ConfigTab>(mode === "safe" ? "quick" : "editor");
   const [validated, setValidated] = useState<boolean | null>(null);
@@ -66,6 +67,20 @@ export function ConfigPage() {
     } catch (err) {
       setActionError(err instanceof ApiError ? err.message : t("config.saveError"));
       if (validate) setValidated(false);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleApplySubscription() {
+    setSaving(true);
+    setActionError("");
+    try {
+      await cfg.save(false);
+      await applyMihomoConfigChanges(clash);
+      setValidated(null);
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : t("config.saveError"));
     } finally {
       setSaving(false);
     }
@@ -140,7 +155,7 @@ export function ConfigPage() {
           subscriptionHwid={cfg.subscriptionHwid}
           onSubscriptionChange={cfg.updateSubscriptionUrl}
           onSubscriptionHwidChange={cfg.updateSubscriptionHwid}
-          onSaveSubscription={() => handleSave(true)}
+          onSaveSubscription={handleApplySubscription}
           dirty={cfg.dirty}
           saving={saving}
         />

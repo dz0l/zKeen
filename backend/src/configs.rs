@@ -227,10 +227,15 @@ pub async fn put_config(
         }
 
         if let Err(err_msg) = validate_core(core_type, &validate_files).await {
-            log("ERROR", err_msg);
+            log("ERROR", err_msg.clone());
+            let detail = truncate_validation_error(&err_msg);
             return Json(ApiResponse::<()> {
                 success: false,
-                error: Some("Validation failed".into()),
+                error: Some(if detail.is_empty() {
+                    "Validation failed".into()
+                } else {
+                    format!("Validation failed: {detail}")
+                }),
                 data: None,
             });
         }
@@ -346,6 +351,42 @@ pub async fn patch_config(State(state): State<AppState>, Json(req): Json<RenameR
 }
 
 async fn validate_core(core: &str, files: &[ConfigReq]) -> Result<(), String> {
+    if core == "mihomo" {
+        let content = files
+            .iter()
+            .find(|f| {
+                f.file.ends_with(".yaml")
+                    || f.file.ends_with(".yml")
+                    || f.file.ends_with("config.yaml")
+            })
+            .map(|f| f.content.as_str())
+            .unwrap_or(&files[0].content);
+
+        let validate_path = Path::new(MIHOMO_CONF_DIR).join(".zkeen-validate.yaml");
+        tokio::fs::create_dir_all(MIHOMO_CONF_DIR)
+            .await
+            .map_err(|e| e.to_string())?;
+        tokio::fs::write(&validate_path, content)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let mut cmd = tokio::process::Command::new("mihomo");
+        cmd.args(["-t", "-f"]).arg(&validate_path);
+        cmd.env("CLASH_HOME_DIR", MIHOMO_CONF_DIR);
+
+        let output = cmd.output().await;
+        _ = tokio::fs::remove_file(&validate_path).await;
+
+        let output = output.map_err(|e| e.to_string())?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        return Err(combined);
+    }
+
     let temp_dir = std::env::temp_dir().join(format!(
         "xkeen-validate-{}-{}",
         std::process::id(),
@@ -366,22 +407,11 @@ async fn validate_core(core: &str, files: &[ConfigReq]) -> Result<(), String> {
         }
     }
 
-    let mut command = match core {
-        "mihomo" => {
-            let mut cmd = tokio::process::Command::new("mihomo");
-            cmd.args(["-t", "-f"]).arg(temp_dir.join("config.yaml"));
-            cmd.env("CLASH_HOME_DIR", MIHOMO_CONF_DIR);
-            cmd
-        }
-        _ => {
-            let mut cmd = tokio::process::Command::new("xray");
-            cmd.args(["-test", "-confdir"]).arg(&temp_dir);
-            cmd.env("XRAY_LOCATION_ASSET", XRAY_ASSET_DIR);
-            cmd
-        }
-    };
+    let mut cmd = tokio::process::Command::new("xray");
+    cmd.args(["-test", "-confdir"]).arg(&temp_dir);
+    cmd.env("XRAY_LOCATION_ASSET", XRAY_ASSET_DIR);
 
-    let output = command.output().await;
+    let output = cmd.output().await;
     _ = tokio::fs::remove_dir_all(&temp_dir).await;
 
     let output = output.map_err(|e| e.to_string())?;
@@ -392,4 +422,19 @@ async fn validate_core(core: &str, files: &[ConfigReq]) -> Result<(), String> {
     let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
     combined.push_str(&String::from_utf8_lossy(&output.stderr));
     Err(combined)
+}
+
+fn truncate_validation_error(raw: &str) -> String {
+    let lines: Vec<&str> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let tail: Vec<&str> = lines.iter().copied().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect();
+    let summary = tail.join(" · ");
+    if summary.len() > 240 {
+        summary.chars().rev().take(240).collect::<String>().chars().rev().collect()
+    } else {
+        summary
+    }
 }

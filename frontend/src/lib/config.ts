@@ -67,6 +67,27 @@ async function reloadMihomoCore(): Promise<void> {
   }
 }
 
+export async function reloadClashConfig(clash: ClashConnection): Promise<void> {
+  await clashJson("configs?reload=true", clash, {
+    method: "PUT",
+    body: JSON.stringify({ path: "", payload: "" }),
+  });
+}
+
+/** zashboard-style: reload config on disk, then refresh proxy-provider */
+export async function applyMihomoConfigChanges(clash: ClashConnection): Promise<void> {
+  try {
+    await reloadClashConfig(clash);
+  } catch {
+    await reloadMihomoCore();
+  }
+  try {
+    await refreshProxyProvider(DEFAULT_PROVIDER, clash);
+  } catch {
+    /* provider refresh optional if core still reloading */
+  }
+}
+
 export async function refreshProxyProvider(
   providerName: string,
   clash: ClashConnection,
@@ -76,7 +97,11 @@ export async function refreshProxyProvider(
   });
 }
 
-const providerBlockRe = (provider: string) => new RegExp(`\\n  ${provider}:\\n(?:    [^\\n]*\\n)+`, "m");
+const providerBlockRe = (provider: string) =>
+  new RegExp(
+    `\\n  ${provider}:[\\s\\S]*?(?=\\n  [a-zA-Z][\\w-]*:|\\nproxies:|\\nproxy-groups:|\\nrules:|\\ndns:|\\ngeox-url:)`,
+    "m",
+  );
 
 function buildProviderBlock(provider: string, url: string, hwid: string): string {
   const hwidSection = hwid ? `\n      x-hwid:\n        - "${hwid}"` : "";
@@ -172,12 +197,7 @@ export async function applySubscriptionUrl(
     );
   }
   const updated = updateSubscriptionProvider(loaded.content, { url, hwid });
-  await saveMihomoConfig(loaded.path, updated, true);
-  await reloadMihomoCore();
-  try {
-    await refreshProxyProvider(DEFAULT_PROVIDER, clash);
-  } catch {
-    /* provider refresh optional if core still reloading */
-  }
+  await saveMihomoConfig(loaded.path, updated, false);
+  await applyMihomoConfigChanges(clash);
   return { path: normalizeMihomoConfigPath(loaded.path) };
 }
