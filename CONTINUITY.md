@@ -13,10 +13,10 @@
 - mipsel: `build-std = true` в `backend/Cross.toml`.
 
 ## State:
-- CI: workflow YAML invalid — `uses: dtolnay/rust-toolchain@${{ matrix.toolchain }}` не поддерживается Actions.
+- CI: aarch64 OK; mipsel FAIL — `panic_abort` не входил в build-std при `panic = "abort"`.
 
 ## Now:
-- fix(ci): toolchain через input, перезапуск release v0.0.1.
+- fix(ci): build-std = ["std", "panic_abort"] для mipsel, перезапуск v0.0.1.
 
 ## Next:
 - Проверить успешный CI и Release v0.0.1.

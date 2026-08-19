@@ -5,6 +5,6 @@ pre-build = ["ln -s /usr/local/lib/gcc/mips-linux-muslsf/9.2.0/libgcc.a /usr/loc
 [target.mipsel-unknown-linux-musl]
 image = "ghcr.io/cross-rs/mipsel-unknown-linux-musl:edge"
 pre-build = ["ln -s /usr/local/lib/gcc/mipsel-linux-muslsf/9.2.0/libgcc.a /usr/local/lib/gcc/mipsel-linux-muslsf/9.2.0/libunwind.a"]
-build-std = true
+build-std = ["std", "panic_abort"]
 
 [target.mipsel-unknown-linux-gnu]
