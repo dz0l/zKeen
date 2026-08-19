@@ -4,9 +4,13 @@ import { IconChevron } from "../components/icons";
 import { useT } from "../lib/i18n";
 import { useSession } from "../lib/session";
 import { ApiError, clashJson } from "../lib/api";
-import { ensureMihomoRunning, isClashConnectionError } from "../lib/config";
+import { ensureMihomoRunning, fetchMihomoConfig, isClashConnectionError } from "../lib/config";
 import {
-  isProxyGroup,
+  buildProxyNameSets,
+  collectBulkServerOptions,
+  filterGroupMembers,
+  isUserProxyGroup,
+  parseGroupIcons,
   type ClashDelayResponse,
   type ClashProxiesResponse,
 } from "../lib/clash";
@@ -20,6 +24,7 @@ interface ProxyGroup {
   name: string;
   type: string;
   nodes: ProxyNode[];
+  icon?: string;
 }
 
 function delayColor(ms: number) {
@@ -28,13 +33,15 @@ function delayColor(ms: number) {
   return "text-zk-coral";
 }
 
-function mapGroups(data: ClashProxiesResponse): ProxyGroup[] {
+function mapGroups(data: ClashProxiesResponse, icons: Record<string, string>): ProxyGroup[] {
+  const { groupNames } = buildProxyNameSets(data);
   return Object.values(data.proxies)
-    .filter(isProxyGroup)
+    .filter(isUserProxyGroup)
     .map((g) => ({
       name: g.name,
       type: g.type,
-      nodes: (g.all ?? []).map((name) => ({ name })),
+      icon: icons[g.name],
+      nodes: filterGroupMembers(g.all, groupNames).map((name) => ({ name })),
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -42,7 +49,7 @@ function mapGroups(data: ClashProxiesResponse): ProxyGroup[] {
 function selectedMap(data: ClashProxiesResponse): Record<string, string> {
   const map: Record<string, string> = {};
   for (const item of Object.values(data.proxies)) {
-    if (isProxyGroup(item) && item.now) {
+    if (isUserProxyGroup(item) && item.now) {
       map[item.name] = item.now;
     }
   }
@@ -53,6 +60,8 @@ export function ProxiesPage() {
   const t = useT();
   const { clash, setClash, settings } = useSession();
   const [groups, setGroups] = useState<ProxyGroup[]>([]);
+  const [bulkServers, setBulkServers] = useState<string[]>(["DIRECT"]);
+  const [bulkServer, setBulkServer] = useState("DIRECT");
   const [selected, setSelected] = useState<Record<string, string>>({});
   const [delays, setDelays] = useState<Record<string, number>>({});
   const [expanded, setExpanded] = useState("");
@@ -69,8 +78,13 @@ export function ProxiesPage() {
     setError("");
     setOffline(false);
     try {
-      const data = await clashJson<ClashProxiesResponse>("proxies", clash);
-      setGroups(mapGroups(data));
+      const [data, config] = await Promise.all([
+        clashJson<ClashProxiesResponse>("proxies", clash),
+        fetchMihomoConfig().catch(() => null),
+      ]);
+      const icons = config ? parseGroupIcons(config.content) : {};
+      setBulkServers(collectBulkServerOptions(data));
+      setGroups(mapGroups(data, icons));
       setSelected(selectedMap(data));
     } catch (err) {
       if (isClashConnectionError(err)) {
@@ -108,13 +122,35 @@ export function ProxiesPage() {
     return groups.filter((g) => g.name.toLowerCase().includes(q));
   }, [groups, search]);
 
-  const allNodeNames = useMemo(() => {
-    const names = new Set<string>();
-    for (const g of groups) {
-      for (const n of g.nodes) names.add(n.name);
-    }
-    return Array.from(names).sort();
-  }, [groups]);
+  const applyToAll = useCallback(
+    async (server: string) => {
+      setBulkServer(server);
+      setBusy("__all__");
+      setError("");
+      try {
+        const targets = groups.filter((g) => g.nodes.some((n) => n.name === server));
+        if (!targets.length) {
+          throw new ApiError(400, t("proxies.noGroupsForServer"));
+        }
+
+        const next: Record<string, string> = { ...selected };
+        for (const g of targets) {
+          await clashJson(`proxies/${encodeURIComponent(g.name)}`, clash, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: server }),
+          });
+          next[g.name] = server;
+        }
+        setSelected(next);
+      } catch (err) {
+        setError(err instanceof ApiError ? err.message : t("proxies.switchError"));
+      } finally {
+        setBusy("");
+      }
+    },
+    [groups, clash, selected, t],
+  );
 
   const selectProxy = useCallback(
     async (groupName: string, nodeName: string) => {
@@ -136,34 +172,9 @@ export function ProxiesPage() {
     [clash, t],
   );
 
-  const applyToAll = useCallback(
-    async (server: string) => {
-      setBusy("__all__");
-      setError("");
-      try {
-        for (const g of groups) {
-          await clashJson(`proxies/${encodeURIComponent(g.name)}`, clash, {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name: server }),
-          });
-        }
-        setSelected(() => {
-          const next: Record<string, string> = {};
-          for (const g of groups) next[g.name] = server;
-          return next;
-        });
-      } catch (err) {
-        setError(err instanceof ApiError ? err.message : t("proxies.switchError"));
-      } finally {
-        setBusy("");
-      }
-    },
-    [groups, clash, t],
-  );
-
   const testDelay = useCallback(
     async (name: string) => {
+      if (name === "DIRECT" || name === "REJECT") return;
       const url = encodeURIComponent(settings?.clash_api.ping_url || "https://www.gstatic.com/generate_204");
       const timeout = settings?.clash_api.ping_timeout || 5000;
       try {
@@ -185,7 +196,9 @@ export function ProxiesPage() {
     setTesting(true);
     const names = new Set<string>();
     for (const g of filtered) {
-      for (const n of g.nodes) names.add(n.name);
+      for (const n of g.nodes) {
+        if (n.name !== "DIRECT" && n.name !== "REJECT") names.add(n.name);
+      }
     }
     await Promise.all(Array.from(names).map((n) => testDelay(n)));
     setTesting(false);
@@ -235,12 +248,17 @@ export function ProxiesPage() {
           <div className="min-w-[200px] flex-1">
             <Select
               label={t("proxies.serverForAll")}
-              options={allNodeNames.map((n) => ({ value: n, label: n }))}
-              value="DIRECT"
+              options={bulkServers.map((n) => ({ value: n, label: n }))}
+              value={bulkServer}
               onChange={applyToAll}
             />
           </div>
-          <Button size="sm" variant="ghost" onClick={() => applyToAll("DIRECT")} disabled={!!busy}>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => applyToAll("DIRECT")}
+            disabled={!!busy || !groups.some((g) => g.nodes.some((n) => n.name === "DIRECT"))}
+          >
             {t("proxies.resetAll")}
           </Button>
         </div>
@@ -270,9 +288,17 @@ export function ProxiesPage() {
                 <IconChevron
                   className={`h-3.5 w-3.5 shrink-0 text-zk-dim transition-transform ${open ? "rotate-90" : ""}`}
                 />
-                <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-zk-surface-hover text-[11px] font-bold text-zk-muted">
-                  {group.name[0]?.toUpperCase()}
-                </span>
+                {group.icon ? (
+                  <img
+                    src={group.icon}
+                    alt=""
+                    className="h-6 w-6 shrink-0 rounded-md bg-zk-surface-hover object-contain p-0.5"
+                  />
+                ) : (
+                  <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-zk-surface-hover text-[11px] font-bold text-zk-muted">
+                    {group.name[0]?.toUpperCase()}
+                  </span>
+                )}
                 <div className="min-w-0 flex-1">
                   <span className="text-sm font-semibold">{group.name}</span>
                   <p className="truncate text-[11px] text-zk-muted">

@@ -28,6 +28,7 @@ const translations: Translations = {
     "status.running": "Работает",
     "status.stopped": "Остановлен",
     "status.uptime": "Аптайм",
+    "status.traffic": "Трафик",
     "status.connections": "Соединения",
     "status.active": "активных",
     "status.memory": "Память",
@@ -219,6 +220,7 @@ const translations: Translations = {
     "proxies.startMihomo": "Запустить mihomo",
     "proxies.startError": "Не удалось запустить mihomo",
     "proxies.switchError": "Не удалось переключить узел",
+    "proxies.noGroupsForServer": "Ни одна группа не поддерживает этот узел",
 
     // Status API
     "status.actionError": "Не удалось выполнить действие",
@@ -272,6 +274,7 @@ const translations: Translations = {
     "status.running": "Running",
     "status.stopped": "Stopped",
     "status.uptime": "Uptime",
+    "status.traffic": "Traffic",
     "status.connections": "Connections",
     "status.active": "active",
     "status.memory": "Memory",
@@ -458,6 +461,7 @@ const translations: Translations = {
     "proxies.startMihomo": "Start mihomo",
     "proxies.startError": "Failed to start mihomo",
     "proxies.switchError": "Failed to switch node",
+    "proxies.noGroupsForServer": "No group supports this node",
     "status.actionError": "Action failed",
     "settings.saveClash": "Save Clash API",
     "settings.saved": "Saved",

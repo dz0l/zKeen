@@ -4,20 +4,25 @@ import { useApp } from "../lib/store";
 import { useT } from "../lib/i18n";
 import { useSession } from "../lib/session";
 import { ApiError, apiJson, clashJson } from "../lib/api";
+import { ensureMihomoRunning } from "../lib/config";
 import {
-  formatBytes,
+  formatTrafficTotal,
+  parseConnectionCount,
+  parseMemoryBytes,
   type ClashConnectionsResponse,
   type ClashMemoryResponse,
   type ClashVersionResponse,
+  formatBytes,
 } from "../lib/clash";
 
 export function StatusPage() {
   const { mode } = useApp();
   const t = useT();
-  const { control, versions, clash, refreshSession } = useSession();
+  const { control, versions, clash, setClash, refreshSession } = useSession();
   const [clashVersion, setClashVersion] = useState("");
   const [memory, setMemory] = useState("");
   const [connections, setConnections] = useState("");
+  const [traffic, setTraffic] = useState("");
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
 
@@ -25,20 +30,30 @@ export function StatusPage() {
   const panelPort = typeof window !== "undefined" && window.location.port ? window.location.port : "7220";
 
   const loadClashStats = useCallback(async () => {
-    if (!running) return;
     try {
-      const [ver, mem, conn] = await Promise.all([
-        clashJson<ClashVersionResponse>("version", clash).catch(() => null),
-        clashJson<ClashMemoryResponse>("memory", clash).catch(() => null),
-        clashJson<ClashConnectionsResponse>("connections", clash).catch(() => null),
+      const conn = await ensureMihomoRunning(clash);
+      setClash(conn);
+
+      const [ver, mem, trafficData] = await Promise.all([
+        clashJson<ClashVersionResponse>("version", conn).catch(() => null),
+        clashJson<ClashMemoryResponse>("memory", conn).catch(() => null),
+        clashJson<ClashConnectionsResponse>("connections", conn).catch(() => null),
       ]);
-      if (ver?.version) setClashVersion(ver.version.replace(/^v/, ""));
-      if (mem?.inuse !== undefined) setMemory(formatBytes(mem.inuse));
-      if (conn?.connections) setConnections(String(conn.connections.length));
+
+      if (ver?.version) {
+        setClashVersion(ver.version.replace(/^v/i, ""));
+      }
+
+      const memBytes = parseMemoryBytes(mem) ?? trafficData?.memory;
+      setMemory(memBytes !== undefined ? formatBytes(memBytes) : "—");
+      setConnections(String(parseConnectionCount(trafficData)));
+      setTraffic(formatTrafficTotal(trafficData));
     } catch {
-      /* optional stats */
+      setMemory("—");
+      setConnections("—");
+      setTraffic("—");
     }
-  }, [clash, running]);
+  }, [clash, setClash]);
 
   useEffect(() => {
     loadClashStats();
@@ -96,16 +111,16 @@ export function StatusPage() {
           }
         />
         <div className="grid grid-cols-2 gap-2 p-4 sm:grid-cols-4 sm:p-5">
-          <StatTile label={t("status.uptime")} value="—" />
+          <StatTile label={t("status.traffic")} value={traffic} />
           <StatTile
             label={t("status.connections")}
-            value={connections || "—"}
+            value={connections}
             hint={t("status.active")}
           />
-          <StatTile label={t("status.memory")} value={memory || "—"} />
+          <StatTile label={t("status.memory")} value={memory} />
           <StatTile
             label={t("status.version")}
-            value={clashVersion || versions?.mihomo?.version?.replace(/^v/, "") || "—"}
+            value={clashVersion || versions?.mihomo?.version?.replace(/^v/i, "") || "—"}
           />
         </div>
         <div className="flex flex-wrap gap-2 border-t border-zk-border-soft px-4 py-3 sm:px-5">

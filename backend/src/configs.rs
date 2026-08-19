@@ -438,3 +438,134 @@ fn truncate_validation_error(raw: &str) -> String {
         summary
     }
 }
+
+const DEFAULT_MIHOMO_CONFIG: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../install/mihomo-config.default.yaml"));
+
+fn is_zkeen_ready_config(content: &str) -> bool {
+    content.contains("external-controller:") && content.contains("proxy-groups:")
+}
+
+fn extract_subscription_url(content: &str) -> Option<String> {
+    let re = regex_lite::Regex::new(
+        r"(?ms)  subscription:.*?^\s+url:\s*['\"]?([^'\"#\n]+)['\"]?\s*$",
+    )
+    .ok()?;
+    re.captures(content)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn extract_subscription_hwid(content: &str) -> Option<String> {
+    let re = regex_lite::Regex::new(
+        r"(?ms)  subscription:.*?x-hwid:\s*\n\s*-\s*['\"]?([^'\"#\n]+)['\"]?",
+    )
+    .ok()?;
+    re.captures(content)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn inject_subscription_defaults(mut content: String, url: Option<&str>, hwid: Option<&str>) -> String {
+    if let Some(url) = url.filter(|s| !s.is_empty()) {
+        content = content.replacen("url: \"\"", &format!("url: \"{url}\""), 1);
+    }
+    if let Some(hwid) = hwid.filter(|s| !s.is_empty()) {
+        content = content.replace(
+            "        - \"Mihomo\"\n    health-check:",
+            &format!(
+                "        - \"Mihomo\"\n      x-hwid:\n        - \"{hwid}\"\n    health-check:"
+            ),
+        );
+    }
+    content
+}
+
+#[derive(Deserialize)]
+pub struct BootstrapReq {
+    file: Option<String>,
+    force: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct BootstrapData {
+    bootstrapped: bool,
+    file: String,
+}
+
+pub async fn bootstrap_mihomo_config(
+    State(state): State<AppState>,
+    Json(req): Json<BootstrapReq>,
+) -> impl IntoResponse {
+    let path = req
+        .file
+        .unwrap_or_else(|| format!("{MIHOMO_CONF_DIR}/config.yaml"));
+    let force = req.force.unwrap_or(false);
+
+    if let Err(e) = check_access(&path, &state) {
+        return Json(ApiResponse::<BootstrapData> {
+            success: false,
+            error: Some(e.into()),
+            data: None,
+        });
+    }
+
+    let existing = tokio::fs::read_to_string(&path).await.ok();
+    if let Some(ref content) = existing {
+        if is_zkeen_ready_config(content) && !force {
+            return Json(ApiResponse {
+                success: true,
+                error: None,
+                data: Some(BootstrapData {
+                    bootstrapped: false,
+                    file: path,
+                }),
+            });
+        }
+    }
+
+    let preserved_url = existing.as_deref().and_then(extract_subscription_url);
+    let preserved_hwid = existing.as_deref().and_then(extract_subscription_hwid);
+    let content = inject_subscription_defaults(
+        DEFAULT_MIHOMO_CONFIG.to_string(),
+        preserved_url.as_deref(),
+        preserved_hwid.as_deref(),
+    );
+
+    if let Some(ref old) = existing {
+        let backup = format!(
+            "{path}.bak.{}",
+            chrono::Local::now().format("%Y%m%d%H%M%S")
+        );
+        if tokio::fs::write(&backup, old).await.is_ok() {
+            log("INFO", format!("Backed up Mihomo config: {backup}"));
+        }
+    }
+
+    if let Some(parent) = Path::new(&path).parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+        let _ = tokio::fs::create_dir_all(parent.join("proxy-providers")).await;
+        let _ = tokio::fs::create_dir_all(parent.join("adblock")).await;
+    }
+
+    if let Err(e) = tokio::fs::write(&path, &content).await {
+        return Json(ApiResponse::<BootstrapData> {
+            success: false,
+            error: Some(format!("Write error: {e}")),
+            data: None,
+        });
+    }
+
+    log("INFO", format!("Installed zKeen Mihomo config template: {path}"));
+
+    Json(ApiResponse {
+        success: true,
+        error: None,
+        data: Some(BootstrapData {
+            bootstrapped: true,
+            file: path,
+        }),
+    })
+}

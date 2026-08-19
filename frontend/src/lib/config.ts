@@ -1,4 +1,4 @@
-import { ApiError, apiJson, clashJson, parseClashFromYaml, saveClashConnection, type ClashConnection } from "./api";
+import { ApiError, apiJson, clashJson, parseClashFromYaml, saveClashConnection, type ApiResponse, type ClashConnection } from "./api";
 
 export interface ControlInfo {
   cores: string[];
@@ -33,6 +33,33 @@ export function pickMainConfig(configs: ConfigItem[]): ConfigItem | null {
   if (exact) return exact;
   const named = configs.find((c) => /(^|\/)config\.ya?ml$/i.test(c.file));
   return named ?? configs[0];
+}
+
+export function isZkeenReadyConfig(yaml: string): boolean {
+  return yaml.includes("external-controller:") && yaml.includes("proxy-groups:");
+}
+
+/** Replace XKeen stub config with the full zKeen template (preserves subscription URL/hwid). */
+export async function ensureZkeenMihomoConfig(force = false): Promise<boolean> {
+  const res = await apiJson<ApiResponse<{ bootstrapped: boolean; file: string }>>(
+    "/api/configs/bootstrap",
+    {
+      method: "POST",
+      body: JSON.stringify({ file: DEFAULT_CONFIG_PATH, force }),
+    },
+  );
+  return Boolean(res.data?.bootstrapped);
+}
+
+export function getTopLevelScalar(yaml: string, key: string): string {
+  return yaml.match(new RegExp(`^${key}:\\s*['"]?([^'"\n#]+)`, "m"))?.[1]?.trim() ?? "";
+}
+
+export function setTopLevelScalar(yaml: string, key: string, value: string): string {
+  const line = `${key}: ${value}`;
+  const re = new RegExp(`^${key}:\\s*.+$`, "m");
+  if (re.test(yaml)) return yaml.replace(re, line);
+  return `${line}\n${yaml}`;
 }
 
 export async function fetchMihomoConfig(): Promise<{ path: string; content: string } | null> {
@@ -158,13 +185,24 @@ export async function reloadClashConfig(clash: ClashConnection): Promise<void> {
 }
 
 /** zashboard-style: ensure mihomo is up, reload config, refresh proxy-provider */
-export async function applyMihomoConfigChanges(clash: ClashConnection): Promise<ClashConnection> {
+export async function applyMihomoConfigChanges(
+  clash: ClashConnection,
+  opts?: { hardRestart?: boolean },
+): Promise<ClashConnection> {
   const conn = await ensureMihomoRunning(clash);
-  try {
-    await reloadClashConfig(conn);
-  } catch {
-    await reloadMihomoCore();
-    await waitForClashApi(conn);
+  if (opts?.hardRestart) {
+    await apiJson("/api/control", {
+      method: "POST",
+      body: JSON.stringify({ action: "hardRestart", core: "mihomo" }),
+    });
+    await waitForClashApi(conn, 40, 500);
+  } else {
+    try {
+      await reloadClashConfig(conn);
+    } catch {
+      await reloadMihomoCore();
+      await waitForClashApi(conn);
+    }
   }
   await refreshProxyProvider(DEFAULT_PROVIDER, conn);
   return conn;
@@ -184,6 +222,14 @@ const providerBlockRe = (provider: string) =>
     `\\n  ${provider}:[\\s\\S]*?(?=\\n  [a-zA-Z][\\w-]*:|\\nproxies:|\\nproxy-groups:|\\nrules:|\\ndns:|\\ngeox-url:)`,
     "m",
   );
+
+function removeProviderBlocks(yaml: string, provider: string): string {
+  const re = new RegExp(
+    `\\n  ${provider}:[\\s\\S]*?(?=\\n  [a-zA-Z][\\w-]*:|\\nproxies:|\\nproxy-groups:|\\nrules:|\\ndns:|\\ngeox-url:|$)`,
+    "gm",
+  );
+  return yaml.replace(re, "");
+}
 
 function buildProviderBlock(provider: string, url: string, hwid: string): string {
   const hwidSection = hwid ? `\n      x-hwid:\n        - "${hwid}"` : "";
@@ -233,22 +279,18 @@ export function updateSubscriptionProvider(
   if (!url) return yaml;
 
   const block = buildProviderBlock(provider, url, hwid);
-  const blockRe = providerBlockRe(provider);
+  let cleaned = removeProviderBlocks(yaml, provider);
 
-  if (yaml.includes("proxy-providers:") && blockRe.test(yaml)) {
-    return yaml.replace(blockRe, `\n${block}`);
-  }
-
-  if (yaml.includes("proxy-providers:")) {
-    return yaml.replace(/(\nproxy-providers:\s*\n)/, `$1${block}\n`);
+  if (cleaned.includes("proxy-providers:")) {
+    return cleaned.replace(/(\nproxy-providers:\s*\n)/, `$1${block}\n`);
   }
 
   const insert = `\nproxy-providers:\n${block}\n`;
-  const anchor = yaml.match(/\n(proxies|proxy-groups|rules):/);
+  const anchor = cleaned.match(/\n(proxies|proxy-groups|rules):/);
   if (anchor?.index !== undefined) {
-    return yaml.slice(0, anchor.index) + insert + yaml.slice(anchor.index);
+    return cleaned.slice(0, anchor.index) + insert + cleaned.slice(anchor.index);
   }
-  return `${yaml.trimEnd()}${insert}`;
+  return `${cleaned.trimEnd()}${insert}`;
 }
 
 export function setSubscriptionUrl(
@@ -272,6 +314,7 @@ export async function applySubscriptionUrl(
   clash: ClashConnection,
   hwid = "",
 ): Promise<{ path: string; clash: ClashConnection }> {
+  const bootstrapped = await ensureZkeenMihomoConfig();
   const loaded = await fetchMihomoConfig();
   if (!loaded) {
     throw new Error(
@@ -282,6 +325,6 @@ export async function applySubscriptionUrl(
   await saveMihomoConfig(loaded.path, updated, false);
   return {
     path: normalizeMihomoConfigPath(loaded.path),
-    clash: await applyMihomoConfigChanges(clash),
+    clash: await applyMihomoConfigChanges(clash, { hardRestart: bootstrapped }),
   };
 }

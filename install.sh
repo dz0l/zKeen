@@ -16,9 +16,13 @@ MIHOMO_DIR="/opt/etc/mihomo"
 MIHOMO_CONFIG="${MIHOMO_DIR}/config.yaml"
 DEFAULT_CONFIG_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/install/mihomo-config.default.yaml"
 XKEEN_ORIGIN_REPO="Skrill0/XKeen"
+XKEEN_FORK_REPO="jameszeroX/XKeen"
 XKEEN_ORIGIN_TAR="https://github.com/${XKEEN_ORIGIN_REPO}/releases/latest/download/xkeen.tar"
+XKEEN_FORK_TAR="https://github.com/${XKEEN_FORK_REPO}/releases/latest/download/xkeen.tar.gz"
 XKEEN_ORIGIN_INSTALL="https://raw.githubusercontent.com/${XKEEN_ORIGIN_REPO}/main/install.sh"
+XKEEN_FORK_INSTALL="https://raw.githubusercontent.com/${XKEEN_FORK_REPO}/main/install.sh"
 MIHOMO_REPO="MetaCubeX/mihomo"
+MIHOMO_API="https://api.github.com/repos/${MIHOMO_REPO}/releases/latest"
 PORT="7220"
 MIN_FREE_MB=15
 MIN_BINARY_BYTES=1048576
@@ -42,12 +46,14 @@ die() { log_error "$1"; exit 1; }
 MODE="install"
 INSTALL_XKEEN=""
 SKIP_XKEEN_CHECK=0
+NO_INSTALL_XKEEN=0
 for arg in "$@"; do
     case "$arg" in
         --update) MODE="update" ;;
         --uninstall) MODE="uninstall" ;;
         --install-xkeen) INSTALL_XKEEN=1 ;;
         --skip-xkeen-check) SKIP_XKEEN_CHECK=1 ;;
+        --no-install-xkeen) NO_INSTALL_XKEEN=1 ;;
     esac
 done
 
@@ -265,6 +271,32 @@ has_xray_binary() {
     [ -x /opt/sbin/xray ]
 }
 
+ensure_opkg_package() {
+    _pkg="$1"
+    if command -v "$_pkg" >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! command -v opkg >/dev/null 2>&1; then
+        return 1
+    fi
+    opkg update >/dev/null 2>&1 || true
+    opkg install "$_pkg" >/dev/null 2>&1
+}
+
+mihomo_asset_suffix() {
+    case "$ARCH" in
+        aarch64) printf '%s' "arm64" ;;
+        mips|mipsel)
+            if [ "$(echo -n I | od -to2 | head -c 20 | awk '{print $2}')" = "00000" ]; then
+                printf '%s' "mips-softfloat"
+            else
+                printf '%s' "mipsle-softfloat"
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 prompt_yes() {
     _prompt="$1"
     _default="${2:-n}"
@@ -290,36 +322,154 @@ prompt_yes() {
     esac
 }
 
+run_jameszerox_install() {
+    log_step "Launching XKeen installer (${XKEEN_FORK_REPO})..."
+    log_warn "In the menu choose Mihomo as proxy core, then follow prompts"
+    log_warn "Installer must run from writable /opt/tmp (not ~ or /)"
+    mkdir -p /opt/tmp
+    if ( cd /opt/tmp && sh -c "$(curl -sSL "$XKEEN_FORK_INSTALL")" -- --stable ); then
+        return 0
+    fi
+    return 1
+}
+
 install_xkeen_origin() {
     log_step "Installing XKeen from ${XKEEN_ORIGIN_REPO}..."
 
-    if ! command -v tar >/dev/null 2>&1; then
-        if command -v opkg >/dev/null 2>&1; then
-            opkg update >/dev/null 2>&1 || true
-            opkg install tar >/dev/null 2>&1 || die "Failed to install tar (required for XKeen)"
-        else
-            die "tar not found (required for XKeen)"
-        fi
-    fi
+    ensure_opkg_package tar || die "tar not found (required for XKeen)"
 
     _xkeen_tar="/opt/tmp/xkeen.tar.$$"
     mkdir -p /opt/tmp
     if ! curl_fetch "$XKEEN_ORIGIN_TAR" "$_xkeen_tar"; then
         rm -f "$_xkeen_tar"
-        die "Failed to download XKeen from ${XKEEN_ORIGIN_TAR}"
+        return 1
     fi
 
     if ! tar -xf "$_xkeen_tar" -C /opt/sbin --overwrite >/dev/null 2>&1; then
         rm -f "$_xkeen_tar"
-        die "Failed to extract XKeen archive"
+        return 1
     fi
     rm -f "$_xkeen_tar"
 
     if ! has_xkeen_binary; then
-        die "XKeen install failed: /opt/sbin/xkeen not found after extract"
+        return 1
     fi
     chmod 755 /opt/sbin/xkeen 2>/dev/null || true
     log_info "XKeen binary installed (/opt/sbin/xkeen)"
+    return 0
+}
+
+install_xkeen_fork() {
+    log_step "Installing XKeen (${XKEEN_FORK_REPO}, fork of ${XKEEN_ORIGIN_REPO})..."
+
+    ensure_opkg_package tar || die "tar not found (required for XKeen)"
+    ensure_opkg_package gzip || true
+
+    _archive="/opt/tmp/xkeen.tar.gz.$$"
+    mkdir -p /opt/tmp /opt/sbin
+    if ! curl_fetch "$XKEEN_FORK_TAR" "$_archive"; then
+        rm -f "$_archive"
+        log_warn "Failed to download ${XKEEN_FORK_TAR}"
+        install_xkeen_origin
+        return $?
+    fi
+
+    _stage="/opt/sbin/.xkeen-install.$$"
+    mkdir -p "$_stage"
+    if ! tar -xzf "$_archive" -C "$_stage" \
+        || [ ! -f "$_stage/xkeen" ] \
+        || [ ! -d "$_stage/_xkeen" ]; then
+        rm -rf "$_stage" "$_archive"
+        log_warn "Failed to extract ${XKEEN_FORK_REPO} archive, trying ${XKEEN_ORIGIN_REPO}..."
+        install_xkeen_origin
+        return $?
+    fi
+
+    chmod 755 "$_stage/xkeen"
+    mv "$_stage/xkeen" /opt/sbin/xkeen
+    rm -rf /opt/sbin/.xkeen.old
+    [ -d /opt/sbin/.xkeen ] && mv /opt/sbin/.xkeen /opt/sbin/.xkeen.old
+    mv "$_stage/_xkeen" /opt/sbin/.xkeen
+    rm -rf /opt/sbin/.xkeen.old "$_stage"
+
+    cp -f "$_archive" /opt/sbin/xkeen.tar.gz
+    rm -f "$_archive"
+    chmod 755 /opt/sbin/xkeen
+
+    if ! has_xkeen_binary; then
+        return 1
+    fi
+    log_info "XKeen installed: /opt/sbin/xkeen"
+    return 0
+}
+
+install_mihomo_binary() {
+    if has_mihomo_binary; then
+        return 0
+    fi
+
+    _suffix=$(mihomo_asset_suffix) || {
+        log_warn "Unsupported architecture for Mihomo: ${ARCH}"
+        return 1
+    }
+
+    log_step "Downloading Mihomo (${_suffix})..."
+    ensure_opkg_package gzip || true
+
+    _release_json=$(curl -s --connect-timeout 10 --max-time 20 \
+        ${CURL_CA_BUNDLE:+--cacert "$CURL_CA_BUNDLE"} \
+        "$MIHOMO_API" 2>/dev/null) || {
+        log_warn "Failed to fetch Mihomo release info"
+        return 1
+    }
+
+    _asset_prefix="mihomo-linux-${_suffix}-"
+    _asset_name=$(printf '%s' "$_release_json" | tr ',' '\n' | \
+        grep 'browser_download_url' | grep "$_asset_prefix" | grep '\.gz"' | head -1 | \
+        sed 's/.*\/\([^/"]*\)".*/\1/')
+
+    if [ -z "$_asset_name" ]; then
+        log_warn "Mihomo asset not found for ${_suffix}"
+        return 1
+    fi
+
+    _tag=$(printf '%s' "$_release_json" | \
+        grep '"tag_name"' | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+    _download_url="https://github.com/${MIHOMO_REPO}/releases/download/${_tag}/${_asset_name}"
+
+    _gz="/opt/tmp/mihomo.gz.$$"
+    _tmp="/opt/sbin/mihomo.new.$$"
+    mkdir -p /opt/tmp
+
+    if ! curl_fetch "$_download_url" "$_gz"; then
+        rm -f "$_gz"
+        log_warn "Failed to download Mihomo: ${_download_url}"
+        return 1
+    fi
+
+    if ! gunzip -c "$_gz" > "$_tmp" 2>/dev/null; then
+        rm -f "$_gz" "$_tmp"
+        log_warn "Failed to unpack Mihomo archive"
+        return 1
+    fi
+    rm -f "$_gz"
+
+    if ! is_elf_binary "$_tmp"; then
+        rm -f "$_tmp"
+        log_warn "Downloaded Mihomo file is not a valid binary"
+        return 1
+    fi
+
+    chmod 755 "$_tmp"
+    if ! "$_tmp" -v >/dev/null 2>&1; then
+        rm -f "$_tmp"
+        log_warn "Mihomo binary failed validation on this CPU"
+        return 1
+    fi
+
+    mv -f "$_tmp" /opt/sbin/mihomo
+    log_info "Mihomo installed: /opt/sbin/mihomo (${_tag})"
+    return 0
 }
 
 run_xkeen_setup() {
@@ -330,14 +480,47 @@ run_xkeen_setup() {
         return 0
     fi
 
-    log_warn "XKeen needs interactive setup: init scripts and proxy core (Mihomo)"
-    log_warn "Run: xkeen -i   (choose Mihomo as proxy core)"
-    log_warn "Docs: https://github.com/${XKEEN_ORIGIN_REPO}"
+    _xkeen="/opt/sbin/xkeen"
 
-    if [ -t 0 ] && prompt_yes "Run xkeen -i now?" "y"; then
-        log_step "Starting xkeen -i (interactive)..."
-        xkeen -i || log_warn "xkeen -i exited with an error — finish setup manually"
+    if ! has_mihomo_binary; then
+        install_mihomo_binary || true
     fi
+
+    log_step "Configuring XKeen (Mihomo core)..."
+
+    _configured=0
+
+    if [ -t 0 ] && { [ -n "$INSTALL_XKEEN" ] || prompt_yes "Run xkeen -i now (interactive)?" "y"; }; then
+        log_step "Starting xkeen -i (interactive)..."
+        if "$_xkeen" -i; then
+            _configured=1
+        else
+            log_warn "xkeen -i exited with an error"
+        fi
+    fi
+
+    if [ "$_configured" -eq 0 ] && { ! has_xkeen_init || ! has_mihomo_binary; }; then
+        log_step "Non-interactive XKeen setup..."
+        # jameszeroX menu: 2 = Mihomo, 1 = stable / first option
+        if printf '2\n1\n' | "$_xkeen" -i 2>/dev/null; then
+            _configured=1
+        elif [ -f /opt/sbin/xkeen.tar.gz ] && has_mihomo_binary; then
+            if ( cd /opt/sbin && "$_xkeen" -io ); then
+                _configured=1
+            fi
+        fi
+    fi
+
+    if has_xkeen_init && has_mihomo_binary; then
+        "$_xkeen" -mihomo 2>/dev/null || true
+        log_info "XKeen configured (init scripts + Mihomo)"
+        return 0
+    fi
+
+    log_warn "XKeen setup incomplete — finish manually:"
+    log_warn "  /opt/sbin/xkeen -i   (choose Mihomo as proxy core)"
+    log_warn "Docs: https://github.com/${XKEEN_FORK_REPO}"
+    return 1
 }
 
 check_proxy_stack() {
@@ -378,15 +561,33 @@ check_proxy_stack() {
     fi
 
     if [ "$_need_xkeen" -eq 1 ]; then
+        log_warn "XKeen fork: ${XKEEN_FORK_INSTALL}"
         log_warn "Original XKeen: ${XKEEN_ORIGIN_INSTALL}"
-        log_warn "Mihomo core: https://github.com/${MIHOMO_REPO} (installed by XKeen)"
-        if prompt_yes "Install XKeen from ${XKEEN_ORIGIN_REPO} now?" "y"; then
-            install_xkeen_origin
-            _need_xkeen=0
-            _need_setup=1
-            _need_mihomo=1
+        if [ "$NO_INSTALL_XKEEN" -eq 1 ]; then
+            log_warn "Auto-install skipped (--no-install-xkeen). zKeen UI needs XKeen to manage Mihomo."
+        elif [ -t 0 ] && [ -t 1 ]; then
+            if run_jameszerox_install; then
+                _need_xkeen=0
+                _need_setup=0
+                _need_mihomo=0
+            else
+                log_warn "Interactive XKeen install failed, trying bundled installer..."
+                if install_xkeen_fork; then
+                    _need_xkeen=0
+                    _need_setup=1
+                    _need_mihomo=1
+                fi
+            fi
         else
-            log_warn "zKeen UI needs XKeen to start/stop Mihomo. Install later, then run: xkeen -i"
+            log_step "Installing missing XKeen (required for Mihomo on the router)..."
+            if install_xkeen_fork; then
+                _need_xkeen=0
+                _need_setup=1
+                _need_mihomo=1
+            else
+                log_warn "XKeen install failed. Install manually from /opt/tmp:"
+                log_warn "  cd /opt/tmp && sh -c \"\$(curl -sSL ${XKEEN_FORK_INSTALL})\" -- --stable"
+            fi
         fi
     fi
 
@@ -397,7 +598,8 @@ check_proxy_stack() {
     if has_xkeen_init && has_mihomo_binary; then
         log_info "Proxy stack ready (XKeen + Mihomo)"
     elif has_xkeen_binary; then
-        log_warn "Finish XKeen setup before using Proxy tab: xkeen -i"
+        log_warn "Finish XKeen setup before using Proxy tab: /opt/sbin/xkeen -i"
+        log_warn "Note: use /opt/sbin/xkeen (Entware shell may not have /opt/sbin in PATH)"
     fi
 }
 
@@ -501,24 +703,61 @@ create_conf_dir() {
 }
 
 install_mihomo_config() {
-    if [ -f "$MIHOMO_CONFIG" ]; then
-        log_info "Mihomo config exists: ${MIHOMO_CONFIG}"
+    mkdir -p "${MIHOMO_DIR}/proxy-providers" "${MIHOMO_DIR}/adblock"
+
+    if [ -f "$MIHOMO_CONFIG" ] \
+        && grep -q 'external-controller:' "$MIHOMO_CONFIG" \
+        && grep -q 'proxy-groups:' "$MIHOMO_CONFIG"; then
+        log_info "Mihomo config OK: ${MIHOMO_CONFIG}"
         return 0
     fi
 
-    log_step "Installing default Mihomo config..."
-    mkdir -p "${MIHOMO_DIR}/proxy-providers" "${MIHOMO_DIR}/adblock"
+    _sub_url=""
+    if [ -f "$MIHOMO_CONFIG" ]; then
+        _bak="${MIHOMO_CONFIG}.bak.$(date +%Y%m%d%H%M%S 2>/dev/null || echo xkeen)"
+        cp -f "$MIHOMO_CONFIG" "$_bak" 2>/dev/null && log_info "Backed up stub config: ${_bak}"
+        _sub_url=$(awk '
+            /^  subscription:/ { in_sub=1; next }
+            in_sub && /^  [a-zA-Z]/ && !/^  subscription:/ { in_sub=0 }
+            in_sub && /^[[:space:]]*url:/ {
+                sub(/^.*url:[[:space:]]*["'\'']?/, "")
+                gsub(/["'\'']?[[:space:]]*$/, "")
+                print
+                exit
+            }
+        ' "$MIHOMO_CONFIG" 2>/dev/null)
+        log_step "Replacing XKeen stub config with zKeen default template..."
+    else
+        log_step "Installing default Mihomo config..."
+    fi
 
-    if ! curl_fetch "$DEFAULT_CONFIG_URL" "$MIHOMO_CONFIG"; then
+    _tmp_cfg="/opt/tmp/mihomo-config.default.$$"
+    if ! curl_fetch "$DEFAULT_CONFIG_URL" "$_tmp_cfg"; then
+        rm -f "$_tmp_cfg"
         log_warn "Could not download default config from GitHub"
         return 1
     fi
 
-    if [ ! -s "$MIHOMO_CONFIG" ]; then
-        rm -f "$MIHOMO_CONFIG"
+    if [ ! -s "$_tmp_cfg" ]; then
+        rm -f "$_tmp_cfg"
         log_warn "Downloaded config template is empty"
         return 1
     fi
+
+    if [ -n "$_sub_url" ]; then
+        awk -v url="$_sub_url" '
+            !done && /^[[:space:]]*url: ""$/ {
+                print "    url: \"" url "\""
+                done=1
+                next
+            }
+            { print }
+        ' "$_tmp_cfg" > "${MIHOMO_CONFIG}.new.$$"
+        mv -f "${MIHOMO_CONFIG}.new.$$" "$MIHOMO_CONFIG"
+    else
+        mv -f "$_tmp_cfg" "$MIHOMO_CONFIG"
+    fi
+    rm -f "$_tmp_cfg"
 
     log_info "Default config installed: ${MIHOMO_CONFIG}"
     return 0
@@ -598,8 +837,8 @@ main() {
 
     check_entware
     check_curl
-    check_proxy_stack
     detect_arch
+    check_proxy_stack
     check_free_space
     check_repo_available
     get_latest_version

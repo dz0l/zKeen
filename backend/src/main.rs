@@ -447,6 +447,10 @@ async fn main() {
             get(controller::get_control).post(controller::post_control),
         )
         .route(
+            "/api/configs/bootstrap",
+            post(configs::bootstrap_mihomo_config),
+        )
+        .route(
             "/api/configs",
             get(configs::get_configs)
                 .put(configs::put_config)
