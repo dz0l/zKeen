@@ -10,6 +10,7 @@ pub const APP_CONFIG_LEGACY: &str = "/opt/etc/xkeen/xkeen-ui.json";
 pub const DEFAULT_ACCESS_LOG: &str = "/opt/var/log/xray/access.log";
 pub const DEFAULT_ERROR_LOG: &str = "/opt/var/log/xray/error.log";
 pub const MIHOMO_CONF_DIR: &str = "/opt/etc/mihomo";
+pub const S05XKEEN: &str = "/opt/etc/init.d/S05xkeen";
 pub const S24XRAY: &str = "/opt/etc/init.d/S24xray";
 pub const S99XKEEN: &str = "/opt/etc/init.d/S99xkeen";
 pub const S99ZKEEN_UI: &str = "/opt/etc/init.d/S99zkeen-ui";

@@ -39,7 +39,7 @@ pub fn find_init_file(log_enabled: bool) -> Option<String> {
     }
 
     let final_path = path.or_else(|| {
-        [S99XKEEN, S24XRAY]
+        [S05XKEEN, S99XKEEN, S24XRAY]
             .into_iter()
             .find(|p| Path::new(p).exists())
             .map(String::from)
@@ -330,15 +330,16 @@ pub async fn post_control(State(state): State<AppState>, Json(req): Json<Control
                 });
             }
         }
-        a if ["start", "stop", "hardRestart"].contains(&a) => {
-            let arg = match a {
+        a if ["start", "stop", "hardRestart", "restart"].contains(&a) => {
+            let action = if a == "restart" { "hardRestart" } else { a };
+            let arg = match action {
                 "start" => "start",
                 "stop" => "stop",
                 _ => "restart",
             };
 
             let cur_name = state.core.read().unwrap().name.clone();
-            if a == "start" || a == "hardRestart" {
+            if action == "start" || action == "hardRestart" {
                 if let Err(e) = check_core_config(&cur_name).await {
                     log("ERROR", e);
                     return Json(ApiResponse {
@@ -352,11 +353,11 @@ pub async fn post_control(State(state): State<AppState>, Json(req): Json<Control
                     });
                 }
             }
-            if cur_name == "mihomo" && (a == "start" || a == "hardRestart") {
+            if cur_name == "mihomo" && (action == "start" || action == "hardRestart") {
                 _ = fs::write(error_log_path(), b"").await;
             }
 
-            let args: &[&str] = match a {
+            let args: &[&str] = match action {
                 "start" => &["start", "on"],
                 "hardRestart" => &["restart", "on"],
                 _ => &[arg],
