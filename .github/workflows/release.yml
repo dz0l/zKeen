@@ -33,6 +33,7 @@ jobs:
     needs: build-frontend
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: aarch64-unknown-linux-musl
@@ -48,13 +49,10 @@ jobs:
           name: frontend-dist
           path: frontend/dist/
 
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          targets: ${{ matrix.target }}
-          components: rust-src
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
 
       - name: Build release binary
         working-directory: backend
