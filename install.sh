@@ -31,6 +31,23 @@ log_step()  { printf "${CYAN}[→]${NC} ${BOLD}%s${NC}\n" "$1"; }
 
 die() { log_error "$1"; exit 1; }
 
+# Portable ELF magic check (\x7fELF) for BusyBox/GNU toolchains
+is_elf_binary() {
+    _file="$1"
+
+    if command -v file >/dev/null 2>&1; then
+        file "$_file" 2>/dev/null | grep -q 'ELF' && return 0
+    fi
+
+    _magic=$(od -A n -t x1 -N 4 "$_file" 2>/dev/null | tr -dc '0-9a-fA-F')
+    if [ "$_magic" = "7f454c46" ]; then
+        return 0
+    fi
+
+    _magic=$(od -An -N 4 -t x1 "$_file" 2>/dev/null | tr -dc '0-9a-fA-F')
+    [ "$_magic" = "7f454c46" ]
+}
+
 # --- Определение режима ---
 MODE="install"
 for arg in "$@"; do
@@ -184,11 +201,11 @@ download_binary() {
         die "Загруженный файл слишком мал (${FILE_SIZE:-0} байт). Возможно, артефакт повреждён"
     fi
 
-    # Проверка ELF-заголовка
-    FILE_MAGIC=$(od -A n -t x1 -N 4 "$TMP_FILE" 2>/dev/null | tr -d ' ')
-    if [ "$FILE_MAGIC" != "7f454c46" ]; then
+    # Проверка ELF-заголовка (совместимо с BusyBox od на Entware)
+    if ! is_elf_binary "$TMP_FILE"; then
+        _magic=$(od -A n -t x1 -N 4 "$TMP_FILE" 2>/dev/null | tr -dc '0-9a-fA-F' || true)
         rm -f "$TMP_FILE"
-        die "Загруженный файл не является ELF-бинарём. Проверьте URL"
+        die "Загруженный файл не является ELF-бинарём (magic: ${_magic:-unknown}). Проверьте URL"
     fi
 
     log_info "Файл загружен: $(( FILE_SIZE / 1024 / 1024 )) МБ"
