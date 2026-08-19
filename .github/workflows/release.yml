@@ -38,8 +38,10 @@ jobs:
         include:
           - target: aarch64-unknown-linux-musl
             asset_name: zkeen-ui-arm64-v8a
+            toolchain: stable
           - target: mipsel-unknown-linux-musl
             asset_name: zkeen-ui-mips32le
+            toolchain: nightly
 
     steps:
       - uses: actions/checkout@v4
@@ -49,7 +51,7 @@ jobs:
           name: frontend-dist
           path: frontend/dist/
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@${{ matrix.toolchain }}
 
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross --locked

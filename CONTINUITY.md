@@ -13,14 +13,14 @@
 - mipsel: `build-std = true` в `backend/Cross.toml`.
 
 ## State:
-- CI v0.0.1 после dae4ff5: frontend OK, backend FAIL (embed path + mipsel std).
+- CI v0.0.1 после 13c3d26: frontend OK, aarch64 OK, mipsel FAIL (nightly required for build-std).
 
 ## Done:
 - Stage 0 UI mock, Stage 1 backend, install.sh, release workflow, Connections page.
 - fix(ci) dae4ff5: stable + cross без host mipsel target.
 
 ## Now:
-- fix(ci): stage frontend-dist + mipsel build-std, перезапуск release.
+- fix(ci): nightly toolchain для mipsel build-std, перезапуск release.
 
 ## Next:
 - Проверить успешный CI и Release v0.0.1.
