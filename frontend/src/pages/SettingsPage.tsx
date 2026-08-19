@@ -1,13 +1,61 @@
-import { Card, CardHeader, Input, MockBanner, Select, Button, Badge } from "../components/ui";
+import { useState, useEffect } from "react";
+import { Card, CardHeader, Input, Select, Button, Badge } from "../components/ui";
 import { useI18n, useT, AVAILABLE_LOCALES } from "../lib/i18n";
+import { useSession } from "../lib/session";
+import { useMihomoConfig } from "../lib/useMihomoConfig";
+import { DEFAULT_PROVIDER, refreshProxyProvider, setSubscriptionUrl, saveMihomoConfig } from "../lib/config";
+import type { ClashConnection } from "../lib/api";
+import { ApiError } from "../lib/api";
 
 export function SettingsPage() {
   const t = useT();
   const { locale, setLocale } = useI18n();
+  const { clash, setClash, versions, logout, loginInfo } = useSession();
+  const cfg = useMihomoConfig();
+  const [draft, setDraft] = useState<ClashConnection>(clash);
+  const [subUrl, setSubUrl] = useState("");
+  const [saved, setSaved] = useState(false);
+  const [subSaving, setSubSaving] = useState(false);
+  const [subError, setSubError] = useState("");
+
+  useEffect(() => {
+    setDraft(clash);
+  }, [clash]);
+
+  useEffect(() => {
+    setSubUrl(cfg.subscriptionUrl);
+  }, [cfg.subscriptionUrl]);
+
+  function saveClash() {
+    setClash(draft);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  }
+
+  async function saveSubscription() {
+    if (!cfg.configPath) return;
+    setSubSaving(true);
+    setSubError("");
+    try {
+      const updated = setSubscriptionUrl(cfg.yaml, subUrl);
+      cfg.setYaml(updated);
+      await saveMihomoConfig(cfg.configPath, updated, true);
+      try {
+        await refreshProxyProvider(DEFAULT_PROVIDER, clash);
+      } catch {
+        /* optional */
+      }
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (err) {
+      setSubError(err instanceof ApiError ? err.message : t("config.saveError"));
+    } finally {
+      setSubSaving(false);
+    }
+  }
 
   return (
     <div className="page-enter space-y-4">
-      <MockBanner />
 
       <div>
         <h1 className="text-xl font-bold tracking-tight sm:text-2xl">{t("settings.title")}</h1>
@@ -26,41 +74,88 @@ export function SettingsPage() {
         </div>
       </Card>
 
-      <Card>
-        <CardHeader title={t("settings.auth")} />
-        <div className="space-y-3 p-4 sm:p-5">
-          <Input label={t("settings.login")} placeholder="admin" />
-          <Input label={t("settings.password")} placeholder="••••••••" />
-          <Button size="sm" variant="secondary">{t("settings.changePassword")}</Button>
-        </div>
-      </Card>
-
-      <Card>
-        <CardHeader title={t("settings.updates")} subtitle={t("settings.updatesSub")} />
-        <div className="space-y-4 p-4 sm:p-5">
-          <Select
-            label={t("settings.downloadMethod")}
-            options={[
-              { value: "direct", label: t("settings.direct") },
-              { value: "proxy", label: t("settings.proxy") },
-            ]}
-          />
-
-          <div className="space-y-2">
-            <UpdateRow name="zkeen-ui" version="0.0.1-proto" latest="0.0.1" />
-            <UpdateRow name="mihomo" version="1.19.2" latest="1.19.4" hasUpdate />
-            <UpdateRow name="xkeen" version="1.2.0" latest="1.2.0" />
+      {loginInfo?.enabled && loginInfo.authenticated && (
+        <Card>
+          <CardHeader title={t("settings.auth")} />
+          <div className="p-4 sm:p-5">
+            <Button size="sm" variant="secondary" onClick={() => logout()}>
+              {t("auth.logout")}
+            </Button>
           </div>
+        </Card>
+      )}
+
+      <Card>
+        <CardHeader title={t("settings.subscription")} subtitle={t("settings.subscriptionSub")} />
+        <div className="space-y-3 p-4 sm:p-5">
+          <Input
+            label={t("config.qSubUrl")}
+            placeholder="https://..."
+            mono
+            value={subUrl}
+            onChange={setSubUrl}
+          />
+          {subError && <p className="text-xs text-zk-coral">{subError}</p>}
+          <Button size="sm" variant="primary" disabled={subSaving || !subUrl.trim()} onClick={saveSubscription}>
+            {subSaving ? t("app.loading") : t("settings.saveSubscription")}
+          </Button>
         </div>
       </Card>
 
       <Card>
         <CardHeader title={t("settings.clashApi")} subtitle={t("settings.clashApiSub")} />
         <div className="grid gap-3 p-4 sm:grid-cols-2 sm:p-5">
-          <Input label="Host" placeholder="0.0.0.0" />
-          <Input label="Port" placeholder="9090" mono />
+          <Input
+            label="Port"
+            placeholder="9090"
+            mono
+            value={draft.port}
+            onChange={(v) => setDraft((d) => ({ ...d, port: v, unix: "" }))}
+          />
+          <Input
+            label="Unix socket"
+            placeholder="controller.sock"
+            mono
+            value={draft.unix}
+            onChange={(v) => setDraft((d) => ({ ...d, unix: v, port: v ? "" : d.port || "9090" }))}
+            hint={t("settings.unixHint")}
+          />
           <div className="sm:col-span-2">
-            <Input label="Secret" placeholder="••••••••" />
+            <Input
+              label="Secret"
+              type="password"
+              placeholder="••••••••"
+              value={draft.secret}
+              onChange={(v) => setDraft((d) => ({ ...d, secret: v }))}
+            />
+          </div>
+          <div className="sm:col-span-2 flex items-center gap-3">
+            <Button size="sm" variant="primary" onClick={saveClash}>
+              {saved ? t("settings.saved") : t("settings.saveClash")}
+            </Button>
+          </div>
+        </div>
+      </Card>
+
+      <Card>
+        <CardHeader title={t("settings.updates")} subtitle={t("settings.updatesSub")} />
+        <div className="space-y-4 p-4 sm:p-5">
+          <div className="space-y-2">
+            <UpdateRow
+              name="zkeen-ui"
+              version={versions?.["zkeen-ui"]?.version || "—"}
+              latest={versions?.["zkeen-ui"]?.version || "—"}
+            />
+            <UpdateRow
+              name="mihomo"
+              version={versions?.mihomo?.version?.replace(/^v/, "") || "—"}
+              latest={versions?.mihomo?.version?.replace(/^v/, "") || "—"}
+            />
+            <UpdateRow
+              name="xray"
+              version={versions?.xray?.version?.replace(/^v/, "") || "—"}
+              latest={versions?.xray?.version?.replace(/^v/, "") || "—"}
+            />
           </div>
         </div>
       </Card>
@@ -68,13 +163,9 @@ export function SettingsPage() {
   );
 }
 
-function UpdateRow({ name, version, latest, hasUpdate }: {
-  name: string;
-  version: string;
-  latest: string;
-  hasUpdate?: boolean;
-}) {
+function UpdateRow({ name, version, latest }: { name: string; version: string; latest: string }) {
   const t = useT();
+  const hasUpdate = version !== "—" && latest !== "—" && version !== latest;
   return (
     <div className="flex items-center justify-between gap-3 rounded-xl border border-zk-border-soft bg-zk-bg-elevated/60 px-4 py-3">
       <div className="min-w-0">

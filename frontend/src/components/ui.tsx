@@ -141,6 +141,7 @@ export function Input({
   onChange,
   hint,
   mono,
+  type = "text",
 }: {
   label: string;
   placeholder?: string;
@@ -148,12 +149,13 @@ export function Input({
   onChange?: (v: string) => void;
   hint?: string;
   mono?: boolean;
+  type?: string;
 }) {
   return (
     <label className="block">
       <span className="mb-1.5 block text-xs font-medium text-zk-muted">{label}</span>
       <input
-        type="text"
+        type={type}
         placeholder={placeholder}
         value={value}
         onChange={(e) => onChange?.(e.target.value)}

@@ -1,5 +1,8 @@
 import type { ComponentType } from "react";
 import { AppProvider, useApp } from "./lib/store";
+import { SessionProvider } from "./lib/session";
+import { AuthGate } from "./components/AuthGate";
+import { OnboardingGate } from "./components/OnboardingGate";
 import { AppShell } from "./components/layout";
 import { StatusPage } from "./pages/StatusPage";
 import { ProxiesPage } from "./pages/ProxiesPage";
@@ -29,9 +32,15 @@ function Router() {
 export default function App() {
   return (
     <AppProvider>
-      <AppShell>
-        <Router />
-      </AppShell>
+      <SessionProvider>
+        <AuthGate>
+          <OnboardingGate>
+            <AppShell>
+              <Router />
+            </AppShell>
+          </OnboardingGate>
+        </AuthGate>
+      </SessionProvider>
     </AppProvider>
   );
 }

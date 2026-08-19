@@ -1,7 +1,14 @@
-import { useState, useMemo, useCallback } from "react";
-import { Badge, Button, Card, CardHeader, MockBanner, Select } from "../components/ui";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Badge, Button, Card, CardHeader, Select } from "../components/ui";
 import { IconChevron } from "../components/icons";
 import { useT } from "../lib/i18n";
+import { useSession } from "../lib/session";
+import { ApiError, clashJson } from "../lib/api";
+import {
+  isProxyGroup,
+  type ClashDelayResponse,
+  type ClashProxiesResponse,
+} from "../lib/clash";
 
 interface ProxyNode {
   name: string;
@@ -11,78 +18,8 @@ interface ProxyNode {
 interface ProxyGroup {
   name: string;
   type: string;
-  icon?: string;
-  hidden?: boolean;
   nodes: ProxyNode[];
 }
-
-const MOCK_NODES: ProxyNode[] = [
-  { name: "DIRECT" },
-  { name: "🇳🇱 NL-Amsterdam-01", delay: 89 },
-  { name: "🇳🇱 NL-Amsterdam-02", delay: 94 },
-  { name: "🇩🇪 DE-Frankfurt-01", delay: 112 },
-  { name: "🇩🇪 DE-Berlin-02", delay: 118 },
-  { name: "🇫🇮 FI-Helsinki-01", delay: 145 },
-  { name: "🇸🇪 SE-Stockholm-01", delay: 138 },
-  { name: "🇳🇴 NO-Oslo-01", delay: 152 },
-  { name: "🇵🇱 PL-Warsaw-01", delay: 130 },
-  { name: "🇦🇹 AT-Vienna-01", delay: 125 },
-  { name: "🇨🇿 CZ-Prague-01", delay: 128 },
-  { name: "🇨🇭 CH-Zurich-01", delay: 135 },
-  { name: "🇬🇧 UK-London-01", delay: 167 },
-  { name: "🇬🇧 UK-London-02", delay: 172 },
-  { name: "🇫🇷 FR-Paris-01", delay: 142 },
-  { name: "🇮🇹 IT-Milan-01", delay: 155 },
-  { name: "🇪🇸 ES-Madrid-01", delay: 161 },
-  { name: "🇺🇸 US-NewYork-01", delay: 201 },
-  { name: "🇺🇸 US-LosAngeles-02", delay: 245 },
-  { name: "🇺🇸 US-Dallas-03", delay: 218 },
-  { name: "🇨🇦 CA-Toronto-01", delay: 210 },
-  { name: "🇯🇵 JP-Tokyo-01", delay: 278 },
-  { name: "🇸🇬 SG-Singapore-01", delay: 295 },
-  { name: "🇦🇺 AU-Sydney-01", delay: 310 },
-  { name: "🇧🇷 BR-SaoPaulo-01", delay: 330 },
-  { name: "🇹🇷 TR-Istanbul-01", delay: 158 },
-];
-
-const MOCK_GROUPS: ProxyGroup[] = [
-  { name: "YouTube", type: "select", icon: "https://www.svgrepo.com/show/13671/youtube.svg", nodes: MOCK_NODES },
-  { name: "Google", type: "select", icon: "https://www.svgrepo.com/show/475656/google-color.svg", nodes: MOCK_NODES },
-  { name: "Google Play", type: "select", icon: "https://www.svgrepo.com/show/353828/google-play-icon.svg", nodes: MOCK_NODES },
-  { name: "Gemini", type: "select", icon: "https://www.svgrepo.com/show/331406/gemini.svg", nodes: MOCK_NODES },
-  { name: "OpenAI", type: "select", icon: "https://www.svgrepo.com/show/306500/openai.svg", nodes: MOCK_NODES },
-  { name: "Telegram", type: "select", icon: "https://www.svgrepo.com/show/354443/telegram.svg", nodes: MOCK_NODES },
-  { name: "Discord", type: "select", icon: "https://www.svgrepo.com/show/331368/discord-v2.svg", nodes: MOCK_NODES },
-  { name: "Whatsapp", type: "select", icon: "https://www.svgrepo.com/show/349511/spotify.svg", nodes: MOCK_NODES },
-  { name: "Instagram", type: "select", icon: "https://www.svgrepo.com/show/452229/instagram-1.svg", nodes: MOCK_NODES },
-  { name: "Facebook", type: "select", icon: "https://www.svgrepo.com/show/475647/facebook-color.svg", nodes: MOCK_NODES },
-  { name: "Twitter", type: "select", icon: "https://www.svgrepo.com/show/452121/twitter-1.svg", nodes: MOCK_NODES },
-  { name: "TikTok", type: "select", icon: "https://www.svgrepo.com/show/349530/tiktok.svg", nodes: MOCK_NODES },
-  { name: "Spotify", type: "select", icon: "https://www.svgrepo.com/show/349511/spotify.svg", nodes: MOCK_NODES },
-  { name: "Netflix", type: "select", icon: "https://www.svgrepo.com/show/303341/netflix-1-logo.svg", nodes: MOCK_NODES },
-  { name: "Twitch", type: "select", icon: "https://www.svgrepo.com/show/448251/twitch.svg", nodes: MOCK_NODES },
-  { name: "Steam", type: "select", icon: "https://www.svgrepo.com/show/452107/steam.svg", nodes: MOCK_NODES },
-  { name: "Microsoft", type: "select", icon: "https://www.svgrepo.com/show/452062/microsoft.svg", nodes: MOCK_NODES },
-  { name: "GitHub", type: "select", icon: "https://www.svgrepo.com/show/344880/github.svg", nodes: MOCK_NODES },
-  { name: "Apple", type: "select", icon: "https://www.svgrepo.com/show/501448/apple.svg", nodes: MOCK_NODES },
-  { name: "Roblox", type: "select", icon: "https://www.svgrepo.com/show/443377/brand-roblox.svg", nodes: MOCK_NODES },
-  { name: "Linkedin", type: "select", icon: "https://www.svgrepo.com/show/448234/linkedin.svg", nodes: MOCK_NODES },
-  { name: "Tidal", type: "select", icon: "https://www.svgrepo.com/show/504993/tidal.svg", nodes: MOCK_NODES },
-  { name: "Viber", type: "select", icon: "https://www.svgrepo.com/show/125448/viber.svg", nodes: MOCK_NODES },
-  { name: "Notion", type: "select", icon: "https://www.svgrepo.com/show/361558/notion-logo.svg", nodes: MOCK_NODES },
-  { name: "Fastly", type: "select", icon: "https://www.svgrepo.com/show/353730/fastly.svg", nodes: MOCK_NODES },
-  { name: "Speedtest", type: "select", icon: "https://www.svgrepo.com/show/355484/speed.svg", nodes: MOCK_NODES },
-  { name: "Oculus", type: "select", icon: "https://www.svgrepo.com/show/293111/maps-and-flags-global.svg", nodes: MOCK_NODES },
-  { name: "2IP.IO", type: "select", icon: "https://www.svgrepo.com/show/415672/address-location-map.svg", nodes: MOCK_NODES },
-  { name: "intel", type: "select", icon: "https://www.svgrepo.com/show/349412/intel.svg", nodes: MOCK_NODES },
-  { name: "18+", type: "select", icon: "https://www.svgrepo.com/show/530357/peach.svg", nodes: MOCK_NODES },
-  { name: "other", type: "select", icon: "https://www.svgrepo.com/show/462111/netflix.svg", nodes: MOCK_NODES },
-  { name: "RU traffic", type: "select", icon: "https://www.svgrepo.com/show/508628/flag-ru.svg", nodes: MOCK_NODES },
-  { name: "Other traffic", type: "select", icon: "https://www.svgrepo.com/show/293111/maps-and-flags-global.svg", nodes: MOCK_NODES },
-  { name: "Блокировка рекламы", type: "select", icon: "https://www.svgrepo.com/show/300290/sign-roadblock.svg", nodes: [...MOCK_NODES.filter(n => n.name !== "DIRECT"), { name: "REJECT" }, { name: "DIRECT" }] },
-];
-
-const SERVER_OPTIONS = MOCK_NODES.map((n) => ({ value: n.name, label: n.name }));
 
 function delayColor(ms: number) {
   if (ms <= 100) return "text-zk-accent";
@@ -90,80 +27,192 @@ function delayColor(ms: number) {
   return "text-zk-coral";
 }
 
-function GroupIcon({ src, name }: { src?: string; name: string }) {
-  if (src) {
-    return (
-      <img
-        src={src}
-        alt=""
-        className="h-6 w-6 shrink-0 rounded-md object-contain"
-        loading="lazy"
-        onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
-      />
-    );
+function mapGroups(data: ClashProxiesResponse): ProxyGroup[] {
+  return Object.values(data.proxies)
+    .filter(isProxyGroup)
+    .map((g) => ({
+      name: g.name,
+      type: g.type,
+      nodes: (g.all ?? []).map((name) => ({ name })),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function selectedMap(data: ClashProxiesResponse): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const item of Object.values(data.proxies)) {
+    if (isProxyGroup(item) && item.now) {
+      map[item.name] = item.now;
+    }
   }
-  return (
-    <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-zk-surface-hover text-[11px] font-bold text-zk-muted">
-      {name[0]?.toUpperCase()}
-    </span>
-  );
+  return map;
 }
 
 export function ProxiesPage() {
   const t = useT();
-  const [expanded, setExpanded] = useState<string>("");
+  const { clash, settings } = useSession();
+  const [groups, setGroups] = useState<ProxyGroup[]>([]);
+  const [selected, setSelected] = useState<Record<string, string>>({});
+  const [delays, setDelays] = useState<Record<string, number>>({});
+  const [expanded, setExpanded] = useState("");
   const [search, setSearch] = useState("");
-  const [selected, setSelected] = useState<Record<string, string>>(() => {
-    const init: Record<string, string> = {};
-    for (const g of MOCK_GROUPS) {
-      init[g.name] = "DIRECT";
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState("");
+  const [testing, setTesting] = useState(false);
+
+  const loadProxies = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const data = await clashJson<ClashProxiesResponse>("proxies", clash);
+      setGroups(mapGroups(data));
+      setSelected(selectedMap(data));
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : t("proxies.loadError"));
+    } finally {
+      setLoading(false);
     }
-    return init;
-  });
+  }, [clash, t]);
+
+  useEffect(() => {
+    loadProxies();
+  }, [loadProxies]);
 
   const filtered = useMemo(() => {
-    if (!search.trim()) return MOCK_GROUPS;
+    if (!search.trim()) return groups;
     const q = search.toLowerCase();
-    return MOCK_GROUPS.filter((g) => g.name.toLowerCase().includes(q));
-  }, [search]);
+    return groups.filter((g) => g.name.toLowerCase().includes(q));
+  }, [groups, search]);
 
-  const applyToAll = useCallback((server: string) => {
-    setSelected(() => {
-      const next: Record<string, string> = {};
-      for (const g of MOCK_GROUPS) {
-        next[g.name] = server;
+  const allNodeNames = useMemo(() => {
+    const names = new Set<string>();
+    for (const g of groups) {
+      for (const n of g.nodes) names.add(n.name);
+    }
+    return Array.from(names).sort();
+  }, [groups]);
+
+  const selectProxy = useCallback(
+    async (groupName: string, nodeName: string) => {
+      setBusy(groupName);
+      setError("");
+      try {
+        await clashJson(`proxies/${encodeURIComponent(groupName)}`, clash, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: nodeName }),
+        });
+        setSelected((s) => ({ ...s, [groupName]: nodeName }));
+      } catch (err) {
+        setError(err instanceof ApiError ? err.message : t("proxies.switchError"));
+      } finally {
+        setBusy("");
       }
-      return next;
-    });
-  }, []);
+    },
+    [clash, t],
+  );
+
+  const applyToAll = useCallback(
+    async (server: string) => {
+      setBusy("__all__");
+      setError("");
+      try {
+        for (const g of groups) {
+          await clashJson(`proxies/${encodeURIComponent(g.name)}`, clash, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: server }),
+          });
+        }
+        setSelected(() => {
+          const next: Record<string, string> = {};
+          for (const g of groups) next[g.name] = server;
+          return next;
+        });
+      } catch (err) {
+        setError(err instanceof ApiError ? err.message : t("proxies.switchError"));
+      } finally {
+        setBusy("");
+      }
+    },
+    [groups, clash, t],
+  );
+
+  const testDelay = useCallback(
+    async (name: string) => {
+      const url = encodeURIComponent(settings?.clash_api.ping_url || "https://www.gstatic.com/generate_204");
+      const timeout = settings?.clash_api.ping_timeout || 5000;
+      try {
+        const res = await clashJson<ClashDelayResponse>(
+          `proxies/${encodeURIComponent(name)}/delay?url=${url}&timeout=${timeout}`,
+          clash,
+        );
+        if (res.delay >= 0) {
+          setDelays((d) => ({ ...d, [name]: res.delay }));
+        }
+      } catch {
+        setDelays((d) => ({ ...d, [name]: -1 }));
+      }
+    },
+    [clash, settings],
+  );
+
+  const testAllVisible = useCallback(async () => {
+    setTesting(true);
+    const names = new Set<string>();
+    for (const g of filtered) {
+      for (const n of g.nodes) names.add(n.name);
+    }
+    await Promise.all(Array.from(names).map((n) => testDelay(n)));
+    setTesting(false);
+  }, [filtered, testDelay]);
+
+  if (loading) {
+    return (
+      <div className="page-enter py-12 text-center text-sm text-zk-muted">
+        {t("app.loading")}
+      </div>
+    );
+  }
 
   return (
     <div className="page-enter space-y-4">
-      <MockBanner />
+      {error && (
+        <div className="rounded-xl border border-zk-coral/25 bg-zk-coral/10 px-3 py-2 text-center text-xs text-zk-coral">
+          {error}
+        </div>
+      )}
 
       <div className="flex items-end justify-between gap-3">
         <div>
           <h1 className="text-xl font-bold tracking-tight sm:text-2xl">{t("proxies.title")}</h1>
           <p className="mt-1 text-sm text-zk-muted">
-            {t("proxies.subtitle", { count: MOCK_GROUPS.length })}
+            {t("proxies.subtitle", { count: groups.length })}
           </p>
         </div>
-        <Button size="sm" variant="secondary">⟳ {t("proxies.testAll")}</Button>
+        <div className="flex gap-2">
+          <Button size="sm" variant="ghost" onClick={loadProxies} disabled={!!busy}>
+            ⟳
+          </Button>
+          <Button size="sm" variant="secondary" onClick={testAllVisible} disabled={testing || !!busy}>
+            {testing ? t("app.loading") : t("proxies.testAll")}
+          </Button>
+        </div>
       </div>
 
-      {/* Quick apply to all groups */}
       <Card>
         <CardHeader title={t("proxies.quickSelect")} subtitle={t("proxies.quickSelectSub")} />
         <div className="flex flex-wrap items-end gap-3 p-4 sm:p-5">
           <div className="min-w-[200px] flex-1">
             <Select
               label={t("proxies.serverForAll")}
-              options={SERVER_OPTIONS}
+              options={allNodeNames.map((n) => ({ value: n, label: n }))}
               value="DIRECT"
               onChange={applyToAll}
             />
           </div>
-          <Button size="sm" variant="ghost" onClick={() => applyToAll("DIRECT")}>
+          <Button size="sm" variant="ghost" onClick={() => applyToAll("DIRECT")} disabled={!!busy}>
             {t("proxies.resetAll")}
           </Button>
         </div>
@@ -180,7 +229,9 @@ export function ProxiesPage() {
       <div className="space-y-1.5">
         {filtered.map((group) => {
           const open = expanded === group.name;
-          const currentNode = group.nodes.find((n) => n.name === selected[group.name]);
+          const current = selected[group.name];
+          const currentDelay = current ? delays[current] : undefined;
+          const isGroupBusy = busy === group.name || busy === "__all__";
           return (
             <Card key={group.name} className="overflow-hidden">
               <button
@@ -191,22 +242,27 @@ export function ProxiesPage() {
                 <IconChevron
                   className={`h-3.5 w-3.5 shrink-0 text-zk-dim transition-transform ${open ? "rotate-90" : ""}`}
                 />
-                <GroupIcon src={group.icon} name={group.name} />
+                <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-zk-surface-hover text-[11px] font-bold text-zk-muted">
+                  {group.name[0]?.toUpperCase()}
+                </span>
                 <div className="min-w-0 flex-1">
                   <span className="text-sm font-semibold">{group.name}</span>
                   <p className="truncate text-[11px] text-zk-muted">
-                    <span className={selected[group.name] === "DIRECT" ? "text-zk-dim" : "text-zk-accent"}>
-                      {selected[group.name] || "—"}
+                    <span className={current === "DIRECT" ? "text-zk-dim" : "text-zk-accent"}>
+                      {current || "—"}
                     </span>
-                    {currentNode?.delay !== undefined && (
-                      <span className={`ml-2 font-mono ${delayColor(currentNode.delay)}`}>
-                        {currentNode.delay}ms
+                    {currentDelay !== undefined && currentDelay >= 0 && (
+                      <span className={`ml-2 font-mono ${delayColor(currentDelay)}`}>
+                        {currentDelay}ms
                       </span>
+                    )}
+                    {isGroupBusy && (
+                      <span className="ml-2 text-zk-dim">{t("app.loading")}</span>
                     )}
                   </p>
                 </div>
-                <Badge variant={selected[group.name] === "DIRECT" ? "muted" : "default"}>
-                  {selected[group.name] === "DIRECT" ? "DIRECT" : group.type}
+                <Badge variant={current === "DIRECT" ? "muted" : "default"}>
+                  {current === "DIRECT" ? "DIRECT" : group.type}
                 </Badge>
               </button>
 
@@ -214,14 +270,16 @@ export function ProxiesPage() {
                 <div className="border-t border-zk-border-soft px-2 pb-2 sm:px-3">
                   <div className="mt-1 grid gap-1 sm:grid-cols-2 lg:grid-cols-3">
                     {group.nodes.map((node) => {
-                      const isActive = selected[group.name] === node.name;
+                      const isActive = current === node.name;
                       const isDirect = node.name === "DIRECT";
                       const isReject = node.name === "REJECT";
+                      const delay = delays[node.name];
                       return (
                         <button
                           key={node.name}
                           type="button"
-                          onClick={() => setSelected((s) => ({ ...s, [group.name]: node.name }))}
+                          disabled={isGroupBusy}
+                          onClick={() => selectProxy(group.name, node.name)}
                           className={`flex items-center justify-between rounded-xl px-3 py-2 text-sm transition-colors ${
                             isActive
                               ? "bg-zk-accent/10 border border-zk-accent/25 text-zk-accent"
@@ -233,9 +291,9 @@ export function ProxiesPage() {
                           }`}
                         >
                           <span className="truncate font-medium">{node.name}</span>
-                          {node.delay !== undefined && (
-                            <span className={`ml-2 shrink-0 font-mono text-xs ${delayColor(node.delay)}`}>
-                              {node.delay}ms
+                          {delay !== undefined && delay >= 0 && (
+                            <span className={`ml-2 shrink-0 font-mono text-xs ${delayColor(delay)}`}>
+                              {delay}ms
                             </span>
                           )}
                         </button>

@@ -194,6 +194,55 @@ const translations: Translations = {
 
     // Mock banner
     "mock.banner": "UI-прототип · данные демонстрационные · функционал не подключён",
+
+    // App
+    "app.loading": "Загрузка…",
+
+    // Auth
+    "auth.loginTitle": "Вход",
+    "auth.loginSub": "Введите пароль панели",
+    "auth.setupTitle": "Первоначальная настройка",
+    "auth.setupSub": "Задайте пароль для доступа к панели",
+    "auth.password": "Пароль",
+    "auth.confirmPassword": "Подтверждение",
+    "auth.loginAction": "Войти",
+    "auth.setupAction": "Сохранить",
+    "auth.logout": "Выйти",
+    "auth.passwordShort": "Минимум 4 символа",
+    "auth.passwordMismatch": "Пароли не совпадают",
+    "auth.failed": "Ошибка авторизации",
+
+    // Proxies API
+    "proxies.loadError": "Не удалось загрузить proxy-группы",
+    "proxies.switchError": "Не удалось переключить узел",
+
+    // Status API
+    "status.actionError": "Не удалось выполнить действие",
+
+    // Settings
+    "settings.saveClash": "Сохранить Clash API",
+    "settings.saved": "Сохранено",
+    "settings.unixHint": "Имя файла сокета в каталоге Mihomo (вместо TCP-порта)",
+    "settings.subscription": "Подписка VPS",
+    "settings.subscriptionSub": "URL proxy-provider для загрузки списка серверов",
+    "settings.saveSubscription": "Сохранить и обновить",
+
+    // Onboarding
+    "onboarding.title": "Добро пожаловать в zKeen UI",
+    "onboarding.subtitle": "Первоначальная настройка",
+    "onboarding.hint": "Вставьте ссылку на подписку, чтобы загрузить список VPS в Mihomo. Можно пропустить и добавить позже в Config или Settings.",
+    "onboarding.subUrl": "URL подписки",
+    "onboarding.subHint": "Будет записано в proxy-providers.subscription",
+    "onboarding.skip": "Пропустить",
+    "onboarding.continue": "Продолжить",
+    "onboarding.failed": "Не удалось применить подписку",
+
+    // Config API
+    "config.reload": "Перезагрузить",
+    "config.validateError": "Ошибка проверки конфига",
+    "config.saveError": "Ошибка сохранения конфига",
+    "config.refreshError": "Не удалось обновить провайдер",
+    "config.quickMockNote": "Остальные быстрые настройки — скоро. Пока используйте YAML-редактор (Expert).",
   },
 
   en: {
@@ -384,6 +433,44 @@ const translations: Translations = {
 
     // Mock banner
     "mock.banner": "UI prototype · demo data · functionality not connected",
+
+    "app.loading": "Loading…",
+    "auth.loginTitle": "Sign in",
+    "auth.loginSub": "Enter panel password",
+    "auth.setupTitle": "Initial setup",
+    "auth.setupSub": "Set a password for panel access",
+    "auth.password": "Password",
+    "auth.confirmPassword": "Confirm password",
+    "auth.loginAction": "Sign in",
+    "auth.setupAction": "Save",
+    "auth.logout": "Sign out",
+    "auth.passwordShort": "At least 4 characters",
+    "auth.passwordMismatch": "Passwords do not match",
+    "auth.failed": "Authentication failed",
+    "proxies.loadError": "Failed to load proxy groups",
+    "proxies.switchError": "Failed to switch node",
+    "status.actionError": "Action failed",
+    "settings.saveClash": "Save Clash API",
+    "settings.saved": "Saved",
+    "settings.unixHint": "Socket filename in Mihomo dir (instead of TCP port)",
+    "settings.subscription": "VPS subscription",
+    "settings.subscriptionSub": "Proxy-provider URL to fetch server list",
+    "settings.saveSubscription": "Save and refresh",
+
+    "onboarding.title": "Welcome to zKeen UI",
+    "onboarding.subtitle": "Initial setup",
+    "onboarding.hint": "Paste your subscription URL to load VPS nodes into Mihomo. You can skip and add it later in Config or Settings.",
+    "onboarding.subUrl": "Subscription URL",
+    "onboarding.subHint": "Written to proxy-providers.subscription",
+    "onboarding.skip": "Skip",
+    "onboarding.continue": "Continue",
+    "onboarding.failed": "Failed to apply subscription",
+
+    "config.reload": "Reload",
+    "config.validateError": "Config validation failed",
+    "config.saveError": "Failed to save config",
+    "config.refreshError": "Failed to refresh provider",
+    "config.quickMockNote": "Other quick settings coming soon. Use YAML editor (Expert) for now.",
   },
 };
 
