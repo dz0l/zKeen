@@ -8,6 +8,7 @@ target/
 
 # === Сборки ===
 frontend/dist/
+backend/frontend-dist/
 dist/
 *.tar.gz
 

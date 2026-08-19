@@ -4,7 +4,7 @@ use axum::response::Response;
 use rust_embed::Embed;
 
 #[derive(Embed)]
-#[folder = "../frontend/dist"]
+#[folder = "frontend-dist"]
 struct StaticFiles;
 
 pub async fn serve(uri: Uri) -> Response {
