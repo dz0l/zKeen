@@ -13,14 +13,10 @@
 - mipsel: `build-std = true` в `backend/Cross.toml`.
 
 ## State:
-- CI v0.0.1 после 13c3d26: frontend OK, aarch64 OK, mipsel FAIL (nightly required for build-std).
-
-## Done:
-- Stage 0 UI mock, Stage 1 backend, install.sh, release workflow, Connections page.
-- fix(ci) dae4ff5: stable + cross без host mipsel target.
+- CI: workflow YAML invalid — `uses: dtolnay/rust-toolchain@${{ matrix.toolchain }}` не поддерживается Actions.
 
 ## Now:
-- fix(ci): nightly toolchain для mipsel build-std, перезапуск release.
+- fix(ci): toolchain через input, перезапуск release v0.0.1.
 
 ## Next:
 - Проверить успешный CI и Release v0.0.1.
