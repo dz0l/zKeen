@@ -2,7 +2,7 @@
 set -e
 
 # ============================================================
-#  zKeen UI — установка / обновление для Keenetic + Entware
+#  zKeen UI — install / update for Keenetic + Entware
 # ============================================================
 
 REPO_OWNER="dz0l"
@@ -14,8 +14,8 @@ INIT_SCRIPT="S99zkeen-ui"
 CONF_DIR="/opt/etc/xkeen"
 PORT="7220"
 MIN_FREE_MB=15
+MIN_BINARY_BYTES=1048576
 GITHUB_API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}"
-GITHUB_RAW="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -24,31 +24,14 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-log_info()  { printf "${GREEN}[✓]${NC} %s\n" "$1"; }
-log_warn()  { printf "${YELLOW}[!]${NC} %s\n" "$1"; }
-log_error() { printf "${RED}[✗]${NC} %s\n" "$1"; }
-log_step()  { printf "${CYAN}[→]${NC} ${BOLD}%s${NC}\n" "$1"; }
+log_info()  { printf "${GREEN}[OK]${NC} %s\n" "$1"; }
+log_warn()  { printf "${YELLOW}[!!]${NC} %s\n" "$1"; }
+log_error() { printf "${RED}[ERR]${NC} %s\n" "$1"; }
+log_step()  { printf "${CYAN}>>${NC} ${BOLD}%s${NC}\n" "$1"; }
 
 die() { log_error "$1"; exit 1; }
 
-# Portable ELF magic check (\x7fELF) for BusyBox/GNU toolchains
-is_elf_binary() {
-    _file="$1"
-
-    if command -v file >/dev/null 2>&1; then
-        file "$_file" 2>/dev/null | grep -q 'ELF' && return 0
-    fi
-
-    _magic=$(od -A n -t x1 -N 4 "$_file" 2>/dev/null | tr -dc '0-9a-fA-F')
-    if [ "$_magic" = "7f454c46" ]; then
-        return 0
-    fi
-
-    _magic=$(od -An -N 4 -t x1 "$_file" 2>/dev/null | tr -dc '0-9a-fA-F')
-    [ "$_magic" = "7f454c46" ]
-}
-
-# --- Определение режима ---
+# --- Mode ---
 MODE="install"
 for arg in "$@"; do
     case "$arg" in
@@ -57,57 +40,113 @@ for arg in "$@"; do
     esac
 done
 
+# --- curl wrapper with CA bundle (Entware) ---
+setup_curl_cacert() {
+    CURL_CA_BUNDLE=""
+    for _cert in \
+        /opt/etc/ssl/certs/ca-certificates.crt \
+        /opt/etc/ssl/cert.pem \
+        /etc/ssl/cert.pem \
+        /etc/ssl/certs/ca-certificates.crt; do
+        if [ -f "$_cert" ]; then
+            CURL_CA_BUNDLE="$_cert"
+            export CURL_CA_BUNDLE
+            return 0
+        fi
+    done
+    log_warn "CA certificates not found. Install: opkg install curl ca-certificates"
+    return 1
+}
+
+curl_fetch() {
+    _url="$1"
+    _out="$2"
+    _extra="${3:-}"
+
+    if [ -n "$CURL_CA_BUNDLE" ]; then
+        _cacert="--cacert $CURL_CA_BUNDLE"
+    else
+        _cacert=""
+    fi
+
+    # shellcheck disable=SC2086
+    if [ -n "$_out" ]; then
+        curl -fSL $_cacert --connect-timeout 15 --max-time 300 \
+            --retry 3 --retry-delay 5 $_extra -o "$_out" "$_url"
+    else
+        curl -fSL $_cacert --connect-timeout 15 --max-time 30 \
+            --retry 3 --retry-delay 5 $_extra "$_url"
+    fi
+}
+
+# ELF magic: 0x7f 'E' 'L' 'F' — works on BusyBox ash without od quirks
+is_elf_binary() {
+    _file="$1"
+    _sig=$(dd if="$_file" bs=1 count=4 2>/dev/null) || return 1
+    _elf=$(printf '\177ELF')
+    [ "$_sig" = "$_elf" ]
+}
+
+file_head_is_text() {
+    _file="$1"
+    _first=$(dd if="$_file" bs=1 count=1 2>/dev/null) || return 1
+    case "$_first" in
+        '<'|'{'|'['|' ') return 0 ;;
+    esac
+    return 1
+}
+
 # ============================================================
-#  Проверки окружения
+#  Environment checks
 # ============================================================
 
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
-        die "Скрипт должен быть запущен от root (sudo)"
+        die "Run as root"
     fi
 }
 
 check_entware() {
     if [ ! -d "/opt/etc" ]; then
-        die "Entware не обнаружен. Установите Entware: https://github.com/Entware/Entware/wiki"
+        die "Entware not found. See https://github.com/Entware/Entware/wiki"
     fi
-    log_info "Entware обнаружен"
+    log_info "Entware detected"
 }
 
 check_curl() {
     if ! command -v curl >/dev/null 2>&1; then
-        log_warn "curl не найден, устанавливаю..."
+        log_warn "curl not found, installing..."
         if command -v opkg >/dev/null 2>&1; then
             opkg update >/dev/null 2>&1
-            opkg install curl >/dev/null 2>&1 || die "Не удалось установить curl"
-            log_info "curl установлен"
+            opkg install curl ca-certificates >/dev/null 2>&1 \
+                || opkg install curl >/dev/null 2>&1 \
+                || die "Failed to install curl"
+            log_info "curl installed"
         else
-            die "curl не найден и opkg недоступен"
+            die "curl not found and opkg is unavailable"
         fi
     fi
+    setup_curl_cacert || true
 }
 
 detect_arch() {
     ARCH=$(uname -m)
     case "$ARCH" in
         aarch64)
-            ARCH_SUFFIX="aarch64-unknown-linux-musl"
             ASSET_NAME="${BINARY_NAME}-arm64-v8a"
             ;;
         mips|mipsel)
             if [ "$(echo -n I | od -to2 | head -c 20 | awk '{print $2}')" = "00000" ]; then
-                ARCH_SUFFIX="mips-unknown-linux-musl"
                 ASSET_NAME="${BINARY_NAME}-mips32"
             else
-                ARCH_SUFFIX="mipsel-unknown-linux-musl"
                 ASSET_NAME="${BINARY_NAME}-mips32le"
             fi
             ;;
         *)
-            die "Архитектура ${ARCH} не поддерживается. Поддерживаются: aarch64, mipsle"
+            die "Unsupported architecture: ${ARCH} (supported: aarch64, mipsle)"
             ;;
     esac
-    log_info "Архитектура: ${ARCH} (${ASSET_NAME})"
+    log_info "Architecture: ${ARCH} (${ASSET_NAME})"
 }
 
 check_free_space() {
@@ -118,52 +157,69 @@ check_free_space() {
 
     FREE_KB=$(df -k "$MOUNT_POINT" 2>/dev/null | tail -1 | awk '{print $4}')
     if [ -z "$FREE_KB" ]; then
-        log_warn "Не удалось определить свободное место, продолжаю..."
+        log_warn "Cannot determine free space, continuing..."
         return
     fi
 
     FREE_MB=$((FREE_KB / 1024))
     if [ "$FREE_MB" -lt "$MIN_FREE_MB" ]; then
-        die "Недостаточно места: ${FREE_MB} МБ свободно, требуется минимум ${MIN_FREE_MB} МБ"
+        die "Not enough space: ${FREE_MB} MB free, need at least ${MIN_FREE_MB} MB"
     fi
-    log_info "Свободное место: ${FREE_MB} МБ (мин. ${MIN_FREE_MB} МБ)"
+    log_info "Free space: ${FREE_MB} MB (min ${MIN_FREE_MB} MB)"
 }
 
 check_repo_available() {
-    log_step "Проверка доступности репозитория..."
+    log_step "Checking repository..."
 
     REPO_CODE=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 15 \
+        ${CURL_CA_BUNDLE:+--cacert "$CURL_CA_BUNDLE"} \
         "${GITHUB_API}" 2>/dev/null || echo "000")
 
     case "$REPO_CODE" in
-        200) log_info "Репозиторий найден: ${REPO_OWNER}/${REPO_NAME}" ;;
-        404) die "Репозиторий не найден: ${REPO_OWNER}/${REPO_NAME}" ;;
-        403) die "Доступ к GitHub API ограничен (rate limit). Повторите через несколько минут" ;;
-        000) die "Нет подключения к GitHub. Проверьте интернет или DNS" ;;
-        *)   die "GitHub вернул HTTP ${REPO_CODE} при проверке репозитория" ;;
+        200) log_info "Repository found: ${REPO_OWNER}/${REPO_NAME}" ;;
+        404) die "Repository not found: ${REPO_OWNER}/${REPO_NAME}" ;;
+        403) die "GitHub API rate limit. Retry in a few minutes" ;;
+        000) die "Cannot reach GitHub. Check internet/DNS" ;;
+        *)   die "GitHub returned HTTP ${REPO_CODE} for repository check" ;;
     esac
 
     RELEASE_CODE=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 15 \
+        ${CURL_CA_BUNDLE:+--cacert "$CURL_CA_BUNDLE"} \
         "${GITHUB_API}/releases/latest" 2>/dev/null || echo "000")
 
     case "$RELEASE_CODE" in
-        200) log_info "Release доступен" ;;
-        404) die "Нет опубликованных релизов. Дождитесь первого release (тег v*.*.*) в ${REPO_OWNER}/${REPO_NAME}" ;;
-        403) die "Доступ к GitHub API ограничен (rate limit). Повторите через несколько минут" ;;
-        000) die "Нет подключения к GitHub. Проверьте интернет или DNS" ;;
-        *)   die "GitHub вернул HTTP ${RELEASE_CODE} при проверке release" ;;
+        200) log_info "Release available" ;;
+        404) die "No published releases yet (tag v*.*.* required)" ;;
+        403) die "GitHub API rate limit. Retry in a few minutes" ;;
+        000) die "Cannot reach GitHub. Check internet/DNS" ;;
+        *)   die "GitHub returned HTTP ${RELEASE_CODE} for release check" ;;
     esac
 }
 
 get_latest_version() {
-    LATEST_TAG=$(curl -s --connect-timeout 10 --max-time 15 \
-        "${GITHUB_API}/releases/latest" 2>/dev/null | \
+    RELEASE_JSON=$(curl -s --connect-timeout 10 --max-time 15 \
+        ${CURL_CA_BUNDLE:+--cacert "$CURL_CA_BUNDLE"} \
+        "${GITHUB_API}/releases/latest" 2>/dev/null) \
+        || die "Failed to fetch release info"
+
+    LATEST_TAG=$(printf '%s' "$RELEASE_JSON" | \
         grep '"tag_name"' | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
 
     if [ -z "$LATEST_TAG" ]; then
-        die "Не удалось определить последнюю версию"
+        die "Cannot determine latest version"
     fi
-    log_info "Последняя версия: ${LATEST_TAG}"
+    log_info "Latest version: ${LATEST_TAG}"
+}
+
+resolve_download_url() {
+    DOWNLOAD_URL=$(printf '%s' "$RELEASE_JSON" | tr ',' '\n' | \
+        grep 'browser_download_url' | grep "/${ASSET_NAME}\"" | head -1 | \
+        sed 's/^[[:space:]]*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+
+    if [ -z "$DOWNLOAD_URL" ]; then
+        DOWNLOAD_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${LATEST_TAG}/${ASSET_NAME}"
+        log_warn "Asset URL not found in API response, using fallback URL"
+    fi
 }
 
 get_installed_version() {
@@ -174,57 +230,54 @@ get_installed_version() {
 }
 
 # ============================================================
-#  Загрузка и установка
+#  Download and install
 # ============================================================
 
 download_binary() {
-    DOWNLOAD_URL="${GITHUB_RAW}/download/${LATEST_TAG}/${ASSET_NAME}"
+    resolve_download_url
     TMP_FILE="/opt/tmp/${BINARY_NAME}.tmp.$$"
 
     mkdir -p /opt/tmp
-
-    # Проверяем место ещё раз перед загрузкой
     check_free_space
 
-    log_step "Загрузка ${ASSET_NAME} (${LATEST_TAG})..."
-    if ! curl -fSL --connect-timeout 15 --max-time 300 \
-         --retry 3 --retry-delay 5 \
-         -o "$TMP_FILE" "$DOWNLOAD_URL" 2>/dev/null; then
+    log_step "Downloading ${ASSET_NAME} (${LATEST_TAG})..."
+    if ! curl_fetch "$DOWNLOAD_URL" "$TMP_FILE" 2>/dev/null; then
         rm -f "$TMP_FILE"
-        die "Ошибка загрузки: ${DOWNLOAD_URL}"
+        die "Download failed: ${DOWNLOAD_URL}"
     fi
 
-    # Проверка размера
     FILE_SIZE=$(wc -c < "$TMP_FILE" 2>/dev/null | tr -d ' ')
-    if [ -z "$FILE_SIZE" ] || [ "$FILE_SIZE" -lt 1048576 ]; then
+    if [ -z "$FILE_SIZE" ] || [ "$FILE_SIZE" -lt "$MIN_BINARY_BYTES" ]; then
         rm -f "$TMP_FILE"
-        die "Загруженный файл слишком мал (${FILE_SIZE:-0} байт). Возможно, артефакт повреждён"
+        die "Downloaded file too small (${FILE_SIZE:-0} bytes). Check release assets"
     fi
 
-    # Проверка ELF-заголовка (совместимо с BusyBox od на Entware)
+    if file_head_is_text "$TMP_FILE"; then
+        rm -f "$TMP_FILE"
+        die "Downloaded file looks like HTML/JSON, not a binary. Run: opkg install curl ca-certificates"
+    fi
+
     if ! is_elf_binary "$TMP_FILE"; then
-        _magic=$(od -A n -t x1 -N 4 "$TMP_FILE" 2>/dev/null | tr -dc '0-9a-fA-F' || true)
+        _hex=$(od -An -tx1 -N4 "$TMP_FILE" 2>/dev/null | tr -dc '0-9a-fA-F' || true)
         rm -f "$TMP_FILE"
-        die "Загруженный файл не является ELF-бинарём (magic: ${_magic:-unknown}). Проверьте URL"
+        die "Not an ELF binary (magic: ${_hex:-unknown}, size: ${FILE_SIZE} bytes). URL: ${DOWNLOAD_URL}"
     fi
 
-    log_info "Файл загружен: $(( FILE_SIZE / 1024 / 1024 )) МБ"
+    log_info "Downloaded: $(( FILE_SIZE / 1024 / 1024 )) MB"
 }
 
 install_binary() {
-    log_step "Установка ${BINARY_NAME}..."
+    log_step "Installing ${BINARY_NAME}..."
 
-    # Проверяем место для установки
     FREE_KB_NOW=$(df -k /opt 2>/dev/null | tail -1 | awk '{print $4}')
     FILE_SIZE_KB=$(( $(wc -c < "$TMP_FILE" | tr -d ' ') / 1024 ))
     if [ -n "$FREE_KB_NOW" ] && [ "$FREE_KB_NOW" -lt "$((FILE_SIZE_KB + 1024))" ]; then
         rm -f "$TMP_FILE"
-        die "Недостаточно места для установки: ${FREE_KB_NOW} КБ свободно, нужно ~$((FILE_SIZE_KB + 1024)) КБ"
+        die "Not enough space to install: ${FREE_KB_NOW} KB free, need ~$((FILE_SIZE_KB + 1024)) KB"
     fi
 
     mkdir -p "${INSTALL_DIR}"
 
-    # Бэкап старого бинарника при обновлении
     if [ "$MODE" = "update" ] && [ -f "${INSTALL_DIR}/${BINARY_NAME}" ]; then
         cp -f "${INSTALL_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}.bak" 2>/dev/null || true
     fi
@@ -232,23 +285,23 @@ install_binary() {
     if ! mv -f "$TMP_FILE" "${INSTALL_DIR}/${BINARY_NAME}" 2>/dev/null; then
         cp -f "$TMP_FILE" "${INSTALL_DIR}/${BINARY_NAME}" || {
             rm -f "$TMP_FILE"
-            die "Не удалось установить бинарник"
+            die "Failed to install binary"
         }
         rm -f "$TMP_FILE"
     fi
 
     chmod 755 "${INSTALL_DIR}/${BINARY_NAME}"
     sync
-    log_info "Бинарник установлен: ${INSTALL_DIR}/${BINARY_NAME}"
+    log_info "Binary installed: ${INSTALL_DIR}/${BINARY_NAME}"
 }
 
 create_init_script() {
     if [ -f "${INIT_DIR}/${INIT_SCRIPT}" ]; then
-        log_info "Init-скрипт уже существует"
+        log_info "Init script already exists"
         return
     fi
 
-    log_step "Создание init-скрипта..."
+    log_step "Creating init script..."
     mkdir -p "${INIT_DIR}"
 
     cat > "${INIT_DIR}/${INIT_SCRIPT}" <<'INITEOF'
@@ -265,77 +318,81 @@ PATH=/opt/sbin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
 INITEOF
 
     chmod 755 "${INIT_DIR}/${INIT_SCRIPT}"
-    log_info "Init-скрипт создан: ${INIT_DIR}/${INIT_SCRIPT}"
+    log_info "Init script created: ${INIT_DIR}/${INIT_SCRIPT}"
 }
 
 create_conf_dir() {
     if [ ! -d "$CONF_DIR" ]; then
         mkdir -p "$CONF_DIR"
-        log_info "Каталог конфигурации создан: ${CONF_DIR}"
+        log_info "Config directory created: ${CONF_DIR}"
     fi
 }
 
 start_service() {
-    log_step "Запуск ${BINARY_NAME}..."
+    log_step "Starting ${BINARY_NAME}..."
     if "${INIT_DIR}/${INIT_SCRIPT}" start >/dev/null 2>&1; then
         sleep 1
         if pgrep -x "${BINARY_NAME}" >/dev/null 2>&1; then
-            log_info "Сервис запущен"
+            log_info "Service started"
         else
-            log_warn "Сервис запущен, но процесс не обнаружен. Проверьте лог: /opt/var/log/zkeen-ui.log"
+            log_warn "Service started but process not found. Check log: /opt/var/log/zkeen-ui.log"
         fi
     else
-        log_warn "Не удалось запустить сервис автоматически"
+        log_warn "Failed to start service automatically"
     fi
 }
 
 restart_service() {
-    log_step "Перезапуск ${BINARY_NAME}..."
+    log_step "Restarting ${BINARY_NAME}..."
     "${INIT_DIR}/${INIT_SCRIPT}" restart >/dev/null 2>&1 || true
     sleep 1
     if pgrep -x "${BINARY_NAME}" >/dev/null 2>&1; then
-        log_info "Сервис перезапущен"
+        log_info "Service restarted"
     else
-        log_warn "Сервис не запустился после перезапуска"
+        log_warn "Service did not start after restart"
     fi
 }
 
 # ============================================================
-#  Удаление
+#  Uninstall
 # ============================================================
 
 do_uninstall() {
-    log_step "Удаление ${BINARY_NAME}..."
+    log_step "Removing ${BINARY_NAME}..."
 
     if [ -f "${INIT_DIR}/${INIT_SCRIPT}" ]; then
         "${INIT_DIR}/${INIT_SCRIPT}" stop >/dev/null 2>&1 || true
         rm -f "${INIT_DIR}/${INIT_SCRIPT}"
-        log_info "Init-скрипт удалён"
+        log_info "Init script removed"
     fi
 
     rm -f "${INSTALL_DIR}/${BINARY_NAME}"
     rm -f "${INSTALL_DIR}/${BINARY_NAME}.bak"
-    log_info "Бинарник удалён"
+    log_info "Binary removed"
 
-    printf "${YELLOW}Удалить конфигурацию ${CONF_DIR}/${BINARY_NAME}.json? [y/N] ${NC}"
+    printf "${YELLOW}Remove config ${CONF_DIR}/${BINARY_NAME}.json? [y/N] ${NC}"
     read -r answer
     case "$answer" in
-        [yY]*) rm -f "${CONF_DIR}/${BINARY_NAME}.json"; log_info "Конфигурация удалена" ;;
-        *) log_info "Конфигурация сохранена" ;;
+        [yY]*) rm -f "${CONF_DIR}/${BINARY_NAME}.json"; log_info "Config removed" ;;
+        *) log_info "Config kept" ;;
     esac
 
-    log_info "Удаление завершено"
+    log_info "Uninstall complete"
     exit 0
 }
 
 # ============================================================
-#  Основной процесс
+#  Main
 # ============================================================
 
 main() {
-    printf "\n${BOLD}  zKeen UI — %s${NC}\n\n" \
-        "$([ "$MODE" = "update" ] && echo "обновление" || \
-           [ "$MODE" = "uninstall" ] && echo "удаление" || echo "установка")"
+    case "$MODE" in
+        update)    _title="update" ;;
+        uninstall) _title="uninstall" ;;
+        *)           _title="install" ;;
+    esac
+
+    printf "\n${BOLD}  zKeen UI — %s${NC}\n\n" "$_title"
 
     check_root
 
@@ -353,11 +410,11 @@ main() {
     if [ "$MODE" = "update" ]; then
         get_installed_version
         if [ -n "$INSTALLED_VERSION" ] && [ "$INSTALLED_VERSION" = "$LATEST_TAG" ]; then
-            log_info "Уже установлена актуальная версия: ${INSTALLED_VERSION}"
+            log_info "Already up to date: ${INSTALLED_VERSION}"
             exit 0
         fi
         if [ -n "$INSTALLED_VERSION" ]; then
-            log_info "Обновление: ${INSTALLED_VERSION} → ${LATEST_TAG}"
+            log_info "Updating: ${INSTALLED_VERSION} -> ${LATEST_TAG}"
         fi
     fi
 
@@ -372,21 +429,20 @@ main() {
         start_service
     fi
 
-    # Финальная проверка места
     FINAL_FREE_KB=$(df -k /opt 2>/dev/null | tail -1 | awk '{print $4}')
     if [ -n "$FINAL_FREE_KB" ]; then
         FINAL_FREE_MB=$((FINAL_FREE_KB / 1024))
         if [ "$FINAL_FREE_MB" -lt 5 ]; then
-            log_warn "Внимание: осталось мало места (${FINAL_FREE_MB} МБ). Рекомендуется освободить место"
+            log_warn "Low disk space remaining (${FINAL_FREE_MB} MB)"
         fi
     fi
 
     IP_ADDR=$(ip -4 addr show br0 2>/dev/null | grep -o 'inet [0-9.]*' | awk '{print $2}' || \
               ip -4 route get 1.1.1.1 2>/dev/null | grep -o 'src [0-9.]*' | awk '{print $2}' || \
-              echo "<IP роутера>")
+              echo "router-ip")
 
-    printf "\n${GREEN}${BOLD}  Готово!${NC}\n"
-    printf "  Панель доступна: ${CYAN}http://${IP_ADDR}:${PORT}${NC}\n\n"
+    printf "\n${GREEN}${BOLD}  Done!${NC}\n"
+    printf "  Panel: ${CYAN}http://${IP_ADDR}:${PORT}${NC}\n\n"
 }
 
 main
