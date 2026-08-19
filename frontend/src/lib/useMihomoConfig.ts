@@ -3,9 +3,10 @@ import { ApiError } from "./api";
 import { useT } from "./i18n";
 import {
   fetchMihomoConfig,
+  getSubscriptionHwid,
   getSubscriptionUrl,
   saveMihomoConfig,
-  setSubscriptionUrl,
+  updateSubscriptionProvider,
 } from "./config";
 
 export function useMihomoConfig() {
@@ -56,14 +57,17 @@ export function useMihomoConfig() {
   );
 
   const subscriptionUrl = getSubscriptionUrl(yaml);
+  const subscriptionHwid = getSubscriptionHwid(yaml);
 
-  const updateSubscriptionUrl = useCallback(
-    (url: string) => {
-      setYaml((prev) => setSubscriptionUrl(prev, url));
-      setDirty(true);
-    },
-    [],
-  );
+  const updateSubscriptionUrl = useCallback((url: string) => {
+    setYaml((prev) => updateSubscriptionProvider(prev, { url }));
+    setDirty(true);
+  }, []);
+
+  const updateSubscriptionHwid = useCallback((hwid: string) => {
+    setYaml((prev) => updateSubscriptionProvider(prev, { hwid }));
+    setDirty(true);
+  }, []);
 
   return {
     configPath,
@@ -75,6 +79,8 @@ export function useMihomoConfig() {
     load,
     save,
     subscriptionUrl,
+    subscriptionHwid,
     updateSubscriptionUrl,
+    updateSubscriptionHwid,
   };
 }

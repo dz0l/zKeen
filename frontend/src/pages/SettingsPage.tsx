@@ -2,56 +2,23 @@ import { useState, useEffect } from "react";
 import { Card, CardHeader, Input, Select, Button, Badge } from "../components/ui";
 import { useI18n, useT, AVAILABLE_LOCALES } from "../lib/i18n";
 import { useSession } from "../lib/session";
-import { useMihomoConfig } from "../lib/useMihomoConfig";
-import { DEFAULT_PROVIDER, refreshProxyProvider, setSubscriptionUrl, saveMihomoConfig } from "../lib/config";
 import type { ClashConnection } from "../lib/api";
-import { ApiError } from "../lib/api";
 
 export function SettingsPage() {
   const t = useT();
   const { locale, setLocale } = useI18n();
   const { clash, setClash, versions, logout, loginInfo } = useSession();
-  const cfg = useMihomoConfig();
   const [draft, setDraft] = useState<ClashConnection>(clash);
-  const [subUrl, setSubUrl] = useState("");
   const [saved, setSaved] = useState(false);
-  const [subSaving, setSubSaving] = useState(false);
-  const [subError, setSubError] = useState("");
 
   useEffect(() => {
     setDraft(clash);
   }, [clash]);
 
-  useEffect(() => {
-    setSubUrl(cfg.subscriptionUrl);
-  }, [cfg.subscriptionUrl]);
-
   function saveClash() {
     setClash(draft);
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
-  }
-
-  async function saveSubscription() {
-    if (!cfg.configPath) return;
-    setSubSaving(true);
-    setSubError("");
-    try {
-      const updated = setSubscriptionUrl(cfg.yaml, subUrl);
-      cfg.setYaml(updated);
-      await saveMihomoConfig(cfg.configPath, updated, true);
-      try {
-        await refreshProxyProvider(DEFAULT_PROVIDER, clash);
-      } catch {
-        /* optional */
-      }
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
-    } catch (err) {
-      setSubError(err instanceof ApiError ? err.message : t("config.saveError"));
-    } finally {
-      setSubSaving(false);
-    }
   }
 
   return (
@@ -84,23 +51,6 @@ export function SettingsPage() {
           </div>
         </Card>
       )}
-
-      <Card>
-        <CardHeader title={t("settings.subscription")} subtitle={t("settings.subscriptionSub")} />
-        <div className="space-y-3 p-4 sm:p-5">
-          <Input
-            label={t("config.qSubUrl")}
-            placeholder="https://..."
-            mono
-            value={subUrl}
-            onChange={setSubUrl}
-          />
-          {subError && <p className="text-xs text-zk-coral">{subError}</p>}
-          <Button size="sm" variant="primary" disabled={subSaving || !subUrl.trim()} onClick={saveSubscription}>
-            {subSaving ? t("app.loading") : t("settings.saveSubscription")}
-          </Button>
-        </div>
-      </Card>
 
       <Card>
         <CardHeader title={t("settings.clashApi")} subtitle={t("settings.clashApiSub")} />

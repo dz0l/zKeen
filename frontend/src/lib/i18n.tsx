@@ -118,6 +118,7 @@ const translations: Translations = {
     "config.qProvidersSub": "Подписки, health-check, заголовки",
     "config.qProvidersRefresh": "Обновить подписку",
     "config.qSubUrl": "URL подписки",
+    "config.qHwid": "x-hwid",
     "config.qHwidHint": "Некоторые провайдеры требуют x-hwid для авторизации",
     "config.qHealthUrl": "Health-check URL",
     "config.qHealthInterval": "Интервал проверки (сек)",
@@ -230,7 +231,7 @@ const translations: Translations = {
     // Onboarding
     "onboarding.title": "Добро пожаловать в zKeen UI",
     "onboarding.subtitle": "Первоначальная настройка",
-    "onboarding.hint": "Вставьте ссылку на подписку, чтобы загрузить список VPS в Mihomo. Можно пропустить и добавить позже в Config или Settings.",
+    "onboarding.hint": "Вставьте ссылку на подписку, чтобы загрузить список VPS в Mihomo. Можно пропустить и добавить позже в Config.",
     "onboarding.subUrl": "URL подписки",
     "onboarding.subHint": "Будет записано в proxy-providers.subscription",
     "onboarding.skip": "Пропустить",
@@ -358,6 +359,7 @@ const translations: Translations = {
     "config.qProvidersSub": "Subscriptions, health-check, headers",
     "config.qProvidersRefresh": "Refresh subscription",
     "config.qSubUrl": "Subscription URL",
+    "config.qHwid": "x-hwid",
     "config.qHwidHint": "Some providers require x-hwid for authorization",
     "config.qHealthUrl": "Health-check URL",
     "config.qHealthInterval": "Check interval (sec)",
@@ -460,7 +462,7 @@ const translations: Translations = {
 
     "onboarding.title": "Welcome to zKeen UI",
     "onboarding.subtitle": "Initial setup",
-    "onboarding.hint": "Paste your subscription URL to load VPS nodes into Mihomo. You can skip and add it later in Config or Settings.",
+    "onboarding.hint": "Paste your subscription URL to load VPS nodes into Mihomo. You can skip and add it later in Config.",
     "onboarding.subUrl": "Subscription URL",
     "onboarding.subHint": "Written to proxy-providers.subscription",
     "onboarding.skip": "Skip",

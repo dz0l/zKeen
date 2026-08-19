@@ -130,24 +130,17 @@ pub async fn get_configs(
     Json(serde_json::json!({ "success": true, "configs": core_configs }))
 }
 
-fn get_allowed_prefixes(state: &AppState, is_lst: bool) -> Vec<String> {
-    if is_lst {
-        return vec![XKEEN_CONF_DIR.to_string()];
-    }
+fn all_write_prefixes(state: &AppState) -> Vec<String> {
     let settings = state.settings.read().unwrap();
-    let core = state.core.read().unwrap();
-    let default_path = if core.name == "mihomo" {
-        MIHOMO_CONF_DIR.to_string()
-    } else {
-        XRAY_CONF_DIR.to_string()
-    };
-    let extra = if core.name == "mihomo" {
-        settings.append_config_paths.mihomo.clone()
-    } else {
-        settings.append_config_paths.xray.clone()
-    };
-    let mut paths = vec![default_path];
-    paths.extend(extra);
+    let mut paths = vec![
+        MIHOMO_CONF_DIR.to_string(),
+        XRAY_CONF_DIR.to_string(),
+        XKEEN_CONF_DIR.to_string(),
+    ];
+    paths.extend(settings.append_config_paths.mihomo.clone());
+    paths.extend(settings.append_config_paths.xray.clone());
+    paths.sort();
+    paths.dedup();
     paths
 }
 
@@ -167,8 +160,7 @@ fn check_access(file: &str, state: &AppState) -> Result<bool, &'static str> {
     if file.contains("..") {
         return Err("Invalid path");
     }
-    let is_xkeen = file.ends_with(".lst") || (file.ends_with(".json") && file.starts_with(XKEEN_CONF_DIR));
-    let prefixes = get_allowed_prefixes(state, is_xkeen);
+    let prefixes = all_write_prefixes(state);
     if !is_path_allowed(file, &prefixes) {
         return Err("Path not allowed");
     }

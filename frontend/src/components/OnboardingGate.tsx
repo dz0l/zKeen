@@ -10,6 +10,7 @@ export function OnboardingGate({ children }: { children: React.ReactNode }) {
   const { booting, clash } = useSession();
   const [done, setDone] = useState(isOnboardingComplete);
   const [url, setUrl] = useState("");
+  const [hwid, setHwid] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -22,7 +23,7 @@ export function OnboardingGate({ children }: { children: React.ReactNode }) {
     setError("");
     try {
       if (!skipUrl && url.trim()) {
-        await applySubscriptionUrl(url.trim(), clash);
+        await applySubscriptionUrl(url.trim(), clash, hwid.trim());
       }
       completeOnboarding();
       setDone(true);
@@ -54,6 +55,14 @@ export function OnboardingGate({ children }: { children: React.ReactNode }) {
             value={url}
             onChange={setUrl}
             hint={t("onboarding.subHint")}
+          />
+          <Input
+            label={t("config.qHwid")}
+            placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+            mono
+            value={hwid}
+            onChange={setHwid}
+            hint={t("config.qHwidHint")}
           />
           {error && (
             <p className="rounded-lg border border-zk-coral/25 bg-zk-coral/10 px-3 py-2 text-xs text-zk-coral">

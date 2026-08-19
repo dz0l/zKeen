@@ -137,7 +137,9 @@ export function ConfigPage() {
       {(mode === "safe" || tab === "quick") && (
         <QuickSettingsTab
           subscriptionUrl={cfg.subscriptionUrl}
+          subscriptionHwid={cfg.subscriptionHwid}
           onSubscriptionChange={cfg.updateSubscriptionUrl}
+          onSubscriptionHwidChange={cfg.updateSubscriptionHwid}
           onSaveSubscription={() => handleSave(true)}
           dirty={cfg.dirty}
           saving={saving}
@@ -255,13 +257,17 @@ function EditorTab({
 
 function QuickSettingsTab({
   subscriptionUrl,
+  subscriptionHwid,
   onSubscriptionChange,
+  onSubscriptionHwidChange,
   onSaveSubscription,
   dirty,
   saving,
 }: {
   subscriptionUrl: string;
+  subscriptionHwid: string;
   onSubscriptionChange: (url: string) => void;
+  onSubscriptionHwidChange: (hwid: string) => void;
   onSaveSubscription: () => Promise<void>;
   dirty: boolean;
   saving: boolean;
@@ -326,6 +332,14 @@ function QuickSettingsTab({
             mono
             value={subscriptionUrl}
             onChange={onSubscriptionChange}
+          />
+          <Input
+            label={t("config.qHwid")}
+            placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+            mono
+            value={subscriptionHwid}
+            onChange={onSubscriptionHwidChange}
+            hint={t("config.qHwidHint")}
           />
           <div className="flex gap-2">
             <Button
