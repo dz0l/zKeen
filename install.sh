@@ -114,15 +114,27 @@ check_free_space() {
 
 check_repo_available() {
     log_step "Проверка доступности репозитория..."
-    HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 15 \
-        "${GITHUB_API}/releases/latest" 2>/dev/null || echo "000")
 
-    case "$HTTP_CODE" in
-        200) log_info "Репозиторий доступен" ;;
+    REPO_CODE=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 15 \
+        "${GITHUB_API}" 2>/dev/null || echo "000")
+
+    case "$REPO_CODE" in
+        200) log_info "Репозиторий найден: ${REPO_OWNER}/${REPO_NAME}" ;;
         404) die "Репозиторий не найден: ${REPO_OWNER}/${REPO_NAME}" ;;
         403) die "Доступ к GitHub API ограничен (rate limit). Повторите через несколько минут" ;;
         000) die "Нет подключения к GitHub. Проверьте интернет или DNS" ;;
-        *)   die "GitHub вернул HTTP ${HTTP_CODE}" ;;
+        *)   die "GitHub вернул HTTP ${REPO_CODE} при проверке репозитория" ;;
+    esac
+
+    RELEASE_CODE=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 15 \
+        "${GITHUB_API}/releases/latest" 2>/dev/null || echo "000")
+
+    case "$RELEASE_CODE" in
+        200) log_info "Release доступен" ;;
+        404) die "Нет опубликованных релизов. Дождитесь первого release (тег v*.*.*) в ${REPO_OWNER}/${REPO_NAME}" ;;
+        403) die "Доступ к GitHub API ограничен (rate limit). Повторите через несколько минут" ;;
+        000) die "Нет подключения к GitHub. Проверьте интернет или DNS" ;;
+        *)   die "GitHub вернул HTTP ${RELEASE_CODE} при проверке release" ;;
     esac
 }
 
