@@ -57,13 +57,28 @@ export async function refreshProxyProvider(
   });
 }
 
+const PROVIDER_TEMPLATE = (provider: string, url: string) => `  ${provider}:
+    type: http
+    url: "${url}"
+    path: ./proxy-providers/${provider}.yaml
+    interval: 0
+    header:
+      User-Agent:
+        - "Mihomo"
+    health-check:
+      enable: true
+      url: http://www.msftncsi.com/ncsi.txt
+      interval: 3000
+`;
+
 export function getSubscriptionUrl(yaml: string, provider = DEFAULT_PROVIDER): string {
   if (!yaml.includes("proxy-providers:")) return "";
   const re = new RegExp(
-    `${provider}:[\\s\\S]*?url:\\s*['"]?([^'"\n#]+)`,
+    `${provider}:[\\s\\S]*?url:\\s*['"]?([^'"\n#]*)['"]?`,
     "m",
   );
-  return yaml.match(re)?.[1]?.trim() ?? "";
+  const raw = yaml.match(re)?.[1]?.trim() ?? "";
+  return raw;
 }
 
 export function setSubscriptionUrl(
@@ -75,23 +90,14 @@ export function setSubscriptionUrl(
   if (!trimmed) return yaml;
 
   const providerBlockRe = new RegExp(
-    `(\\n\\s*${provider}:[\\s\\S]*?\\n\\s*url:\\s*)['"]?[^'"\n#]+['"]?`,
+    `(\\n\\s*${provider}:[\\s\\S]*?\\n\\s*url:\\s*)['"]?[^'"\n#]*['"]?`,
     "m",
   );
   if (yaml.includes("proxy-providers:") && providerBlockRe.test(yaml)) {
     return yaml.replace(providerBlockRe, `$1"${trimmed}"`);
   }
 
-  const newProvider = `  ${provider}:
-    type: http
-    url: "${trimmed}"
-    interval: 3600
-    path: ./providers/${provider}.yaml
-    health-check:
-      enable: true
-      interval: 600
-      url: https://www.gstatic.com/generate_204
-`;
+  const newProvider = `${PROVIDER_TEMPLATE(provider, trimmed)}\n`;
 
   if (yaml.includes("proxy-providers:")) {
     return yaml.replace(/(\nproxy-providers:\s*\n)/, `$1${newProvider}`);
@@ -112,7 +118,9 @@ export async function applySubscriptionUrl(
 ): Promise<{ path: string }> {
   const loaded = await fetchMihomoConfig();
   if (!loaded) {
-    throw new Error("config not found");
+    throw new Error(
+      `Mihomo config missing (${DEFAULT_CONFIG_PATH}). Re-run install or bootstrap default config.`,
+    );
   }
   const updated = setSubscriptionUrl(loaded.content, url);
   await saveMihomoConfig(loaded.path, updated, true);

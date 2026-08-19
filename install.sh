@@ -12,6 +12,9 @@ INSTALL_DIR="/opt/sbin"
 INIT_DIR="/opt/etc/init.d"
 INIT_SCRIPT="S99zkeen-ui"
 CONF_DIR="/opt/etc/xkeen"
+MIHOMO_DIR="/opt/etc/mihomo"
+MIHOMO_CONFIG="${MIHOMO_DIR}/config.yaml"
+DEFAULT_CONFIG_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/install/mihomo-config.default.yaml"
 PORT="7220"
 MIN_FREE_MB=15
 MIN_BINARY_BYTES=1048576
@@ -328,6 +331,30 @@ create_conf_dir() {
     fi
 }
 
+install_mihomo_config() {
+    if [ -f "$MIHOMO_CONFIG" ]; then
+        log_info "Mihomo config exists: ${MIHOMO_CONFIG}"
+        return 0
+    fi
+
+    log_step "Installing default Mihomo config..."
+    mkdir -p "${MIHOMO_DIR}/proxy-providers" "${MIHOMO_DIR}/adblock"
+
+    if ! curl_fetch "$DEFAULT_CONFIG_URL" "$MIHOMO_CONFIG"; then
+        log_warn "Could not download default config from GitHub"
+        return 1
+    fi
+
+    if [ ! -s "$MIHOMO_CONFIG" ]; then
+        rm -f "$MIHOMO_CONFIG"
+        log_warn "Downloaded config template is empty"
+        return 1
+    fi
+
+    log_info "Default config installed: ${MIHOMO_CONFIG}"
+    return 0
+}
+
 start_service() {
     log_step "Starting ${BINARY_NAME}..."
     if "${INIT_DIR}/${INIT_SCRIPT}" start >/dev/null 2>&1; then
@@ -421,6 +448,7 @@ main() {
     download_binary
     install_binary
     create_conf_dir
+    install_mihomo_config || log_warn "Mihomo config not installed — add ${MIHOMO_CONFIG} manually"
 
     if [ "$MODE" = "update" ]; then
         restart_service

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { ApiError } from "./api";
+import { useT } from "./i18n";
 import {
   fetchMihomoConfig,
   getSubscriptionUrl,
@@ -8,6 +9,7 @@ import {
 } from "./config";
 
 export function useMihomoConfig() {
+  const t = useT();
   const [configPath, setConfigPath] = useState("");
   const [yaml, setYaml] = useState("");
   const [loading, setLoading] = useState(true);
@@ -20,7 +22,7 @@ export function useMihomoConfig() {
     try {
       const data = await fetchMihomoConfig();
       if (!data) {
-        setError("config not found");
+        setError(t("config.notFound"));
         setConfigPath("");
         setYaml("");
       } else {
@@ -33,7 +35,7 @@ export function useMihomoConfig() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [t]);
 
   useEffect(() => {
     load();

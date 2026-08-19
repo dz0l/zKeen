@@ -239,6 +239,7 @@ const translations: Translations = {
 
     // Config API
     "config.reload": "Перезагрузить",
+    "config.notFound": "config.yaml не найден в /opt/etc/mihomo/. Переустановите zKeen UI или скопируйте шаблон вручную.",
     "config.validateError": "Ошибка проверки конфига",
     "config.saveError": "Ошибка сохранения конфига",
     "config.refreshError": "Не удалось обновить провайдер",
@@ -467,6 +468,7 @@ const translations: Translations = {
     "onboarding.failed": "Failed to apply subscription",
 
     "config.reload": "Reload",
+    "config.notFound": "config.yaml not found in /opt/etc/mihomo/. Re-run install or copy the default template.",
     "config.validateError": "Config validation failed",
     "config.saveError": "Failed to save config",
     "config.refreshError": "Failed to refresh provider",
