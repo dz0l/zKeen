@@ -1,0 +1,48 @@
+# === Локальные рабочие файлы (не нужны при установке) ===
+.local/
+refs/
+
+# === Зависимости ===
+node_modules/
+target/
+
+# === Сборки ===
+frontend/dist/
+dist/
+*.tar.gz
+
+# === Секреты и конфиги ===
+*.local.md
+.env
+.env.*
+*.pem
+*.key
+credentials.*
+
+# === IDE ===
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.cursor/
+
+# === OS ===
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# === Rust build ===
+backend/target/
+**/*.rs.bk
+Cargo.lock
+
+# === Логи ===
+*.log
+logs/
+
+# === Временные ===
+*.tmp
+*.bak
+*.orig
