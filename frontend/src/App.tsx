@@ -6,11 +6,13 @@ import { ProxiesPage } from "./pages/ProxiesPage";
 import { ConfigPage } from "./pages/ConfigPage";
 import { GroupsPage } from "./pages/GroupsPage";
 import { PoliciesPage } from "./pages/PoliciesPage";
+import { ConnectionsPage } from "./pages/ConnectionsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import type { PageId } from "./lib/types";
 
 const PAGES: Record<PageId, ComponentType> = {
   status: StatusPage,
+  connections: ConnectionsPage,
   proxies: ProxiesPage,
   config: ConfigPage,
   groups: GroupsPage,

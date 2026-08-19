@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { Badge, Button, Card, CardHeader, Input, MockBanner, Select } from "../components/ui";
 import { useApp } from "../lib/store";
 import { useT } from "../lib/i18n";
@@ -63,9 +63,15 @@ rules:
 export function ConfigPage() {
   const { mode } = useApp();
   const t = useT();
-  const [tab, setTab] = useState<ConfigTab>("editor");
+  const [tab, setTab] = useState<ConfigTab>(mode === "safe" ? "quick" : "editor");
   const [yaml, setYaml] = useState(MOCK_YAML);
   const [validated, setValidated] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    if (mode === "safe" && tab === "editor") {
+      setTab("quick");
+    }
+  }, [mode, tab]);
 
   return (
     <div className="page-enter space-y-4">
@@ -79,31 +85,33 @@ export function ConfigPage() {
         <ImportExportButtons yaml={yaml} setYaml={setYaml} />
       </div>
 
-      {/* Tab switcher */}
-      <div className="flex rounded-xl bg-zk-bg-elevated p-1 border border-zk-border-soft">
-        <button
-          type="button"
-          onClick={() => setTab("editor")}
-          className={`flex-1 rounded-lg px-4 py-2 text-xs font-semibold transition-all ${
-            tab === "editor"
-              ? "bg-zk-surface text-zk-text shadow-sm"
-              : "text-zk-muted hover:text-zk-text"
-          }`}
-        >
-          {t("config.tabEditor")}
-        </button>
-        <button
-          type="button"
-          onClick={() => setTab("quick")}
-          className={`flex-1 rounded-lg px-4 py-2 text-xs font-semibold transition-all ${
-            tab === "quick"
-              ? "bg-zk-surface text-zk-text shadow-sm"
-              : "text-zk-muted hover:text-zk-text"
-          }`}
-        >
-          {t("config.tabQuick")}
-        </button>
-      </div>
+      {/* Tab switcher — editor hidden in safe mode */}
+      {mode !== "safe" && (
+        <div className="flex rounded-xl bg-zk-bg-elevated p-1 border border-zk-border-soft">
+          <button
+            type="button"
+            onClick={() => setTab("editor")}
+            className={`flex-1 rounded-lg px-4 py-2 text-xs font-semibold transition-all ${
+              tab === "editor"
+                ? "bg-zk-surface text-zk-text shadow-sm"
+                : "text-zk-muted hover:text-zk-text"
+            }`}
+          >
+            {t("config.tabEditor")}
+          </button>
+          <button
+            type="button"
+            onClick={() => setTab("quick")}
+            className={`flex-1 rounded-lg px-4 py-2 text-xs font-semibold transition-all ${
+              tab === "quick"
+                ? "bg-zk-surface text-zk-text shadow-sm"
+                : "text-zk-muted hover:text-zk-text"
+            }`}
+          >
+            {t("config.tabQuick")}
+          </button>
+        </div>
+      )}
 
       {mode === "safe" && (
         <div className="rounded-xl border border-zk-safe/30 bg-zk-safe/8 px-4 py-3 text-xs text-zk-safe">
@@ -111,8 +119,10 @@ export function ConfigPage() {
         </div>
       )}
 
-      {tab === "editor" && <EditorTab yaml={yaml} setYaml={setYaml} validated={validated} setValidated={setValidated} mode={mode} />}
-      {tab === "quick" && <QuickSettingsTab />}
+      {(mode !== "safe" ? tab === "editor" : false) && (
+        <EditorTab yaml={yaml} setYaml={setYaml} validated={validated} setValidated={setValidated} mode={mode} />
+      )}
+      {(mode === "safe" || tab === "quick") && <QuickSettingsTab />}
     </div>
   );
 }
@@ -213,9 +223,58 @@ function EditorTab({
 
 function QuickSettingsTab() {
   const t = useT();
+  const [refreshing, setRefreshing] = useState(false);
+
+  const handleRefreshProviders = () => {
+    setRefreshing(true);
+    setTimeout(() => setRefreshing(false), 1200);
+  };
 
   return (
     <div className="space-y-3">
+      {/* Proxy providers — first in list */}
+      <Card>
+        <CardHeader
+          title={t("config.qProviders")}
+          subtitle={t("config.qProvidersSub")}
+          action={
+            <button
+              type="button"
+              onClick={handleRefreshProviders}
+              disabled={refreshing}
+              title={t("config.qProvidersRefresh")}
+              aria-label={t("config.qProvidersRefresh")}
+              className="flex h-8 w-8 items-center justify-center rounded-lg border border-zk-border-soft bg-zk-bg-elevated text-zk-muted transition-colors hover:border-zk-accent/40 hover:text-zk-accent disabled:opacity-50"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 20 20"
+                fill="currentColor"
+                className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`}
+              >
+                <path
+                  fillRule="evenodd"
+                  d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z"
+                  clipRule="evenodd"
+                />
+              </svg>
+            </button>
+          }
+        />
+        <div className="space-y-3 p-4 sm:p-5">
+          <Input label={t("config.qSubUrl")} placeholder="https://..." mono />
+          <Input label="User-Agent" placeholder="Mihomo" value="Mihomo" />
+          <Input
+            label="x-hwid"
+            placeholder="b3f1c2a0-7e44-4c19-..."
+            mono
+            hint={t("config.qHwidHint")}
+          />
+          <Input label={t("config.qHealthUrl")} placeholder="http://www.msftncsi.com/ncsi.txt" value="http://www.msftncsi.com/ncsi.txt" mono />
+          <Input label={t("config.qHealthInterval")} placeholder="3000" value="3000" mono />
+        </div>
+      </Card>
+
       {/* Core settings */}
       <Card>
         <CardHeader title={t("config.qCore")} subtitle={t("config.qCoreSub")} />
@@ -299,23 +358,6 @@ function QuickSettingsTab() {
             ]}
             value="true"
           />
-        </div>
-      </Card>
-
-      {/* Proxy providers */}
-      <Card>
-        <CardHeader title={t("config.qProviders")} subtitle={t("config.qProvidersSub")} />
-        <div className="space-y-3 p-4 sm:p-5">
-          <Input label={t("config.qSubUrl")} placeholder="https://..." mono />
-          <Input label="User-Agent" placeholder="Mihomo" value="Mihomo" />
-          <Input
-            label="x-hwid"
-            placeholder="b3f1c2a0-7e44-4c19-..."
-            mono
-            hint={t("config.qHwidHint")}
-          />
-          <Input label={t("config.qHealthUrl")} placeholder="http://www.msftncsi.com/ncsi.txt" value="http://www.msftncsi.com/ncsi.txt" mono />
-          <Input label={t("config.qHealthInterval")} placeholder="3000" value="3000" mono />
         </div>
       </Card>
 

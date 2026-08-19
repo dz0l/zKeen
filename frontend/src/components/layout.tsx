@@ -97,7 +97,7 @@ export function BottomNav() {
           type="button"
           onClick={() => setMenuOpen(true)}
           className={`flex flex-1 flex-col items-center gap-0.5 py-2 text-[10px] font-medium transition-colors ${
-            page === "policies" || page === "settings" ? "text-zk-accent" : "text-zk-dim"
+            page === "policies" || page === "settings" || page === "groups" ? "text-zk-accent" : "text-zk-dim"
           }`}
         >
           <IconMenu className="h-5 w-5" />
@@ -113,8 +113,6 @@ export function MobileMenu() {
   const t = useT();
 
   if (!menuOpen) return null;
-
-  const extraItems = NAV_ITEMS.filter((n) => !MOBILE_PRIMARY.includes(n.id));
 
   return (
     <>
@@ -136,7 +134,7 @@ export function MobileMenu() {
         </div>
 
         <div className="grid gap-1">
-          {[...NAV_ITEMS.filter((n) => MOBILE_PRIMARY.includes(n.id)), ...extraItems].map((item) => {
+          {NAV_ITEMS.filter((n) => !MOBILE_PRIMARY.includes(n.id)).map((item) => {
             const Icon = PAGE_ICONS[item.id];
             const active = page === item.id;
             return (

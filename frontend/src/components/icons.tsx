@@ -56,6 +56,17 @@ export function IconPolicies({ className = "", active }: IconProps) {
   );
 }
 
+export function IconConnections({ className = "", active }: IconProps) {
+  return (
+    <svg className={`${base} ${className}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={active ? 2.2 : 1.8}>
+      <circle cx="5" cy="12" r="2" />
+      <circle cx="19" cy="6" r="2" />
+      <circle cx="19" cy="18" r="2" />
+      <path d="M7 12h4M11 10.5L16.5 7M11 13.5l5.5 3.5" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 export function IconSettings({ className = "", active }: IconProps) {
   return (
     <svg className={`${base} ${className}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={active ? 2.2 : 1.8}>
@@ -91,6 +102,7 @@ export function IconChevron({ className = "" }: { className?: string }) {
 
 export const PAGE_ICONS: Record<PageId, FC<IconProps>> = {
   status: IconStatus,
+  connections: IconConnections,
   proxies: IconProxy,
   config: IconConfig,
   groups: IconGroups,
