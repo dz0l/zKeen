@@ -106,6 +106,5 @@ export const PAGE_ICONS: Record<PageId, FC<IconProps>> = {
   proxies: IconProxy,
   config: IconConfig,
   groups: IconGroups,
-  policies: IconPolicies,
   settings: IconSettings,
 };

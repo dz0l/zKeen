@@ -6,7 +6,6 @@ export type PageId =
   | "proxies"
   | "config"
   | "groups"
-  | "policies"
   | "settings";
 
 export interface NavItem {
@@ -21,7 +20,6 @@ export const NAV_ITEMS: NavItem[] = [
   { id: "proxies", labelKey: "nav.proxies", shortLabelKey: "nav.proxies" },
   { id: "config", labelKey: "nav.config", shortLabelKey: "nav.config" },
   { id: "groups", labelKey: "nav.groups", shortLabelKey: "nav.groups" },
-  { id: "policies", labelKey: "nav.policies", shortLabelKey: "nav.policies" },
   { id: "settings", labelKey: "nav.settings", shortLabelKey: "nav.settings" },
 ];
 

@@ -4,7 +4,7 @@ import { IconChevron } from "../components/icons";
 import { useT } from "../lib/i18n";
 import { useSession } from "../lib/session";
 import { ApiError, clashJson } from "../lib/api";
-import { ensureMihomoRunning, fetchMihomoConfig, isClashConnectionError } from "../lib/config";
+import { ensureMihomoRunning, fetchMihomoConfig, getTopLevelScalar, isClashConnectionError, saveMihomoConfig, setTopLevelScalar, applyMihomoConfigChanges } from "../lib/config";
 import {
   buildProxyNameSets,
   collectBulkServerOptions,
@@ -72,6 +72,8 @@ export function ProxiesPage() {
   const [starting, setStarting] = useState(false);
   const [busy, setBusy] = useState("");
   const [testing, setTesting] = useState(false);
+  const [coreMode, setCoreMode] = useState("rule");
+  const [modeSaving, setModeSaving] = useState(false);
 
   const clashKey = `${clash.port}|${clash.secret}|${clash.unix}`;
   const clashRef = useRef(clash);
@@ -88,6 +90,9 @@ export function ProxiesPage() {
         fetchMihomoConfig().catch(() => null),
       ]);
       const icons = config ? parseGroupIcons(config.content) : {};
+      if (config) {
+        setCoreMode(getTopLevelScalar(config.content, "mode") || "rule");
+      }
       setBulkServers(collectBulkServerOptions(data));
       setGroups(mapGroups(data, icons));
       setSelected(selectedMap(data));
@@ -230,6 +235,27 @@ export function ProxiesPage() {
     setTesting(false);
   }, [filtered, testDelay]);
 
+  const applyCoreMode = useCallback(
+    async (value: string) => {
+      setModeSaving(true);
+      setError("");
+      try {
+        const loaded = await fetchMihomoConfig();
+        if (!loaded) throw new ApiError(404, t("config.notFound"));
+        const updated = setTopLevelScalar(loaded.content, "mode", value);
+        await saveMihomoConfig(loaded.path, updated, false);
+        const conn = await applyMihomoConfigChanges(clashRef.current);
+        setClash(conn);
+        setCoreMode(value);
+      } catch (err) {
+        setError(err instanceof ApiError ? err.message : t("proxies.modeError"));
+      } finally {
+        setModeSaving(false);
+      }
+    },
+    [setClash, t],
+  );
+
   if (loading) {
     return (
       <div className="page-enter py-12 text-center text-sm text-zk-muted">
@@ -267,6 +293,25 @@ export function ProxiesPage() {
           </Button>
         </div>
       </div>
+
+      <Card>
+        <CardHeader title={t("proxies.modeTitle")} subtitle={t("proxies.modeSub")} />
+        <div className="flex flex-wrap items-end gap-3 p-4 sm:p-5">
+          <div className="min-w-[180px] flex-1">
+            <Select
+              label={t("proxies.modeTitle")}
+              value={coreMode}
+              onChange={(v) => void applyCoreMode(v)}
+              options={[
+                { value: "rule", label: "rule" },
+                { value: "global", label: "global" },
+                { value: "direct", label: "direct" },
+              ]}
+            />
+          </div>
+          {modeSaving && <span className="text-xs text-zk-muted">{t("app.loading")}</span>}
+        </div>
+      </Card>
 
       <Card>
         <CardHeader title={t("proxies.quickSelect")} subtitle={t("proxies.quickSelectSub")} />

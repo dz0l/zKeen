@@ -1,10 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Badge, Button, Card, CardHeader, StatTile } from "../components/ui";
+import { Badge, Button, Card, CardHeader, Select, StatTile } from "../components/ui";
 import { useApp } from "../lib/store";
 import { useT } from "../lib/i18n";
 import { useSession } from "../lib/session";
-import { ApiError, clashJson } from "../lib/api";
+import { ApiError, clashJson, clashWsUrl } from "../lib/api";
+import {
+  applyMihomoConfigChanges,
+  fetchMihomoConfig,
+  getTopLevelScalar,
+  saveMihomoConfig,
+  setTopLevelScalar,
+} from "../lib/config";
 import {
   connectionStartedAt,
   formatBytes,
@@ -13,6 +20,7 @@ import {
   type ClashConnectionsResponse,
 } from "../lib/clash";
 
+type PageTab = "connections" | "logs";
 type ConnTab = "active" | "closed";
 
 interface Connection {
@@ -27,6 +35,16 @@ interface Connection {
   durationSec: number;
   closedAt?: number;
 }
+
+interface LogLine {
+  id: number;
+  type: string;
+  payload: string;
+  time: number;
+}
+
+const CLOSED_LIMIT = 100;
+const LOG_LIMIT = 300;
 
 function mapClashConnection(item: ClashConnectionItem): Connection {
   const meta = item.metadata ?? {};
@@ -78,11 +96,7 @@ function IpDropdown({
     const el = triggerRef.current;
     if (!el) return;
     const rect = el.getBoundingClientRect();
-    setMenuPos({
-      top: rect.bottom + 4,
-      left: rect.left,
-      width: rect.width,
-    });
+    setMenuPos({ top: rect.bottom + 4, left: rect.left, width: rect.width });
   };
 
   useEffect(() => {
@@ -113,8 +127,6 @@ function IpDropdown({
     return options.filter((o) => o.ip.toLowerCase().includes(q));
   }, [options, search]);
 
-  const label = value || allLabel;
-
   const menu = open ? (
     <div
       ref={menuRef}
@@ -135,7 +147,11 @@ function IpDropdown({
         <li>
           <button
             type="button"
-            onClick={() => { onChange(""); setOpen(false); setSearch(""); }}
+            onClick={() => {
+              onChange("");
+              setOpen(false);
+              setSearch("");
+            }}
             className={`flex w-full items-center justify-between px-3 py-2 text-left text-sm hover:bg-zk-bg-elevated ${!value ? "text-zk-accent" : "text-zk-muted"}`}
           >
             {allLabel}
@@ -148,7 +164,11 @@ function IpDropdown({
             <li key={ip}>
               <button
                 type="button"
-                onClick={() => { onChange(ip); setOpen(false); setSearch(""); }}
+                onClick={() => {
+                  onChange(ip);
+                  setOpen(false);
+                  setSearch("");
+                }}
                 className={`flex w-full items-center justify-between px-3 py-2 text-left hover:bg-zk-bg-elevated ${
                   value === ip ? "bg-zk-accent/10 text-zk-accent" : "text-zk-text"
                 }`}
@@ -160,11 +180,6 @@ function IpDropdown({
           ))
         )}
       </ul>
-      {options.length > 0 && (
-        <div className="border-t border-zk-border-soft px-3 py-1.5 text-[10px] text-zk-dim">
-          {filtered.length} / {options.length}
-        </div>
-      )}
     </div>
   ) : null;
 
@@ -176,10 +191,11 @@ function IpDropdown({
         onClick={() => setOpen((v) => !v)}
         className="flex w-full items-center justify-between gap-2 rounded-xl border border-zk-border-soft bg-zk-bg/50 px-3 py-2 text-left text-sm transition-colors hover:border-zk-accent/30 focus:border-zk-accent/40 focus:outline-none"
       >
-        <span className={`truncate font-mono ${value ? "text-zk-text" : "text-zk-muted"}`}>{label}</span>
+        <span className={`truncate font-mono ${value ? "text-zk-text" : "text-zk-muted"}`}>
+          {value || allLabel}
+        </span>
         <span className="shrink-0 text-zk-dim">{open ? "▴" : "▾"}</span>
       </button>
-
       {menu && createPortal(menu, document.body)}
     </div>
   );
@@ -188,13 +204,15 @@ function IpDropdown({
 export function ConnectionsPage() {
   const t = useT();
   const { mode } = useApp();
-  const { clash } = useSession();
+  const { clash, setClash } = useSession();
   const clashRef = useRef(clash);
   clashRef.current = clash;
 
+  const [pageTab, setPageTab] = useState<PageTab>("connections");
   const [tab, setTab] = useState<ConnTab>("active");
   const [activeList, setActiveList] = useState<Connection[]>([]);
   const [closedList, setClosedList] = useState<Connection[]>([]);
+  const prevMapRef = useRef<Map<string, Connection>>(new Map());
   const [uploadTotal, setUploadTotal] = useState(0);
   const [downloadTotal, setDownloadTotal] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -202,6 +220,28 @@ export function ConnectionsPage() {
   const [busy, setBusy] = useState(false);
   const [ipFilter, setIpFilter] = useState("");
   const [hostFilter, setHostFilter] = useState("");
+
+  const [logLevel, setLogLevel] = useState("silent");
+  const [logLines, setLogLines] = useState<LogLine[]>([]);
+  const [logsPaused, setLogsPaused] = useState(false);
+  const [logsSaving, setLogsSaving] = useState(false);
+  const [logsError, setLogsError] = useState("");
+  const logsPausedRef = useRef(false);
+  logsPausedRef.current = logsPaused;
+  const logIdRef = useRef(0);
+  const logEndRef = useRef<HTMLDivElement>(null);
+
+  const pushClosed = useCallback((items: Connection[]) => {
+    if (!items.length) return;
+    const now = Date.now();
+    setClosedList((prev) => {
+      const seen = new Set(prev.map((c) => c.id));
+      const added = items
+        .filter((c) => !seen.has(c.id))
+        .map((c) => ({ ...c, closedAt: c.closedAt ?? now }));
+      return [...added, ...prev].slice(0, CLOSED_LIMIT);
+    });
+  }, []);
 
   const loadConnections = useCallback(async () => {
     try {
@@ -211,7 +251,18 @@ export function ConnectionsPage() {
         undefined,
         8000,
       );
-      setActiveList((data.connections ?? []).map(mapClashConnection));
+      const next = (data.connections ?? []).map(mapClashConnection);
+      const nextMap = new Map(next.map((c) => [c.id, c]));
+      const prev = prevMapRef.current;
+      if (prev.size > 0) {
+        const disappeared: Connection[] = [];
+        for (const [id, conn] of prev) {
+          if (!nextMap.has(id)) disappeared.push(conn);
+        }
+        pushClosed(disappeared);
+      }
+      prevMapRef.current = nextMap;
+      setActiveList(next);
       setUploadTotal(data.uploadTotal ?? 0);
       setDownloadTotal(data.downloadTotal ?? 0);
       setError("");
@@ -220,7 +271,7 @@ export function ConnectionsPage() {
     } finally {
       setLoading(false);
     }
-  }, [t]);
+  }, [t, pushClosed]);
 
   useEffect(() => {
     setLoading(true);
@@ -228,6 +279,58 @@ export function ConnectionsPage() {
     const id = setInterval(loadConnections, 3000);
     return () => clearInterval(id);
   }, [loadConnections, clash.port, clash.secret, clash.unix]);
+
+  useEffect(() => {
+    fetchMihomoConfig()
+      .then((cfg) => {
+        if (cfg) setLogLevel(getTopLevelScalar(cfg.content, "log-level") || "silent");
+      })
+      .catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    if (pageTab !== "logs") return;
+    const url = clashWsUrl("logs", clashRef.current);
+    let ws: WebSocket | null = null;
+    let closed = false;
+    try {
+      ws = new WebSocket(url);
+      ws.onmessage = (ev) => {
+        if (logsPausedRef.current) return;
+        try {
+          const data = JSON.parse(String(ev.data)) as { type?: string; payload?: string };
+          const line: LogLine = {
+            id: ++logIdRef.current,
+            type: data.type || "info",
+            payload: data.payload || String(ev.data),
+            time: Date.now(),
+          };
+          setLogLines((prev) => [...prev, line].slice(-LOG_LIMIT));
+        } catch {
+          setLogLines((prev) =>
+            [
+              ...prev,
+              { id: ++logIdRef.current, type: "info", payload: String(ev.data), time: Date.now() },
+            ].slice(-LOG_LIMIT),
+          );
+        }
+      };
+      ws.onerror = () => setLogsError(t("conn.logsError"));
+    } catch {
+      setLogsError(t("conn.logsError"));
+    }
+    return () => {
+      closed = true;
+      ws?.close();
+      void closed;
+    };
+  }, [pageTab, clash.port, clash.secret, clash.unix, t]);
+
+  useEffect(() => {
+    if (pageTab === "logs" && !logsPaused) {
+      logEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [logLines, pageTab, logsPaused]);
 
   const sourceList = tab === "active" ? activeList : closedList;
 
@@ -267,11 +370,6 @@ export function ConnectionsPage() {
     };
   }, [filtered, tab, ipFilter, hostFilter, uploadTotal, downloadTotal]);
 
-  const confirmClose = (message: string, action: () => void) => {
-    if (mode === "safe" && !window.confirm(message)) return;
-    action();
-  };
-
   const handleCloseAll = () => {
     const target = ipFilter
       ? activeList.filter((c) => c.sourceIp === ipFilter)
@@ -280,8 +378,9 @@ export function ConnectionsPage() {
     const msg = ipFilter
       ? t("conn.confirmCloseIp", { ip: ipFilter, count: target.length })
       : t("conn.confirmCloseAll", { count: target.length });
+    if (mode === "safe" && !window.confirm(msg)) return;
 
-    confirmClose(msg, async () => {
+    void (async () => {
       setBusy(true);
       setError("");
       try {
@@ -296,18 +395,33 @@ export function ConnectionsPage() {
             ),
           );
         }
-        const now = Date.now();
-        setClosedList((prev) => [
-          ...target.map((c) => ({ ...c, closedAt: now })),
-          ...prev,
-        ].slice(0, 200));
+        pushClosed(target);
+        for (const c of target) prevMapRef.current.delete(c.id);
         await loadConnections();
       } catch (err) {
         setError(err instanceof ApiError ? err.message : t("conn.closeError"));
       } finally {
         setBusy(false);
       }
-    });
+    })();
+  };
+
+  const applyLogLevel = async (value: string) => {
+    setLogsSaving(true);
+    setLogsError("");
+    try {
+      const loaded = await fetchMihomoConfig();
+      if (!loaded) throw new Error(t("config.notFound"));
+      const updated = setTopLevelScalar(loaded.content, "log-level", value);
+      await saveMihomoConfig(loaded.path, updated, false);
+      const conn = await applyMihomoConfigChanges(clash);
+      setClash(conn);
+      setLogLevel(value);
+    } catch (err) {
+      setLogsError(err instanceof ApiError ? err.message : t("conn.logsSaveError"));
+    } finally {
+      setLogsSaving(false);
+    }
   };
 
   const activeFilteredCount = ipFilter
@@ -316,9 +430,9 @@ export function ConnectionsPage() {
 
   return (
     <div className="page-enter space-y-4">
-      {error && (
+      {(error || logsError) && (
         <div className="rounded-xl border border-zk-coral/25 bg-zk-coral/10 px-3 py-2 text-xs text-zk-coral">
-          {error}
+          {error || logsError}
         </div>
       )}
 
@@ -330,155 +444,222 @@ export function ConnectionsPage() {
       <div className="flex rounded-xl border border-zk-border-soft bg-zk-bg-elevated p-1">
         <button
           type="button"
-          onClick={() => setTab("active")}
+          onClick={() => setPageTab("connections")}
           className={`flex-1 rounded-lg px-3 py-2 text-xs font-semibold transition-all sm:px-4 ${
-            tab === "active" ? "bg-zk-surface text-zk-text shadow-sm" : "text-zk-muted hover:text-zk-text"
+            pageTab === "connections" ? "bg-zk-surface text-zk-text shadow-sm" : "text-zk-muted hover:text-zk-text"
           }`}
         >
-          {t("conn.tabActive")} ({activeList.length})
+          {t("conn.pageConnections")}
         </button>
         <button
           type="button"
-          onClick={() => setTab("closed")}
+          onClick={() => setPageTab("logs")}
           className={`flex-1 rounded-lg px-3 py-2 text-xs font-semibold transition-all sm:px-4 ${
-            tab === "closed" ? "bg-zk-surface text-zk-text shadow-sm" : "text-zk-muted hover:text-zk-text"
+            pageTab === "logs" ? "bg-zk-surface text-zk-text shadow-sm" : "text-zk-muted hover:text-zk-text"
           }`}
         >
-          {t("conn.tabClosed")} ({closedList.length})
+          {t("conn.pageLogs")}
         </button>
       </div>
 
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-        <StatTile
-          label={t("conn.total")}
-          value={loading ? "…" : String(stats.count)}
-          hint={tab === "active" ? t("conn.ofTotal", { total: activeList.length }) : undefined}
-        />
-        <StatTile label={t("conn.uniqueIps")} value={loading ? "…" : String(stats.uniqueIps)} />
-        <StatTile label={t("conn.upload")} value={formatBytes(stats.upload)} />
-        <StatTile label={t("conn.download")} value={formatBytes(stats.download)} />
-      </div>
-
-      <Card>
-        <CardHeader title={t("conn.filterTitle")} subtitle={t("conn.filterSub")} />
-        <div className="space-y-3 p-4 sm:p-5">
-          <div className="grid gap-3 sm:grid-cols-2">
-            <div>
-              <label className="mb-1.5 block text-xs font-medium text-zk-muted">{t("conn.filterIp")}</label>
-              <IpDropdown
-                value={ipFilter}
-                onChange={setIpFilter}
-                options={ipOptions}
-                placeholder={t("conn.noIpFound")}
-                searchPlaceholder={t("conn.searchIp")}
-                allLabel={t("conn.allIps")}
-              />
+      {pageTab === "logs" ? (
+        <div className="space-y-3">
+          <Card>
+            <CardHeader title={t("conn.logLevel")} subtitle={t("conn.logLevelSub")} />
+            <div className="flex flex-wrap items-end gap-3 p-4 sm:p-5">
+              <div className="min-w-[180px] flex-1">
+                <Select
+                  label={t("config.qLogLevel")}
+                  value={logLevel}
+                  onChange={(v) => void applyLogLevel(v)}
+                  options={[
+                    { value: "silent", label: "silent" },
+                    { value: "error", label: "error" },
+                    { value: "warning", label: "warning" },
+                    { value: "info", label: "info" },
+                    { value: "debug", label: "debug" },
+                  ]}
+                />
+              </div>
+              {logsSaving && <span className="text-xs text-zk-muted">{t("app.loading")}</span>}
             </div>
-            <div>
-              <label className="mb-1.5 block text-xs font-medium text-zk-muted">{t("conn.filterHost")}</label>
-              <input
-                type="text"
-                value={hostFilter}
-                onChange={(e) => setHostFilter(e.target.value)}
-                placeholder="youtube.com"
-                className="w-full rounded-xl border border-zk-border-soft bg-zk-bg/50 px-3 py-2 text-sm text-zk-text outline-none placeholder:text-zk-dim focus:border-zk-accent/40"
-              />
-            </div>
-          </div>
+          </Card>
 
-          {tab === "active" && activeFilteredCount > 0 && (
-            <div className="flex flex-wrap gap-2 border-t border-zk-border-soft pt-3">
-              <Button size="sm" variant="danger" disabled={busy} onClick={handleCloseAll}>
-                {busy
-                  ? t("app.loading")
-                  : ipFilter
-                    ? t("conn.closeForIp", { ip: ipFilter, count: activeFilteredCount })
-                    : t("conn.closeAll", { count: activeList.length })}
-              </Button>
-              {mode === "safe" && (
-                <span className="self-center text-[10px] text-zk-safe">{t("conn.safeCloseHint")}</span>
-              )}
-            </div>
-          )}
-        </div>
-      </Card>
-
-      <Card className="overflow-hidden">
-        <CardHeader
-          title={tab === "active" ? t("conn.listActive") : t("conn.listClosed")}
-          subtitle={t("conn.listSub", { count: filtered.length })}
-          action={
-            ipFilter ? (
-              <Badge variant="default">
-                {ipFilter}
-                <button type="button" onClick={() => setIpFilter("")} className="ml-1 opacity-70 hover:opacity-100">✕</button>
-              </Badge>
-            ) : undefined
-          }
-        />
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[640px] text-left text-sm">
-            <thead>
-              <tr className="border-b border-zk-border-soft text-[10px] font-semibold uppercase tracking-widest text-zk-dim">
-                <th className="px-3 py-2.5 sm:px-5">{t("conn.colIp")}</th>
-                <th className="px-3 py-2.5 sm:px-5">{t("conn.colHost")}</th>
-                <th className="hidden px-3 py-2.5 sm:table-cell sm:px-5">{t("conn.colNetwork")}</th>
-                <th className="hidden px-3 py-2.5 md:table-cell md:px-5">{t("conn.colRule")}</th>
-                <th className="hidden px-3 py-2.5 lg:table-cell lg:px-5">{t("conn.colChain")}</th>
-                <th className="px-3 py-2.5 text-right sm:px-5">{t("conn.colDown")}</th>
-                <th className="px-3 py-2.5 text-right sm:px-5">
-                  {tab === "closed" ? t("conn.colClosed") : t("conn.colTime")}
-                </th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-zk-border-soft">
-              {loading && filtered.length === 0 ? (
-                <tr>
-                  <td colSpan={7} className="px-4 py-8 text-center text-zk-muted sm:px-5">
-                    {t("app.loading")}
-                  </td>
-                </tr>
-              ) : filtered.length === 0 ? (
-                <tr>
-                  <td colSpan={7} className="px-4 py-8 text-center text-zk-muted sm:px-5">
-                    {t("conn.noResults")}
-                  </td>
-                </tr>
+          <Card className="overflow-hidden">
+            <CardHeader
+              title={t("conn.logsLive")}
+              subtitle={t("conn.logsLiveSub", { count: logLines.length })}
+              action={
+                <div className="flex gap-2">
+                  <Button size="sm" variant="ghost" onClick={() => setLogsPaused((p) => !p)}>
+                    {logsPaused ? t("conn.logsResume") : t("conn.logsPause")}
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => setLogLines([])}>
+                    {t("conn.logsClear")}
+                  </Button>
+                </div>
+              }
+            />
+            <div className="scrollbar-thin max-h-[420px] overflow-y-auto bg-zk-bg/40 px-3 py-2 font-mono text-[11px] leading-relaxed sm:px-4">
+              {logLines.length === 0 ? (
+                <p className="py-8 text-center text-zk-dim">{t("conn.logsEmpty")}</p>
               ) : (
-                filtered.map((c) => (
-                  <tr key={c.id} className="hover:bg-zk-bg-elevated/40">
-                    <td className="px-3 py-2 sm:px-5">
-                      <button
-                        type="button"
-                        onClick={() => setIpFilter(c.sourceIp)}
-                        className={`font-mono text-xs transition-colors ${
-                          ipFilter === c.sourceIp ? "font-semibold text-zk-accent" : "text-zk-text hover:text-zk-accent"
-                        }`}
-                      >
-                        {c.sourceIp}
-                      </button>
-                    </td>
-                    <td className="max-w-[120px] truncate px-3 py-2 font-mono text-xs text-zk-muted sm:max-w-[180px] sm:px-5" title={c.host}>
-                      {c.host}
-                    </td>
-                    <td className="hidden px-3 py-2 sm:table-cell sm:px-5">
-                      <Badge variant="muted">{c.network}</Badge>
-                    </td>
-                    <td className="hidden px-3 py-2 text-xs md:table-cell md:px-5">{c.rule}</td>
-                    <td className="hidden max-w-[120px] truncate px-3 py-2 text-xs lg:table-cell lg:px-5" title={c.chain}>
-                      {c.chain}
-                    </td>
-                    <td className="px-3 py-2 text-right font-mono text-xs text-zk-muted sm:px-5">{formatBytes(c.download)}</td>
-                    <td className="px-3 py-2 text-right font-mono text-xs text-zk-dim sm:px-5">
-                      {c.closedAt ? formatClosedAgo(c.closedAt) : formatDurationSec(c.durationSec)}
-                    </td>
-                  </tr>
+                logLines.map((l) => (
+                  <div key={l.id} className="border-b border-zk-border-soft/40 py-1">
+                    <span className="text-zk-dim">[{l.type}]</span>{" "}
+                    <span className="text-zk-text break-all">{l.payload}</span>
+                  </div>
                 ))
               )}
-            </tbody>
-          </table>
+              <div ref={logEndRef} />
+            </div>
+          </Card>
         </div>
-      </Card>
+      ) : (
+        <>
+          <div className="flex rounded-xl border border-zk-border-soft bg-zk-bg-elevated p-1">
+            <button
+              type="button"
+              onClick={() => setTab("active")}
+              className={`flex-1 rounded-lg px-3 py-2 text-xs font-semibold transition-all sm:px-4 ${
+                tab === "active" ? "bg-zk-surface text-zk-text shadow-sm" : "text-zk-muted hover:text-zk-text"
+              }`}
+            >
+              {t("conn.tabActive")} ({activeList.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setTab("closed")}
+              className={`flex-1 rounded-lg px-3 py-2 text-xs font-semibold transition-all sm:px-4 ${
+                tab === "closed" ? "bg-zk-surface text-zk-text shadow-sm" : "text-zk-muted hover:text-zk-text"
+              }`}
+            >
+              {t("conn.tabClosed")} ({closedList.length})
+            </button>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <StatTile
+              label={t("conn.total")}
+              value={loading ? "…" : String(stats.count)}
+              hint={tab === "active" ? t("conn.ofTotal", { total: activeList.length }) : undefined}
+            />
+            <StatTile label={t("conn.uniqueIps")} value={loading ? "…" : String(stats.uniqueIps)} />
+            <StatTile label={t("conn.upload")} value={formatBytes(stats.upload)} />
+            <StatTile label={t("conn.download")} value={formatBytes(stats.download)} />
+          </div>
+
+          <Card>
+            <CardHeader title={t("conn.filterTitle")} subtitle={t("conn.filterSub")} />
+            <div className="space-y-3 p-4 sm:p-5">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div>
+                  <label className="mb-1.5 block text-xs font-medium text-zk-muted">{t("conn.filterIp")}</label>
+                  <IpDropdown
+                    value={ipFilter}
+                    onChange={setIpFilter}
+                    options={ipOptions}
+                    placeholder={t("conn.noIpFound")}
+                    searchPlaceholder={t("conn.searchIp")}
+                    allLabel={t("conn.allIps")}
+                  />
+                </div>
+                <div>
+                  <label className="mb-1.5 block text-xs font-medium text-zk-muted">{t("conn.filterHost")}</label>
+                  <input
+                    type="text"
+                    value={hostFilter}
+                    onChange={(e) => setHostFilter(e.target.value)}
+                    placeholder="youtube.com"
+                    className="w-full rounded-xl border border-zk-border-soft bg-zk-bg/50 px-3 py-2 text-sm text-zk-text outline-none placeholder:text-zk-dim focus:border-zk-accent/40"
+                  />
+                </div>
+              </div>
+
+              {tab === "active" && activeFilteredCount > 0 && (
+                <div className="flex flex-wrap gap-2 border-t border-zk-border-soft pt-3">
+                  <Button size="sm" variant="danger" disabled={busy} onClick={handleCloseAll}>
+                    {busy
+                      ? t("app.loading")
+                      : ipFilter
+                        ? t("conn.closeForIp", { ip: ipFilter, count: activeFilteredCount })
+                        : t("conn.closeAll", { count: activeList.length })}
+                  </Button>
+                </div>
+              )}
+            </div>
+          </Card>
+
+          <Card className="overflow-hidden">
+            <CardHeader
+              title={tab === "active" ? t("conn.listActive") : t("conn.listClosed")}
+              subtitle={t("conn.listSub", { count: filtered.length })}
+            />
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[640px] text-left text-sm">
+                <thead>
+                  <tr className="border-b border-zk-border-soft text-[10px] font-semibold uppercase tracking-widest text-zk-dim">
+                    <th className="px-3 py-2.5 sm:px-5">{t("conn.colIp")}</th>
+                    <th className="px-3 py-2.5 sm:px-5">{t("conn.colHost")}</th>
+                    <th className="hidden px-3 py-2.5 sm:table-cell sm:px-5">{t("conn.colNetwork")}</th>
+                    <th className="hidden px-3 py-2.5 md:table-cell md:px-5">{t("conn.colRule")}</th>
+                    <th className="hidden px-3 py-2.5 lg:table-cell lg:px-5">{t("conn.colChain")}</th>
+                    <th className="px-3 py-2.5 text-right sm:px-5">{t("conn.colDown")}</th>
+                    <th className="px-3 py-2.5 text-right sm:px-5">
+                      {tab === "closed" ? t("conn.colClosed") : t("conn.colTime")}
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-zk-border-soft">
+                  {loading && filtered.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="px-4 py-8 text-center text-zk-muted sm:px-5">
+                        {t("app.loading")}
+                      </td>
+                    </tr>
+                  ) : filtered.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="px-4 py-8 text-center text-zk-muted sm:px-5">
+                        {t("conn.noResults")}
+                      </td>
+                    </tr>
+                  ) : (
+                    filtered.map((c) => (
+                      <tr key={`${c.id}-${c.closedAt ?? "a"}`} className="hover:bg-zk-bg-elevated/40">
+                        <td className="px-3 py-2 sm:px-5">
+                          <button
+                            type="button"
+                            onClick={() => setIpFilter(c.sourceIp)}
+                            className="font-mono text-xs text-zk-text hover:text-zk-accent"
+                          >
+                            {c.sourceIp}
+                          </button>
+                        </td>
+                        <td className="max-w-[120px] truncate px-3 py-2 font-mono text-xs text-zk-muted sm:max-w-[180px] sm:px-5" title={c.host}>
+                          {c.host}
+                        </td>
+                        <td className="hidden px-3 py-2 sm:table-cell sm:px-5">
+                          <Badge variant="muted">{c.network}</Badge>
+                        </td>
+                        <td className="hidden px-3 py-2 text-xs md:table-cell md:px-5">{c.rule}</td>
+                        <td className="hidden max-w-[120px] truncate px-3 py-2 text-xs lg:table-cell lg:px-5" title={c.chain}>
+                          {c.chain}
+                        </td>
+                        <td className="px-3 py-2 text-right font-mono text-xs text-zk-muted sm:px-5">
+                          {formatBytes(c.download)}
+                        </td>
+                        <td className="px-3 py-2 text-right font-mono text-xs text-zk-dim sm:px-5">
+                          {c.closedAt ? formatClosedAgo(c.closedAt) : formatDurationSec(c.durationSec)}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        </>
+      )}
     </div>
   );
 }

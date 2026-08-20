@@ -153,3 +153,20 @@ export async function clashJson<T>(
     throw new ApiError(res.status, "Invalid JSON from Clash API");
   }
 }
+
+/** Build Clash WebSocket URL via zkeen-ui relay (`/clash-ws/...`). */
+export function clashWsUrl(path: string, conn: ClashConnection): string {
+  const clean = path.replace(/^\//, "");
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const params = new URLSearchParams();
+  if (conn.unix) {
+    params.set("unix", conn.unix);
+  } else if (conn.port) {
+    params.set("port", conn.port);
+  }
+  if (conn.secret) {
+    params.set("secret", conn.secret);
+  }
+  const qs = params.toString();
+  return `${proto}//${window.location.host}/clash-ws/${clean}${qs ? `?${qs}` : ""}`;
+}

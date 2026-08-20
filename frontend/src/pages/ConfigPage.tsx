@@ -1,11 +1,11 @@
 import { useState, useRef, useEffect } from "react";
-import { Badge, Button, Card, CardHeader, Input, Select } from "../components/ui";
+import { Badge, Button, Card, CardHeader, Input } from "../components/ui";
 import { useApp } from "../lib/store";
 import { useT } from "../lib/i18n";
 import { useMihomoConfig } from "../lib/useMihomoConfig";
 import { useSession } from "../lib/session";
 import { ApiError } from "../lib/api";
-import { DEFAULT_PROVIDER, applyMihomoConfigChanges, ensureMihomoRunning, ensureZkeenMihomoConfig, getTopLevelScalar, refreshProxyProvider, setTopLevelScalar } from "../lib/config";
+import { DEFAULT_PROVIDER, applyMihomoConfigChanges, ensureMihomoRunning, ensureZkeenMihomoConfig, refreshProxyProvider } from "../lib/config";
 
 type ConfigTab = "editor" | "quick";
 
@@ -92,21 +92,6 @@ export function ConfigPage() {
     }
   }
 
-  async function handleApplyCore() {
-    setSaving(true);
-    setActionError("");
-    try {
-      await cfg.save(false);
-      const conn = await applyMihomoConfigChanges(clash);
-      setClash(conn);
-      await refreshSession();
-    } catch (err) {
-      setActionError(err instanceof ApiError ? err.message : t("config.saveError"));
-    } finally {
-      setSaving(false);
-    }
-  }
-
   return (
     <div className="page-enter space-y-4">
       {actionError && (
@@ -172,17 +157,11 @@ export function ConfigPage() {
       )}
       {(mode === "safe" || tab === "quick") && (
         <QuickSettingsTab
-          appMode={mode}
           subscriptionUrl={cfg.subscriptionUrl}
           subscriptionHwid={cfg.subscriptionHwid}
           onSubscriptionChange={cfg.updateSubscriptionUrl}
           onSubscriptionHwidChange={cfg.updateSubscriptionHwid}
           onSaveSubscription={handleApplySubscription}
-          coreMode={getTopLevelScalar(cfg.yaml, "mode") || "rule"}
-          logLevel={getTopLevelScalar(cfg.yaml, "log-level") || "silent"}
-          onCoreModeChange={(value) => cfg.setYaml(setTopLevelScalar(cfg.yaml, "mode", value))}
-          onLogLevelChange={(value) => cfg.setYaml(setTopLevelScalar(cfg.yaml, "log-level", value))}
-          onSaveCore={handleApplyCore}
           dirty={cfg.dirty}
           saving={saving}
         />
@@ -298,31 +277,19 @@ function EditorTab({
 }
 
 function QuickSettingsTab({
-  appMode,
   subscriptionUrl,
   subscriptionHwid,
   onSubscriptionChange,
   onSubscriptionHwidChange,
   onSaveSubscription,
-  coreMode,
-  logLevel,
-  onCoreModeChange,
-  onLogLevelChange,
-  onSaveCore,
   dirty,
   saving,
 }: {
-  appMode: "safe" | "expert";
   subscriptionUrl: string;
   subscriptionHwid: string;
   onSubscriptionChange: (url: string) => void;
   onSubscriptionHwidChange: (hwid: string) => void;
   onSaveSubscription: () => Promise<void>;
-  coreMode: string;
-  logLevel: string;
-  onCoreModeChange: (value: string) => void;
-  onLogLevelChange: (value: string) => void;
-  onSaveCore: () => Promise<void>;
   dirty: boolean;
   saving: boolean;
 }) {
@@ -409,41 +376,6 @@ function QuickSettingsTab({
           </div>
         </div>
       </Card>
-
-      {appMode === "expert" && (
-        <Card>
-          <CardHeader title={t("config.qCore")} subtitle={t("config.qCoreSub")} />
-          <div className="grid gap-3 p-4 sm:grid-cols-2 sm:p-5">
-            <Select
-              label={t("config.qMode")}
-              options={[
-                { value: "rule", label: "rule" },
-                { value: "global", label: "global" },
-                { value: "direct", label: "direct" },
-              ]}
-              value={coreMode}
-              onChange={onCoreModeChange}
-            />
-            <Select
-              label={t("config.qLogLevel")}
-              options={[
-                { value: "silent", label: "silent" },
-                { value: "error", label: "error" },
-                { value: "warning", label: "warning" },
-                { value: "info", label: "info" },
-                { value: "debug", label: "debug" },
-              ]}
-              value={logLevel}
-              onChange={onLogLevelChange}
-            />
-          </div>
-          <div className="border-t border-zk-border-soft px-4 py-3 sm:px-5">
-            <Button size="sm" variant="primary" disabled={saving || !dirty} onClick={onSaveCore}>
-              {saving ? t("app.loading") : t("config.qApply")}
-            </Button>
-          </div>
-        </Card>
-      )}
     </div>
   );
 }
