@@ -3,6 +3,11 @@ use std::fs;
 use std::path::Path;
 
 fn main() {
+    println!(
+        "cargo:rustc-env=BUILD_TARGET={}",
+        env::var("TARGET").unwrap_or_else(|_| "unknown".into())
+    );
+
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let assets_dir = Path::new(&manifest_dir).join("assets");
     let dst = assets_dir.join("mihomo-config.default.yaml");
