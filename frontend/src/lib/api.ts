@@ -155,7 +155,11 @@ export async function clashJson<T>(
 }
 
 /** Build Clash WebSocket URL via zkeen-ui relay (`/clash-ws/...`). */
-export function clashWsUrl(path: string, conn: ClashConnection): string {
+export function clashWsUrl(
+  path: string,
+  conn: ClashConnection,
+  extra?: Record<string, string>,
+): string {
   const clean = path.replace(/^\//, "");
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   const params = new URLSearchParams();
@@ -166,6 +170,11 @@ export function clashWsUrl(path: string, conn: ClashConnection): string {
   }
   if (conn.secret) {
     params.set("secret", conn.secret);
+  }
+  if (extra) {
+    for (const [k, v] of Object.entries(extra)) {
+      if (v) params.set(k, v);
+    }
   }
   const qs = params.toString();
   return `${proto}//${window.location.host}/clash-ws/${clean}${qs ? `?${qs}` : ""}`;

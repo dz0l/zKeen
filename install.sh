@@ -391,9 +391,8 @@ install_xkeen_fork() {
     [ -d /opt/sbin/.xkeen ] && mv /opt/sbin/.xkeen /opt/sbin/.xkeen.old
     mv "$_stage/_xkeen" /opt/sbin/.xkeen
     rm -rf /opt/sbin/.xkeen.old "$_stage"
-
-    cp -f "$_archive" /opt/sbin/xkeen.tar.gz
-    rm -f "$_archive"
+    # Do not keep the archive — Entware flash is limited
+    rm -f "$_archive" /opt/sbin/xkeen.tar.gz
     chmod 755 /opt/sbin/xkeen
 
     if ! has_xkeen_binary; then
@@ -504,7 +503,7 @@ run_xkeen_setup() {
         # jameszeroX menu: 2 = Mihomo, 1 = stable / first option
         if printf '2\n1\n' | "$_xkeen" -i 2>/dev/null; then
             _configured=1
-        elif [ -f /opt/sbin/xkeen.tar.gz ] && has_mihomo_binary; then
+        elif [ -d /opt/sbin/.xkeen ] && has_mihomo_binary; then
             if ( cd /opt/sbin && "$_xkeen" -io ); then
                 _configured=1
             fi
@@ -777,6 +776,35 @@ start_service() {
     fi
 }
 
+# Remove install/update leftovers. Keeps unrelated files in /opt/tmp intact.
+cleanup_tmp() {
+    log_step "Cleaning temporary files..."
+    # XKeen / Mihomo / zKeen UI download leftovers
+    rm -f \
+        /opt/tmp/xkeen.tar.gz \
+        /opt/tmp/xkeen.tar \
+        /opt/tmp/xkeen.tar.gz.* \
+        /opt/tmp/xkeen.tar.* \
+        /opt/tmp/mihomo.gz \
+        /opt/tmp/mihomo.gz.* \
+        /opt/tmp/zkeen-ui \
+        /opt/tmp/zkeen-ui.* \
+        /opt/tmp/zkeen-ui_* \
+        /opt/tmp/bin.tmp \
+        /opt/tmp/download.tmp \
+        /opt/tmp/yq.tmp \
+        /opt/tmp/yq.bin \
+        /opt/tmp/mihomo-config.default.* \
+        /opt/sbin/xkeen.tar.gz \
+        /opt/sbin/mihomo.new.* \
+        2>/dev/null || true
+    # PID-suffixed temp binaries from this installer
+    rm -f /opt/tmp/"${BINARY_NAME}".tmp.* 2>/dev/null || true
+    # Stale stage dirs from interrupted XKeen install
+    rm -rf /opt/sbin/.xkeen-install.* 2>/dev/null || true
+    log_info "Temporary files cleaned"
+}
+
 restart_service() {
     log_step "Restarting ${BINARY_NAME}..."
     "${INIT_DIR}/${INIT_SCRIPT}" restart >/dev/null 2>&1 || true
@@ -839,6 +867,8 @@ main() {
     check_curl
     detect_arch
     check_proxy_stack
+    # Drop XKeen/Mihomo installer leftovers before downloading the panel binary
+    cleanup_tmp
     check_free_space
     check_repo_available
     get_latest_version
@@ -847,6 +877,7 @@ main() {
         get_installed_version
         if [ -n "$INSTALLED_VERSION" ] && [ "$INSTALLED_VERSION" = "$LATEST_TAG" ]; then
             log_info "Already up to date: ${INSTALLED_VERSION}"
+            cleanup_tmp
             exit 0
         fi
         if [ -n "$INSTALLED_VERSION" ]; then
@@ -865,6 +896,8 @@ main() {
         create_init_script
         start_service
     fi
+
+    cleanup_tmp
 
     FINAL_FREE_KB=$(df -k /opt 2>/dev/null | tail -1 | awk '{print $4}')
     if [ -n "$FINAL_FREE_KB" ]; then

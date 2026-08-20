@@ -67,8 +67,13 @@ pub async fn version_handler(State(state): State<AppState>) -> impl IntoResponse
 
     {
         let link = get_repo("self").and_then(|r| make_link(r, ui_tag.as_deref()));
+        let latest = ui_tag
+            .as_deref()
+            .map(|t| t.trim_start_matches('v').to_string())
+            .unwrap_or_else(|| VERSION.trim_start_matches('v').to_string());
         res.insert("zkeen-ui".into(), json!({
             "version": VERSION.trim_start_matches('v'),
+            "latest": latest,
             "outdated": ui,
             "show_toast": check(ui, &state.update_checker.last_ui_toast),
             "link": link,
@@ -76,7 +81,15 @@ pub async fn version_handler(State(state): State<AppState>) -> impl IntoResponse
     }
 
     let make_core_obj = |v: String, repo: &str, tag: Option<&str>| -> serde_json::Value {
-        let mut obj = json!({ "version": v, "outdated": core_outdated, "show_toast": check(core_outdated, &state.update_checker.last_core_toast) });
+        let latest = tag
+            .map(|t| t.trim_start_matches('v').to_string())
+            .unwrap_or_else(|| v.trim_start_matches('v').to_string());
+        let mut obj = json!({
+            "version": v,
+            "latest": latest,
+            "outdated": core_outdated,
+            "show_toast": check(core_outdated, &state.update_checker.last_core_toast)
+        });
         if let Some(link) = make_link(repo, tag) {
             obj["link"] = json!(link);
         }
@@ -170,4 +183,39 @@ fn compare_versions(latest: &str, current: &str) -> bool {
             .collect::<Vec<_>>()
     };
     parse(latest) > parse(current)
+}
+
+/// Force-refresh GitHub latest tags for UI and current core, then return `/api/version` payload.
+pub async fn check_updates_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let proxies = state.settings.read().unwrap().updater.github_proxy.clone();
+
+    {
+        let cur = VERSION.trim_start_matches('v');
+        if let Some((latest, tag)) =
+            updater::fetch_latest_version(&state.http_client, "self", &proxies, Some(cur)).await
+        {
+            *state.update_checker.ui_outdated.write().unwrap() = compare_versions(&latest, cur);
+            *state.update_checker.ui_latest_tag.write().unwrap() = Some(tag);
+            *state.update_checker.last_ui_check.write().unwrap() = Some(Instant::now());
+        }
+    }
+
+    {
+        let core = state.core.read().unwrap().name.clone();
+        let cur_opt = get_local_core_version(&core).await;
+        let cur_str = cur_opt.as_deref().map(|v| v.trim_start_matches('v'));
+        if let Some((latest, tag)) =
+            updater::fetch_latest_version(&state.http_client, &core, &proxies, cur_str).await
+        {
+            if let Some(cur) = cur_str {
+                if !cur.is_empty() {
+                    *state.update_checker.core_outdated.write().unwrap() = compare_versions(&latest, cur);
+                }
+            }
+            *state.update_checker.core_latest_tag.write().unwrap() = Some(tag);
+            *state.update_checker.last_core_check.write().unwrap() = Some(Instant::now());
+        }
+    }
+
+    version_handler(State(state)).await
 }

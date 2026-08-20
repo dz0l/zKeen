@@ -1,15 +1,28 @@
 import { useState, useEffect } from "react";
 import { Card, CardHeader, Input, Select, Button, Badge } from "../components/ui";
 import { useI18n, useT, AVAILABLE_LOCALES } from "../lib/i18n";
-import { useSession } from "../lib/session";
-import type { ClashConnection } from "../lib/api";
+import { useSession, type VersionEntry, type VersionInfo } from "../lib/session";
+import { apiJson, ApiError, type ClashConnection } from "../lib/api";
+
+function stripV(v?: string): string {
+  if (!v) return "—";
+  return v.replace(/^v/i, "");
+}
+
+function displayLatest(entry?: VersionEntry): string {
+  if (!entry) return "—";
+  return stripV(entry.latest || entry.version);
+}
 
 export function SettingsPage() {
   const t = useT();
   const { locale, setLocale } = useI18n();
-  const { clash, setClash, versions, logout, loginInfo } = useSession();
+  const { clash, setClash, versions, setVersions, logout, loginInfo } = useSession();
   const [draft, setDraft] = useState<ClashConnection>(clash);
   const [saved, setSaved] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [checkError, setCheckError] = useState("");
+  const [updating, setUpdating] = useState("");
 
   useEffect(() => {
     setDraft(clash);
@@ -21,9 +34,49 @@ export function SettingsPage() {
     setTimeout(() => setSaved(false), 2000);
   }
 
+  async function checkUpdates() {
+    setChecking(true);
+    setCheckError("");
+    try {
+      const res = await apiJson<VersionInfo & { success?: boolean }>("/api/version/check", {
+        method: "POST",
+      });
+      setVersions(res);
+    } catch (err) {
+      setCheckError(err instanceof ApiError ? err.message : t("settings.checkError"));
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  async function runUpdate(core: string, version: string) {
+    if (!version || version === "—") return;
+    setUpdating(core);
+    setCheckError("");
+    try {
+      await apiJson("/api/update", {
+        method: "POST",
+        body: JSON.stringify({
+          core,
+          version,
+          backup_core: true,
+          assets: [],
+        }),
+      });
+      await checkUpdates();
+    } catch (err) {
+      setCheckError(err instanceof ApiError ? err.message : t("settings.updateError"));
+    } finally {
+      setUpdating("");
+    }
+  }
+
+  const ui = versions?.["zkeen-ui"];
+  const mihomo = versions?.mihomo;
+  const xray = versions?.xray;
+
   return (
     <div className="page-enter space-y-4">
-
       <div>
         <h1 className="text-xl font-bold tracking-tight sm:text-2xl">{t("settings.title")}</h1>
         <p className="mt-1 text-sm text-zk-muted">{t("settings.subtitle")}</p>
@@ -88,23 +141,50 @@ export function SettingsPage() {
       </Card>
 
       <Card>
-        <CardHeader title={t("settings.updates")} subtitle={t("settings.updatesSub")} />
+        <CardHeader
+          title={t("settings.updates")}
+          subtitle={t("settings.updatesSub")}
+          action={
+            <Button size="sm" variant="secondary" disabled={checking} onClick={() => void checkUpdates()}>
+              {checking ? t("settings.checking") : t("settings.checkUpdates")}
+            </Button>
+          }
+        />
         <div className="space-y-4 p-4 sm:p-5">
+          {checkError && (
+            <p className="rounded-lg border border-zk-coral/25 bg-zk-coral/10 px-3 py-2 text-xs text-zk-coral">
+              {checkError}
+            </p>
+          )}
           <div className="space-y-2">
             <UpdateRow
               name="zkeen-ui"
-              version={versions?.["zkeen-ui"]?.version || "—"}
-              latest={versions?.["zkeen-ui"]?.version || "—"}
+              version={stripV(ui?.version)}
+              latest={displayLatest(ui)}
+              outdated={!!ui?.outdated || (stripV(ui?.version) !== displayLatest(ui) && displayLatest(ui) !== "—")}
+              updating={updating === "self"}
+              onUpdate={() => void runUpdate("self", displayLatest(ui))}
             />
             <UpdateRow
               name="mihomo"
-              version={versions?.mihomo?.version?.replace(/^v/, "") || "—"}
-              latest={versions?.mihomo?.version?.replace(/^v/, "") || "—"}
+              version={stripV(mihomo?.version)}
+              latest={displayLatest(mihomo)}
+              outdated={
+                !!mihomo?.outdated ||
+                (stripV(mihomo?.version) !== displayLatest(mihomo) && displayLatest(mihomo) !== "—")
+              }
+              updating={updating === "mihomo"}
+              onUpdate={() => void runUpdate("mihomo", displayLatest(mihomo))}
             />
             <UpdateRow
               name="xray"
-              version={versions?.xray?.version?.replace(/^v/, "") || "—"}
-              latest={versions?.xray?.version?.replace(/^v/, "") || "—"}
+              version={stripV(xray?.version)}
+              latest={displayLatest(xray)}
+              outdated={
+                !!xray?.outdated || (stripV(xray?.version) !== displayLatest(xray) && displayLatest(xray) !== "—")
+              }
+              updating={updating === "xray"}
+              onUpdate={() => void runUpdate("xray", displayLatest(xray))}
             />
           </div>
         </div>
@@ -113,9 +193,23 @@ export function SettingsPage() {
   );
 }
 
-function UpdateRow({ name, version, latest }: { name: string; version: string; latest: string }) {
+function UpdateRow({
+  name,
+  version,
+  latest,
+  outdated,
+  updating,
+  onUpdate,
+}: {
+  name: string;
+  version: string;
+  latest: string;
+  outdated: boolean;
+  updating?: boolean;
+  onUpdate?: () => void;
+}) {
   const t = useT();
-  const hasUpdate = version !== "—" && latest !== "—" && version !== latest;
+  const hasUpdate = outdated && version !== "—" && latest !== "—" && version !== latest;
   return (
     <div className="flex items-center justify-between gap-3 rounded-xl border border-zk-border-soft bg-zk-bg-elevated/60 px-4 py-3">
       <div className="min-w-0">
@@ -129,8 +223,13 @@ function UpdateRow({ name, version, latest }: { name: string; version: string; l
           {t("settings.latest")}: <span className="font-mono">{latest}</span>
         </p>
       </div>
-      <Button size="sm" variant={hasUpdate ? "primary" : "ghost"} disabled={!hasUpdate}>
-        {hasUpdate ? t("settings.update") : t("settings.upToDate")}
+      <Button
+        size="sm"
+        variant={hasUpdate ? "primary" : "ghost"}
+        disabled={!hasUpdate || updating}
+        onClick={onUpdate}
+      >
+        {updating ? t("app.loading") : hasUpdate ? t("settings.update") : t("settings.upToDate")}
       </Button>
     </div>
   );

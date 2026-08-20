@@ -42,7 +42,7 @@ pub fn get_repo(core: &str) -> Option<&'static str> {
     match core {
         "xray" => Some("XTLS/Xray-core"),
         "mihomo" => Some("MetaCubeX/mihomo"),
-        "self" => None,
+        "self" => Some("dz0l/zKeen"),
         _ => None,
     }
 }
@@ -238,6 +238,46 @@ async fn save(dl: DownloadResult, out_path: PathBuf) -> std::io::Result<()> {
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
 }
 
+/// Remove known install/update leftovers under `/opt/tmp` (and archive copies in `/opt/sbin`).
+/// Does not wipe the whole tmp dir — other tools may store files there.
+async fn cleanup_opt_tmp() {
+    let prefixes = [
+        "xkeen.tar",
+        "mihomo.gz",
+        "zkeen-ui",
+        "bin.tmp",
+        "download.tmp",
+        "yq.tmp",
+        "yq.bin",
+        "mihomo-config.default",
+        "mihomo_v",
+        "mihomo_",
+        "xray_v",
+        "xray_",
+        "zkeen-ui_",
+        "convert_",
+    ];
+    if let Ok(mut entries) = fs::read_dir("/opt/tmp").await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let remove = prefixes.iter().any(|p| name.starts_with(p))
+                || name.ends_with(".tmp")
+                || name.contains(".tmp.");
+            if remove {
+                let path = entry.path();
+                if path.is_dir() {
+                    _ = fs::remove_dir_all(&path).await;
+                } else {
+                    _ = fs::remove_file(&path).await;
+                }
+            }
+        }
+    }
+    _ = fs::remove_file("/opt/sbin/xkeen.tar.gz").await;
+    log("INFO", "Временные файлы обновления очищены".into());
+}
+
 async fn install_jq() -> Result<(), String> {
     log("INFO", "Установка jq через opkg...".into());
     let update = Command::new("opkg")
@@ -373,6 +413,8 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
 
         if let Err(e) = integrity_check {
             _ = std::fs::remove_file(&source);
+            _ = fs::remove_file(tmp_dir.join("bin.tmp")).await;
+            cleanup_opt_tmp().await;
             return response(false, Some(e));
         }
 
@@ -384,6 +426,7 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
         _ = fs::set_permissions(target, std::fs::Permissions::from_mode(0o755)).await;
         _ = tokio::task::spawn_blocking(rustix::fs::sync).await;
 
+        cleanup_opt_tmp().await;
         log("INFO", format!("Обновление zKeen UI до {} завершено", ver));
 
         if Path::new(S99ZKEEN_UI).exists() {
@@ -553,5 +596,6 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
     }
     *state.update_checker.last_core_toast.write().unwrap() = None;
 
+    cleanup_opt_tmp().await;
     response(true, None)
 }

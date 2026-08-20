@@ -32,6 +32,8 @@ pub struct ClashWsQuery {
     pub port: Option<String>,
     pub secret: Option<String>,
     pub unix: Option<String>,
+    /// Forwarded to Clash WS (e.g. `/logs?level=error`).
+    pub level: Option<String>,
 }
 
 pub async fn get_device_list(State(state): State<AppState>) -> impl IntoResponse {
@@ -113,28 +115,47 @@ pub async fn proxy_ws(
     matched_path: MatchedPath, Query(q): Query<ClashWsQuery>, ws: WebSocketUpgrade, req: Request<Body>,
 ) -> impl IntoResponse {
     let path = raw_relay_path(matched_path.as_str(), req.uri().path());
+    let level = q.level.clone();
     let target = match resolve_clash_target(q.port, q.secret, q.unix).await {
         Ok(t) => t,
         Err(e) => return make_error(StatusCode::BAD_REQUEST, e),
     };
 
     ws.on_upgrade(move |socket| async move {
-        if let Err(e) = proxy_ws_inner(socket, path, target).await {
+        if let Err(e) = proxy_ws_inner(socket, path, target, level).await {
             eprintln!("Clash WS proxy error: {}", e);
         }
     })
 }
 
-async fn proxy_ws_inner(client_ws: WebSocket, path: String, target: ClashTarget) -> Result<(), String> {
+fn clash_ws_query(secret: Option<&str>, level: Option<&str>) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(secret) = secret {
+        parts.push(format!("token={}", urlencoding::encode(secret)));
+    }
+    if let Some(level) = level {
+        if !level.is_empty() && level != "silent" {
+            parts.push(format!("level={}", urlencoding::encode(level)));
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("&"))
+    }
+}
+
+async fn proxy_ws_inner(
+    client_ws: WebSocket, path: String, target: ClashTarget, level: Option<String>,
+) -> Result<(), String> {
     type UpstreamSink = Pin<Box<dyn Sink<TMessage, Error = TError> + Send>>;
     type UpstreamStream = Pin<Box<dyn Stream<Item = Result<TMessage, TError>> + Send>>;
 
+    let level_ref = level.as_deref();
     let (mut upstream_tx, mut upstream_rx): (UpstreamSink, UpstreamStream) = match target {
         ClashTarget::Tcp { host, port, secret } => {
-            let mut url = build_url("ws", &host, &port, &path, None);
-            if let Some(secret) = secret {
-                url.push_str(&format!("?token={}", urlencoding::encode(&secret)));
-            }
+            let query = clash_ws_query(secret.as_deref(), level_ref);
+            let url = build_url("ws", &host, &port, &path, query.as_deref());
             let (ws, _) = timeout(Duration::from_secs(5), connect_async(url))
                 .await
                 .map_err(|_| "Upstream connect timeout".to_string())?
@@ -143,7 +164,8 @@ async fn proxy_ws_inner(client_ws: WebSocket, path: String, target: ClashTarget)
             (Box::pin(tx), Box::pin(rx))
         }
         ClashTarget::Unix { path: socket_path } => {
-            let url = build_url("ws", "127.0.0.1", "80", &path, None);
+            let query = clash_ws_query(None, level_ref);
+            let url = build_url("ws", "127.0.0.1", "80", &path, query.as_deref());
             let (ws, _) = timeout(Duration::from_secs(5), async {
                 let stream = UnixStream::connect(socket_path).await?;
                 client_async(url, stream).await.map_err(|e| std::io::Error::other(e.to_string()))

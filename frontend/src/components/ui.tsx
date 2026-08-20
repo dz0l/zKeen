@@ -173,19 +173,28 @@ export function Select({
   options,
   value,
   onChange,
+  inline = false,
+  className = "",
 }: {
   label: string;
   options: { value: string; label: string }[];
   value?: string;
   onChange?: (v: string) => void;
+  /** Label and select on one row. */
+  inline?: boolean;
+  className?: string;
 }) {
   return (
-    <label className="block">
-      <span className="mb-1.5 block text-xs font-medium text-zk-muted">{label}</span>
+    <label className={`block ${inline ? "flex min-w-0 items-center gap-3" : ""} ${className}`}>
+      <span
+        className={`shrink-0 text-xs font-medium text-zk-muted ${inline ? "whitespace-nowrap" : "mb-1.5 block"}`}
+      >
+        {label}
+      </span>
       <select
         value={value}
         onChange={(e) => onChange?.(e.target.value)}
-        className="w-full appearance-none rounded-xl border border-zk-border-soft bg-zk-bg-elevated px-3.5 py-2.5 text-sm text-zk-text outline-none focus:border-zk-accent/50"
+        className={`${inline ? "min-w-0 flex-1" : "w-full"} appearance-none rounded-xl border border-zk-border-soft bg-zk-bg-elevated px-3.5 py-2 text-sm text-zk-text outline-none focus:border-zk-accent/50`}
       >
         {options.map((o) => (
           <option key={o.value} value={o.value}>

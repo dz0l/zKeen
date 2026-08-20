@@ -44,10 +44,17 @@ export interface AppSettings {
   auth: { enabled: boolean };
 }
 
+export interface VersionEntry {
+  version: string;
+  latest?: string;
+  outdated?: boolean;
+  link?: string;
+}
+
 export interface VersionInfo {
-  "zkeen-ui"?: { version: string; outdated?: boolean };
-  xray?: { version: string };
-  mihomo?: { version: string };
+  "zkeen-ui"?: VersionEntry;
+  xray?: VersionEntry;
+  mihomo?: VersionEntry;
 }
 
 interface SessionState {
@@ -56,6 +63,7 @@ interface SessionState {
   settings: AppSettings | null;
   control: ControlInfo | null;
   versions: VersionInfo | null;
+  setVersions: (v: VersionInfo | null) => void;
   clash: ClashConnection;
   setClash: (conn: ClashConnection) => void;
   refreshSession: () => Promise<void>;
@@ -191,6 +199,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       settings,
       control,
       versions,
+      setVersions,
       clash,
       setClash,
       refreshSession,

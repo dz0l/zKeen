@@ -471,6 +471,7 @@ async fn main() {
             get(settings::get_settings).patch(settings::patch_settings),
         )
         .route("/api/version", get(version::version_handler))
+        .route("/api/version/check", post(version::check_updates_handler))
         .route("/api/ruleset", get(ruleset_inspector::get_ruleset_content))
         .route("/api/device-list", get(api_relay::get_device_list))
         .route("/api/update", post(updater::post_update))

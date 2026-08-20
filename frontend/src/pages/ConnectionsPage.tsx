@@ -43,8 +43,29 @@ interface LogLine {
   time: number;
 }
 
-const CLOSED_LIMIT = 100;
 const LOG_LIMIT = 300;
+const CLOSED_LIMIT = 100;
+
+const LOG_LEVEL_RANK: Record<string, number> = {
+  debug: 0,
+  info: 1,
+  warning: 2,
+  error: 3,
+  silent: 4,
+};
+
+function normalizeLogType(type: string): string {
+  const t = type.toLowerCase();
+  if (t === "warn") return "warning";
+  return t;
+}
+
+function logPassesFilter(type: string, selectedLevel: string): boolean {
+  if (selectedLevel === "silent") return false;
+  const msgRank = LOG_LEVEL_RANK[normalizeLogType(type)] ?? 1;
+  const minRank = LOG_LEVEL_RANK[selectedLevel] ?? 1;
+  return msgRank >= minRank;
+}
 
 function mapClashConnection(item: ClashConnectionItem): Connection {
   const meta = item.metadata ?? {};
@@ -290,7 +311,8 @@ export function ConnectionsPage() {
 
   useEffect(() => {
     if (pageTab !== "logs") return;
-    const url = clashWsUrl("logs", clashRef.current);
+    const level = logLevel || "info";
+    const url = clashWsUrl("logs", clashRef.current, level === "silent" ? undefined : { level });
     let ws: WebSocket | null = null;
     let closed = false;
     try {
@@ -299,14 +321,17 @@ export function ConnectionsPage() {
         if (logsPausedRef.current) return;
         try {
           const data = JSON.parse(String(ev.data)) as { type?: string; payload?: string };
+          const type = data.type || "info";
+          if (!logPassesFilter(type, level)) return;
           const line: LogLine = {
             id: ++logIdRef.current,
-            type: data.type || "info",
+            type,
             payload: data.payload || String(ev.data),
             time: Date.now(),
           };
           setLogLines((prev) => [...prev, line].slice(-LOG_LIMIT));
         } catch {
+          if (!logPassesFilter("info", level)) return;
           setLogLines((prev) =>
             [
               ...prev,
@@ -324,7 +349,7 @@ export function ConnectionsPage() {
       ws?.close();
       void closed;
     };
-  }, [pageTab, clash.port, clash.secret, clash.unix, t]);
+  }, [pageTab, clash.port, clash.secret, clash.unix, logLevel, t]);
 
   useEffect(() => {
     if (pageTab === "logs" && !logsPaused) {
@@ -417,6 +442,7 @@ export function ConnectionsPage() {
       const conn = await applyMihomoConfigChanges(clash);
       setClash(conn);
       setLogLevel(value);
+      setLogLines([]);
     } catch (err) {
       setLogsError(err instanceof ApiError ? err.message : t("conn.logsSaveError"));
     } finally {
