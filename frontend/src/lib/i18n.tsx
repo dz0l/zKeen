@@ -81,6 +81,8 @@ const translations: Translations = {
     "conn.colTime": "Время",
     "conn.colClosed": "Закрыто",
     "conn.noResults": "Нет подключений по фильтру",
+    "conn.loadError": "Не удалось загрузить соединения",
+    "conn.closeError": "Не удалось завершить соединения",
 
     // Proxies
     "proxies.title": "Proxy",
@@ -327,6 +329,8 @@ const translations: Translations = {
     "conn.colTime": "Time",
     "conn.colClosed": "Closed",
     "conn.noResults": "No connections match filter",
+    "conn.loadError": "Failed to load connections",
+    "conn.closeError": "Failed to close connections",
 
     // Proxies
     "proxies.title": "Proxy",

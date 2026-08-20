@@ -1,8 +1,17 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Badge, Button, Card, CardHeader, MockBanner, StatTile } from "../components/ui";
+import { Badge, Button, Card, CardHeader, StatTile } from "../components/ui";
 import { useApp } from "../lib/store";
 import { useT } from "../lib/i18n";
+import { useSession } from "../lib/session";
+import { ApiError, clashJson } from "../lib/api";
+import {
+  connectionStartedAt,
+  formatBytes,
+  formatDurationSec,
+  type ClashConnectionItem,
+  type ClashConnectionsResponse,
+} from "../lib/clash";
 
 type ConnTab = "active" | "closed";
 
@@ -10,7 +19,7 @@ interface Connection {
   id: string;
   sourceIp: string;
   host: string;
-  network: "TCP" | "UDP";
+  network: string;
   rule: string;
   chain: string;
   upload: number;
@@ -19,69 +28,21 @@ interface Connection {
   closedAt?: number;
 }
 
-const HOSTS = [
-  "www.youtube.com", "api.telegram.org", "discord.com", "www.google.com",
-  "api.openai.com", "netflix.com", "yandex.ru", "steamcommunity.com",
-  "scontent.cdninstagram.com", "github.com", "apple.com", "spotify.com",
-];
-
-const RULES = ["YouTube", "Telegram", "Discord", "Google", "OpenAI", "Netflix", "RU traffic", "Steam", "Instagram", "DIRECT"];
-const CHAINS = ["🇳🇱 NL-Amsterdam-01", "🇩🇪 DE-Frankfurt-02", "🇫🇮 FI-Helsinki-01", "🇺🇸 US-NewYork-03", "DIRECT"];
-
-function buildMockConnections(): { active: Connection[]; closed: Connection[] } {
-  const active: Connection[] = [];
-  const closed: Connection[] = [];
-  let id = 1;
-
-  for (let i = 1; i <= 120; i++) {
-    const ip = `192.168.1.${i}`;
-    const count = i <= 20 ? (i % 4) + 1 : i % 3 === 0 ? 1 : 0;
-    for (let j = 0; j < count; j++) {
-      active.push({
-        id: String(id++),
-        sourceIp: ip,
-        host: HOSTS[(i + j) % HOSTS.length],
-        network: j % 5 === 0 ? "UDP" : "TCP",
-        rule: RULES[(i + j) % RULES.length],
-        chain: CHAINS[(i + j) % CHAINS.length],
-        upload: 500 + (i * 97 + j * 13) % 50000,
-        download: 2000 + (i * 131 + j * 17) % 500000,
-        durationSec: 10 + (i * 7 + j * 3) % 3600,
-      });
-    }
-  }
-
-  for (let k = 0; k < 45; k++) {
-    const i = (k % 80) + 1;
-    closed.push({
-      id: `c-${id++}`,
-      sourceIp: `192.168.1.${i}`,
-      host: HOSTS[k % HOSTS.length],
-      network: k % 4 === 0 ? "UDP" : "TCP",
-      rule: RULES[k % RULES.length],
-      chain: CHAINS[k % CHAINS.length],
-      upload: 1000 + k * 200,
-      download: 5000 + k * 800,
-      durationSec: 30 + k * 12,
-      closedAt: Date.now() - k * 60000 - 30000,
-    });
-  }
-
-  return { active, closed };
-}
-
-const INITIAL = buildMockConnections();
-
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function formatDuration(sec: number): string {
-  if (sec < 60) return `${sec}s`;
-  if (sec < 3600) return `${Math.floor(sec / 60)}m ${sec % 60}s`;
-  return `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`;
+function mapClashConnection(item: ClashConnectionItem): Connection {
+  const meta = item.metadata ?? {};
+  const host = meta.host || meta.destinationIP || "—";
+  const start = connectionStartedAt(item.start);
+  return {
+    id: item.id,
+    sourceIp: meta.sourceIP || "—",
+    host,
+    network: (meta.network || "tcp").toUpperCase(),
+    rule: item.rule || "—",
+    chain: (item.chains ?? []).slice().reverse().join(" → ") || "—",
+    upload: item.upload ?? 0,
+    download: item.download ?? 0,
+    durationSec: Math.max(0, Math.floor((Date.now() - start) / 1000)),
+  };
 }
 
 function formatClosedAgo(ts: number): string {
@@ -227,11 +188,46 @@ function IpDropdown({
 export function ConnectionsPage() {
   const t = useT();
   const { mode } = useApp();
+  const { clash } = useSession();
+  const clashRef = useRef(clash);
+  clashRef.current = clash;
+
   const [tab, setTab] = useState<ConnTab>("active");
-  const [activeList, setActiveList] = useState(INITIAL.active);
-  const [closedList, setClosedList] = useState(INITIAL.closed);
+  const [activeList, setActiveList] = useState<Connection[]>([]);
+  const [closedList, setClosedList] = useState<Connection[]>([]);
+  const [uploadTotal, setUploadTotal] = useState(0);
+  const [downloadTotal, setDownloadTotal] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
   const [ipFilter, setIpFilter] = useState("");
   const [hostFilter, setHostFilter] = useState("");
+
+  const loadConnections = useCallback(async () => {
+    try {
+      const data = await clashJson<ClashConnectionsResponse>(
+        "connections",
+        clashRef.current,
+        undefined,
+        8000,
+      );
+      setActiveList((data.connections ?? []).map(mapClashConnection));
+      setUploadTotal(data.uploadTotal ?? 0);
+      setDownloadTotal(data.downloadTotal ?? 0);
+      setError("");
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : t("conn.loadError"));
+    } finally {
+      setLoading(false);
+    }
+  }, [t]);
+
+  useEffect(() => {
+    setLoading(true);
+    loadConnections();
+    const id = setInterval(loadConnections, 3000);
+    return () => clearInterval(id);
+  }, [loadConnections, clash.port, clash.secret, clash.unix]);
 
   const sourceList = tab === "active" ? activeList : closedList;
 
@@ -263,19 +259,13 @@ export function ConnectionsPage() {
       down += c.download;
       ips.add(c.sourceIp);
     }
-    return { count: filtered.length, upload: up, download: down, uniqueIps: ips.size };
-  }, [filtered]);
-
-  const closeMatching = (match: (c: Connection) => boolean) => {
-    const toClose = activeList.filter(match);
-    if (toClose.length === 0) return;
-    const now = Date.now();
-    setActiveList((prev) => prev.filter((c) => !match(c)));
-    setClosedList((prev) => [
-      ...toClose.map((c) => ({ ...c, closedAt: now })),
-      ...prev,
-    ]);
-  };
+    return {
+      count: filtered.length,
+      upload: tab === "active" && !ipFilter && !hostFilter ? uploadTotal : up,
+      download: tab === "active" && !ipFilter && !hostFilter ? downloadTotal : down,
+      uniqueIps: ips.size,
+    };
+  }, [filtered, tab, ipFilter, hostFilter, uploadTotal, downloadTotal]);
 
   const confirmClose = (message: string, action: () => void) => {
     if (mode === "safe" && !window.confirm(message)) return;
@@ -290,9 +280,33 @@ export function ConnectionsPage() {
     const msg = ipFilter
       ? t("conn.confirmCloseIp", { ip: ipFilter, count: target.length })
       : t("conn.confirmCloseAll", { count: target.length });
-    confirmClose(msg, () => {
-      if (ipFilter) closeMatching((c) => c.sourceIp === ipFilter);
-      else closeMatching(() => true);
+
+    confirmClose(msg, async () => {
+      setBusy(true);
+      setError("");
+      try {
+        if (!ipFilter) {
+          await clashJson("connections", clashRef.current, { method: "DELETE" }, 10000);
+        } else {
+          await Promise.all(
+            target.map((c) =>
+              clashJson(`connections/${encodeURIComponent(c.id)}`, clashRef.current, {
+                method: "DELETE",
+              }, 10000),
+            ),
+          );
+        }
+        const now = Date.now();
+        setClosedList((prev) => [
+          ...target.map((c) => ({ ...c, closedAt: now })),
+          ...prev,
+        ].slice(0, 200));
+        await loadConnections();
+      } catch (err) {
+        setError(err instanceof ApiError ? err.message : t("conn.closeError"));
+      } finally {
+        setBusy(false);
+      }
     });
   };
 
@@ -302,7 +316,11 @@ export function ConnectionsPage() {
 
   return (
     <div className="page-enter space-y-4">
-      <MockBanner />
+      {error && (
+        <div className="rounded-xl border border-zk-coral/25 bg-zk-coral/10 px-3 py-2 text-xs text-zk-coral">
+          {error}
+        </div>
+      )}
 
       <div>
         <h1 className="text-xl font-bold tracking-tight sm:text-2xl">{t("conn.title")}</h1>
@@ -333,10 +351,10 @@ export function ConnectionsPage() {
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
         <StatTile
           label={t("conn.total")}
-          value={String(stats.count)}
+          value={loading ? "…" : String(stats.count)}
           hint={tab === "active" ? t("conn.ofTotal", { total: activeList.length }) : undefined}
         />
-        <StatTile label={t("conn.uniqueIps")} value={String(stats.uniqueIps)} />
+        <StatTile label={t("conn.uniqueIps")} value={loading ? "…" : String(stats.uniqueIps)} />
         <StatTile label={t("conn.upload")} value={formatBytes(stats.upload)} />
         <StatTile label={t("conn.download")} value={formatBytes(stats.download)} />
       </div>
@@ -370,10 +388,12 @@ export function ConnectionsPage() {
 
           {tab === "active" && activeFilteredCount > 0 && (
             <div className="flex flex-wrap gap-2 border-t border-zk-border-soft pt-3">
-              <Button size="sm" variant="danger" onClick={handleCloseAll}>
-                {ipFilter
-                  ? t("conn.closeForIp", { ip: ipFilter, count: activeFilteredCount })
-                  : t("conn.closeAll", { count: activeList.length })}
+              <Button size="sm" variant="danger" disabled={busy} onClick={handleCloseAll}>
+                {busy
+                  ? t("app.loading")
+                  : ipFilter
+                    ? t("conn.closeForIp", { ip: ipFilter, count: activeFilteredCount })
+                    : t("conn.closeAll", { count: activeList.length })}
               </Button>
               {mode === "safe" && (
                 <span className="self-center text-[10px] text-zk-safe">{t("conn.safeCloseHint")}</span>
@@ -412,7 +432,13 @@ export function ConnectionsPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-zk-border-soft">
-              {filtered.length === 0 ? (
+              {loading && filtered.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="px-4 py-8 text-center text-zk-muted sm:px-5">
+                    {t("app.loading")}
+                  </td>
+                </tr>
+              ) : filtered.length === 0 ? (
                 <tr>
                   <td colSpan={7} className="px-4 py-8 text-center text-zk-muted sm:px-5">
                     {t("conn.noResults")}
@@ -444,7 +470,7 @@ export function ConnectionsPage() {
                     </td>
                     <td className="px-3 py-2 text-right font-mono text-xs text-zk-muted sm:px-5">{formatBytes(c.download)}</td>
                     <td className="px-3 py-2 text-right font-mono text-xs text-zk-dim sm:px-5">
-                      {c.closedAt ? formatClosedAgo(c.closedAt) : formatDuration(c.durationSec)}
+                      {c.closedAt ? formatClosedAgo(c.closedAt) : formatDurationSec(c.durationSec)}
                     </td>
                   </tr>
                 ))

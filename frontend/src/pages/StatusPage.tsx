@@ -1,65 +1,63 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Badge, Button, Card, CardHeader, StatTile } from "../components/ui";
 import { useApp } from "../lib/store";
 import { useT } from "../lib/i18n";
 import { useSession } from "../lib/session";
 import { ApiError, apiJson, clashJson } from "../lib/api";
-import { ensureMihomoRunning } from "../lib/config";
 import {
+  formatBytes,
   formatTrafficTotal,
   parseConnectionCount,
   parseMemoryBytes,
   type ClashConnectionsResponse,
-  type ClashMemoryResponse,
   type ClashVersionResponse,
-  formatBytes,
 } from "../lib/clash";
 
 export function StatusPage() {
   const { mode } = useApp();
   const t = useT();
-  const { control, versions, clash, setClash, refreshSession } = useSession();
+  const { control, versions, clash, refreshSession } = useSession();
   const [clashVersion, setClashVersion] = useState("");
-  const [memory, setMemory] = useState("");
-  const [connections, setConnections] = useState("");
-  const [traffic, setTraffic] = useState("");
+  const [memory, setMemory] = useState("—");
+  const [connections, setConnections] = useState("—");
+  const [traffic, setTraffic] = useState("—");
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const clashRef = useRef(clash);
+  clashRef.current = clash;
 
   const running = control?.running ?? false;
   const panelPort = typeof window !== "undefined" && window.location.port ? window.location.port : "7220";
 
   const loadClashStats = useCallback(async () => {
+    const conn = clashRef.current;
     try {
-      const conn = await ensureMihomoRunning(clash);
-      setClash(conn);
-
-      const [ver, mem, trafficData] = await Promise.all([
-        clashJson<ClashVersionResponse>("version", conn).catch(() => null),
-        clashJson<ClashMemoryResponse>("memory", conn).catch(() => null),
-        clashJson<ClashConnectionsResponse>("connections", conn).catch(() => null),
+      // Do NOT GET /memory — Mihomo streams it and hangs HTTP until timeout.
+      const [ver, trafficData] = await Promise.all([
+        clashJson<ClashVersionResponse>("version", conn, undefined, 8000).catch(() => null),
+        clashJson<ClashConnectionsResponse>("connections", conn, undefined, 8000).catch(() => null),
       ]);
 
       if (ver?.version) {
         setClashVersion(ver.version.replace(/^v/i, ""));
       }
 
-      const memBytes = parseMemoryBytes(mem) ?? trafficData?.memory;
+      const memBytes = parseMemoryBytes(trafficData);
       setMemory(memBytes !== undefined ? formatBytes(memBytes) : "—");
-      setConnections(String(parseConnectionCount(trafficData)));
+      setConnections(trafficData ? String(parseConnectionCount(trafficData)) : "—");
       setTraffic(formatTrafficTotal(trafficData));
     } catch {
       setMemory("—");
       setConnections("—");
       setTraffic("—");
     }
-  }, [clash, setClash]);
+  }, []);
 
   useEffect(() => {
     loadClashStats();
-    const id = setInterval(loadClashStats, 10000);
+    const id = setInterval(loadClashStats, 5000);
     return () => clearInterval(id);
-  }, [loadClashStats]);
+  }, [loadClashStats, clash.port, clash.secret, clash.unix]);
 
   async function runControl(action: string) {
     if (mode === "safe") {
@@ -111,13 +109,13 @@ export function StatusPage() {
           }
         />
         <div className="grid grid-cols-2 gap-2 p-4 sm:grid-cols-4 sm:p-5">
-          <StatTile label={t("status.traffic")} value={traffic} />
+          <StatTile label={t("status.traffic")} value={traffic || "—"} />
           <StatTile
             label={t("status.connections")}
-            value={connections}
+            value={connections || "—"}
             hint={t("status.active")}
           />
-          <StatTile label={t("status.memory")} value={memory} />
+          <StatTile label={t("status.memory")} value={memory || "—"} />
           <StatTile
             label={t("status.version")}
             value={clashVersion || versions?.mihomo?.version?.replace(/^v/i, "") || "—"}

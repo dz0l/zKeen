@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button, Card, CardHeader, Select } from "../components/ui";
 import { IconChevron } from "../components/icons";
 import { useT } from "../lib/i18n";
@@ -73,13 +73,18 @@ export function ProxiesPage() {
   const [busy, setBusy] = useState("");
   const [testing, setTesting] = useState(false);
 
+  const clashKey = `${clash.port}|${clash.secret}|${clash.unix}`;
+  const clashRef = useRef(clash);
+  clashRef.current = clash;
+
   const loadProxies = useCallback(async () => {
     setLoading(true);
     setError("");
     setOffline(false);
+    const conn = clashRef.current;
     try {
       const [data, config] = await Promise.all([
-        clashJson<ClashProxiesResponse>("proxies", clash),
+        clashJson<ClashProxiesResponse>("proxies", conn, undefined, 20000),
         fetchMihomoConfig().catch(() => null),
       ]);
       const icons = config ? parseGroupIcons(config.content) : {};
@@ -96,13 +101,13 @@ export function ProxiesPage() {
     } finally {
       setLoading(false);
     }
-  }, [clash, t]);
+  }, [t]);
 
   const startMihomo = useCallback(async () => {
     setStarting(true);
     setError("");
     try {
-      const conn = await ensureMihomoRunning(clash);
+      const conn = await ensureMihomoRunning(clashRef.current);
       setClash(conn);
       await loadProxies();
     } catch (err) {
@@ -110,11 +115,11 @@ export function ProxiesPage() {
     } finally {
       setStarting(false);
     }
-  }, [clash, setClash, loadProxies, t]);
+  }, [setClash, loadProxies, t]);
 
   useEffect(() => {
     loadProxies();
-  }, [loadProxies]);
+  }, [loadProxies, clashKey]);
 
   const filtered = useMemo(() => {
     if (!search.trim()) return groups;
@@ -127,6 +132,7 @@ export function ProxiesPage() {
       setBulkServer(server);
       setBusy("__all__");
       setError("");
+      const conn = clashRef.current;
       try {
         const targets = groups.filter((g) => g.nodes.some((n) => n.name === server));
         if (!targets.length) {
@@ -134,22 +140,35 @@ export function ProxiesPage() {
         }
 
         const next: Record<string, string> = { ...selected };
-        for (const g of targets) {
-          await clashJson(`proxies/${encodeURIComponent(g.name)}`, clash, {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name: server }),
-          });
-          next[g.name] = server;
+        // Parallel batches to avoid very long waits with many groups
+        const chunkSize = 8;
+        for (let i = 0; i < targets.length; i += chunkSize) {
+          const chunk = targets.slice(i, i + chunkSize);
+          await Promise.all(
+            chunk.map(async (g) => {
+              await clashJson(
+                `proxies/${encodeURIComponent(g.name)}`,
+                conn,
+                {
+                  method: "PUT",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ name: server }),
+                },
+                10000,
+              );
+              next[g.name] = server;
+            }),
+          );
         }
-        setSelected(next);
+        setSelected({ ...next });
       } catch (err) {
         setError(err instanceof ApiError ? err.message : t("proxies.switchError"));
+        await loadProxies();
       } finally {
         setBusy("");
       }
     },
-    [groups, clash, selected, t],
+    [groups, selected, t, loadProxies],
   );
 
   const selectProxy = useCallback(
@@ -157,11 +176,16 @@ export function ProxiesPage() {
       setBusy(groupName);
       setError("");
       try {
-        await clashJson(`proxies/${encodeURIComponent(groupName)}`, clash, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name: nodeName }),
-        });
+        await clashJson(
+          `proxies/${encodeURIComponent(groupName)}`,
+          clashRef.current,
+          {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: nodeName }),
+          },
+          10000,
+        );
         setSelected((s) => ({ ...s, [groupName]: nodeName }));
       } catch (err) {
         setError(err instanceof ApiError ? err.message : t("proxies.switchError"));
@@ -169,7 +193,7 @@ export function ProxiesPage() {
         setBusy("");
       }
     },
-    [clash, t],
+    [t],
   );
 
   const testDelay = useCallback(
@@ -180,7 +204,9 @@ export function ProxiesPage() {
       try {
         const res = await clashJson<ClashDelayResponse>(
           `proxies/${encodeURIComponent(name)}/delay?url=${url}&timeout=${timeout}`,
-          clash,
+          clashRef.current,
+          undefined,
+          timeout + 5000,
         );
         if (res.delay >= 0) {
           setDelays((d) => ({ ...d, [name]: res.delay }));
@@ -189,7 +215,7 @@ export function ProxiesPage() {
         setDelays((d) => ({ ...d, [name]: -1 }));
       }
     },
-    [clash, settings],
+    [settings],
   );
 
   const testAllVisible = useCallback(async () => {

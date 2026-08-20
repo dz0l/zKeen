@@ -162,7 +162,10 @@ export function isClashConnectionError(err: unknown): boolean {
     msg.includes("error sending request") ||
     msg.includes("connection refused") ||
     msg.includes("not reachable") ||
-    msg.includes("connect timeout")
+    msg.includes("connect timeout") ||
+    msg.includes("clash api timeout") ||
+    err.status === 408 ||
+    err.status === 502
   );
 }
 

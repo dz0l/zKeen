@@ -103,15 +103,30 @@ export async function clashJson<T>(
   path: string,
   conn: ClashConnection,
   init?: RequestInit,
+  timeoutMs = 15000,
 ): Promise<T> {
   const clean = path.replace(/^\//, "");
-  const res = await request(`/clash/${clean}`, {
-    ...init,
-    headers: {
-      ...clashHeaders(conn),
-      ...(init?.headers || {}),
-    },
-  });
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+
+  let res: Response;
+  try {
+    res = await request(`/clash/${clean}`, {
+      ...init,
+      signal: init?.signal ?? controller.signal,
+      headers: {
+        ...clashHeaders(conn),
+        ...(init?.headers || {}),
+      },
+    });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new ApiError(408, "Clash API timeout");
+    }
+    throw err;
+  } finally {
+    window.clearTimeout(timer);
+  }
 
   if (!res.ok) {
     let message = res.statusText;
@@ -127,5 +142,14 @@ export async function clashJson<T>(
   if (res.status === 204) {
     return {} as T;
   }
-  return res.json() as Promise<T>;
+
+  const text = await res.text();
+  if (!text.trim()) {
+    return {} as T;
+  }
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new ApiError(res.status, "Invalid JSON from Clash API");
+  }
 }

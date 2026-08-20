@@ -26,8 +26,30 @@ export interface ClashMemoryResponse {
   memory?: number;
 }
 
+export interface ClashConnectionMeta {
+  network?: string;
+  type?: string;
+  sourceIP?: string;
+  destinationIP?: string;
+  sourcePort?: string;
+  destinationPort?: string;
+  host?: string;
+  process?: string;
+}
+
+export interface ClashConnectionItem {
+  id: string;
+  metadata?: ClashConnectionMeta;
+  upload?: number;
+  download?: number;
+  start?: string;
+  chains?: string[];
+  rule?: string;
+  rulePayload?: string;
+}
+
 export interface ClashConnectionsResponse {
-  connections?: unknown[];
+  connections?: ClashConnectionItem[] | null;
   downloadTotal?: number;
   uploadTotal?: number;
   memory?: number;
@@ -44,7 +66,7 @@ const GROUP_TYPES = new Set([
   "compatible",
 ]);
 
-/** Built-in or meta groups — hidden from the UI list and bulk selector targets. */
+/** Built-in or meta groups — hidden from the UI list. */
 export const HIDDEN_PROXY_GROUPS = new Set([
   "GLOBAL",
   "COMPATIBLE",
@@ -65,6 +87,20 @@ export function isUserProxyGroup(item: ClashProxyItem): boolean {
   return isProxyGroup(item) && !isHiddenProxyGroup(item.name);
 }
 
+/** Built-in non-server nodes (except DIRECT, which we keep for selection). */
+export function isBuiltinSpecialNode(name: string): boolean {
+  const upper = name.toUpperCase();
+  if (upper === "DIRECT") return false;
+  return (
+    upper === "REJECT" ||
+    upper.startsWith("REJECT") ||
+    upper === "PASS" ||
+    upper.startsWith("PASS") ||
+    upper === "COMPATIBLE" ||
+    upper === "GLOBAL"
+  );
+}
+
 export function buildProxyNameSets(data: ClashProxiesResponse): {
   groupNames: Set<string>;
   leafNames: Set<string>;
@@ -83,25 +119,34 @@ export function buildProxyNameSets(data: ClashProxiesResponse): {
   return { groupNames, leafNames };
 }
 
+/** Servers for bulk select: DIRECT + subscription nodes from user groups (not PASS/REJECT*). */
 export function collectBulkServerOptions(data: ClashProxiesResponse): string[] {
-  const { leafNames } = buildProxyNameSets(data);
-  const servers = Array.from(leafNames).sort((a, b) => a.localeCompare(b));
-  if (!servers.includes("DIRECT")) {
-    servers.unshift("DIRECT");
-  } else {
-    servers.sort((a, b) => {
-      if (a === "DIRECT") return -1;
-      if (b === "DIRECT") return 1;
-      return a.localeCompare(b);
-    });
+  const { groupNames } = buildProxyNameSets(data);
+  const names = new Set<string>(["DIRECT"]);
+
+  for (const item of Object.values(data.proxies)) {
+    if (!isUserProxyGroup(item)) continue;
+    for (const name of item.all ?? []) {
+      if (groupNames.has(name)) continue;
+      if (isBuiltinSpecialNode(name)) continue;
+      names.add(name);
+    }
   }
-  return servers;
+
+  return Array.from(names).sort((a, b) => {
+    if (a === "DIRECT") return -1;
+    if (b === "DIRECT") return 1;
+    return a.localeCompare(b);
+  });
 }
 
 export function filterGroupMembers(all: string[] | undefined, groupNames: Set<string>): string[] {
-  return (all ?? []).filter(
-    (name) => name === "DIRECT" || name === "REJECT" || !groupNames.has(name),
-  );
+  return (all ?? []).filter((name) => {
+    if (name === "DIRECT") return true;
+    if (groupNames.has(name)) return false;
+    if (isBuiltinSpecialNode(name)) return false;
+    return true;
+  });
 }
 
 export function parseGroupIcons(yaml: string): Record<string, string> {
@@ -118,9 +163,9 @@ export function parseGroupIcons(yaml: string): Record<string, string> {
   return icons;
 }
 
-export function parseMemoryBytes(raw?: ClashMemoryResponse | null): number | undefined {
+export function parseMemoryBytes(raw?: ClashMemoryResponse | ClashConnectionsResponse | null): number | undefined {
   if (!raw) return undefined;
-  if (typeof raw.inuse === "number") return raw.inuse;
+  if ("inuse" in raw && typeof raw.inuse === "number") return raw.inuse;
   if (typeof raw.memory === "number") return raw.memory;
   return undefined;
 }
@@ -140,6 +185,19 @@ export function formatTrafficTotal(raw?: ClashConnectionsResponse | null): strin
 
 export function formatBytes(bytes?: number): string {
   if (bytes === undefined || Number.isNaN(bytes)) return "—";
+  if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export function formatDurationSec(sec: number): string {
+  if (sec < 60) return `${sec}s`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m ${sec % 60}s`;
+  return `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`;
+}
+
+export function connectionStartedAt(start?: string): number {
+  if (!start) return Date.now();
+  const ts = Date.parse(start);
+  return Number.isNaN(ts) ? Date.now() : ts;
 }
