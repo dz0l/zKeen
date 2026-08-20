@@ -14,14 +14,18 @@ import {
   saveMihomoConfig,
   setTopLevelScalar,
   applyMihomoConfigChanges,
+  updateGeoDatabases,
 } from "../lib/config";
 import {
   buildProxyNameSets,
   collectBulkServerOptions,
+  collectProviderServers,
   filterGroupMembers,
+  isBuiltinSpecialNode,
   isUserProxyGroup,
   parseGroupIcons,
   type ClashDelayResponse,
+  type ClashProvidersResponse,
   type ClashProxiesResponse,
 } from "../lib/clash";
 
@@ -85,10 +89,12 @@ export function ProxiesPage() {
   const [busy, setBusy] = useState("");
   const [testing, setTesting] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [geoUpdating, setGeoUpdating] = useState(false);
   const [coreMode, setCoreMode] = useState("rule");
   const [modeSaving, setModeSaving] = useState(false);
   const [pageTab, setPageTab] = useState<PageTab>("groups");
   const [serverNames, setServerNames] = useState<string[]>([]);
+  const [providerEmpty, setProviderEmpty] = useState(false);
 
   const clashKey = `${clash.port}|${clash.secret}|${clash.unix}`;
   const clashRef = useRef(clash);
@@ -100,8 +106,11 @@ export function ProxiesPage() {
     setOffline(false);
     const conn = clashRef.current;
     try {
-      const [data, config] = await Promise.all([
+      const [data, providers, config] = await Promise.all([
         clashJson<ClashProxiesResponse>("proxies", conn, undefined, 20000),
+        clashJson<ClashProvidersResponse>("providers/proxies", conn, undefined, 20000).catch(
+          () => null,
+        ),
         fetchMihomoConfig().catch(() => null),
       ]);
       const icons = config ? parseGroupIcons(config.content) : {};
@@ -109,12 +118,19 @@ export function ProxiesPage() {
         setCoreMode(getTopLevelScalar(config.content, "mode") || "rule");
       }
       setBulkServers(collectBulkServerOptions(data));
-      const { leafNames } = buildProxyNameSets(data);
-      setServerNames(
-        [...leafNames]
-          .filter((n) => n !== "DIRECT" && n !== "REJECT" && !n.toUpperCase().startsWith("REJECT"))
-          .sort((a, b) => a.localeCompare(b)),
-      );
+      const fromProvider = collectProviderServers(providers ?? undefined, DEFAULT_PROVIDER);
+      if (fromProvider.length > 0) {
+        setServerNames(fromProvider);
+        setProviderEmpty(false);
+      } else {
+        // Fallback: nodes referenced by groups via `use: [subscription]` (exclude builtins)
+        const { leafNames } = buildProxyNameSets(data);
+        const fallback = [...leafNames]
+          .filter((n) => !isBuiltinSpecialNode(n) && n !== "DIRECT")
+          .sort((a, b) => a.localeCompare(b));
+        setServerNames(fallback);
+        setProviderEmpty(true);
+      }
       setGroups(mapGroups(data, icons));
       setSelected(selectedMap(data));
     } catch (err) {
@@ -224,7 +240,7 @@ export function ProxiesPage() {
 
   const testDelay = useCallback(
     async (name: string) => {
-      if (name === "DIRECT" || name === "REJECT") return;
+      if (isBuiltinSpecialNode(name) || name === "DIRECT") return;
       const url = encodeURIComponent(settings?.clash_api.ping_url || "https://www.gstatic.com/generate_204");
       const timeout = settings?.clash_api.ping_timeout || 5000;
       try {
@@ -248,17 +264,7 @@ export function ProxiesPage() {
     setTesting(true);
     setError("");
     try {
-      const names = serverNames.length
-        ? serverNames
-        : (() => {
-            const set = new Set<string>();
-            for (const g of groups) {
-              for (const n of g.nodes) {
-                if (n.name !== "DIRECT" && n.name !== "REJECT") set.add(n.name);
-              }
-            }
-            return [...set];
-          })();
+      const names = serverNames.filter((n) => !isBuiltinSpecialNode(n) && n !== "DIRECT");
       const chunkSize = 10;
       for (let i = 0; i < names.length; i += chunkSize) {
         await Promise.all(names.slice(i, i + chunkSize).map((n) => testDelay(n)));
@@ -266,7 +272,7 @@ export function ProxiesPage() {
     } finally {
       setTesting(false);
     }
-  }, [serverNames, groups, testDelay]);
+  }, [serverNames, testDelay]);
 
   const refreshProvider = useCallback(async () => {
     setRefreshing(true);
@@ -280,6 +286,18 @@ export function ProxiesPage() {
       setRefreshing(false);
     }
   }, [loadProxies, t]);
+
+  const refreshGeo = useCallback(async () => {
+    setGeoUpdating(true);
+    setError("");
+    try {
+      await updateGeoDatabases(clashRef.current);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : t("proxies.geoError"));
+    } finally {
+      setGeoUpdating(false);
+    }
+  }, [t]);
 
   const applyCoreMode = useCallback(
     async (value: string) => {
@@ -363,7 +381,7 @@ export function ProxiesPage() {
             <Button
               size="md"
               variant="primary"
-              disabled={refreshing || testing || !!busy}
+              disabled={refreshing || testing || geoUpdating || !!busy}
               onClick={() => void refreshProvider()}
             >
               {refreshing ? t("app.loading") : t("proxies.refreshProvider")}
@@ -371,14 +389,27 @@ export function ProxiesPage() {
             <Button
               size="md"
               variant="secondary"
-              disabled={testing || refreshing || !!busy || serverNames.length === 0}
+              disabled={testing || refreshing || geoUpdating || !!busy || serverNames.length === 0}
               onClick={() => void testAllServers()}
             >
               {testing
                 ? t("app.loading")
                 : t("proxies.testAllServers", { count: serverNames.length })}
             </Button>
+            <Button
+              size="md"
+              variant="secondary"
+              disabled={geoUpdating || refreshing || testing || !!busy}
+              onClick={() => void refreshGeo()}
+            >
+              {geoUpdating ? t("app.loading") : t("proxies.updateGeo")}
+            </Button>
           </div>
+          {providerEmpty && serverNames.length === 0 && (
+            <p className="border-t border-zk-border-soft px-4 py-3 text-xs text-zk-muted sm:px-5">
+              {t("proxies.providerEmpty")}
+            </p>
+          )}
           {serverNames.length > 0 && (
             <div className="max-h-64 overflow-y-auto border-t border-zk-border-soft px-4 py-3 sm:px-5">
               <div className="grid gap-1 sm:grid-cols-2 lg:grid-cols-3">

@@ -287,14 +287,6 @@ proxy-groups:
       - DIRECT
     icon: "https://www.svgrepo.com/show/293111/maps-and-flags-global.svg"
 
-  - name: 'other'
-    type: select
-    use:
-      - subscription
-    proxies:
-      - DIRECT
-    icon: "https://www.svgrepo.com/show/462111/netflix.svg"
-
   - name: 'RU traffic'
     type: select
     use:
@@ -311,10 +303,9 @@ proxy-groups:
       - DIRECT
     icon: "https://www.svgrepo.com/show/293111/maps-and-flags-global.svg"
 
-  - name: 'Блокировка рекламы'
+  - name: 'Adblock'
     type: select
-    use:
-      - subscription
+    # Default REJECT drops matched ads; DIRECT allows temporary bypass.
     proxies:
       - REJECT
       - DIRECT
@@ -382,12 +373,11 @@ proxy-groups:
       - 'Twitch'
       - 'Whatsapp'
       - 'Netflix'
-      - 'other'
       - 'Spotify'
       - 'OpenAI'
       - 'Tidal'
       - 'RU traffic'
-      - 'Блокировка рекламы'
+      - 'Adblock'
       - 'Other traffic'
       - DIRECT
 
@@ -415,8 +405,9 @@ rule-providers:
       - AND,((IP-CIDR,66.22.192.0/18,no-resolve),(NETWORK,UDP),(DST-PORT,50000-50100))
 
 rules:
-  - GEOSITE,category-ads-all,Блокировка рекламы
-  - RULE-SET,hagezi_pro,Блокировка рекламы
+  # Ads → Adblock (default outbound REJECT)
+  - GEOSITE,category-ads-all,Adblock
+  - RULE-SET,hagezi_pro,Adblock
   - GEOIP,private,DIRECT,no-resolve
   - GEOSITE,category-ru,RU traffic
   - DOMAIN-SUFFIX,ru,RU traffic
@@ -461,8 +452,8 @@ rules:
   - IP-ASN,32934,Whatsapp
   - IP-ASN,11917,Whatsapp
   - IP-ASN,9002,Whatsapp
-  - GEOSITE,supercell,other
-  - DOMAIN-KEYWORD,supercell,other
+  - GEOSITE,supercell,Other traffic
+  - DOMAIN-KEYWORD,supercell,Other traffic
   - DOMAIN-SUFFIX,2ip.io,2IP.IO
   - GEOSITE,category-porn,18+
   - MATCH,Other traffic

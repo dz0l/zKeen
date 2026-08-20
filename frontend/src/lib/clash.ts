@@ -11,6 +11,17 @@ export interface ClashProxiesResponse {
   proxies: Record<string, ClashProxyItem>;
 }
 
+export interface ClashProxyProvider {
+  name?: string;
+  type?: string;
+  vehicleType?: string;
+  proxies?: ClashProxyItem[];
+}
+
+export interface ClashProvidersResponse {
+  providers: Record<string, ClashProxyProvider>;
+}
+
 export interface ClashDelayResponse {
   delay: number;
 }
@@ -73,6 +84,7 @@ export const HIDDEN_PROXY_GROUPS = new Set([
   "REJECT",
   "DIRECT",
   "PASS",
+  "PASS-RULE",
 ]);
 
 export function isProxyGroup(item: ClashProxyItem): boolean {
@@ -80,7 +92,9 @@ export function isProxyGroup(item: ClashProxyItem): boolean {
 }
 
 export function isHiddenProxyGroup(name: string): boolean {
-  return HIDDEN_PROXY_GROUPS.has(name);
+  if (HIDDEN_PROXY_GROUPS.has(name)) return true;
+  const upper = name.toUpperCase();
+  return upper === "PASS" || upper.startsWith("PASS-") || upper.startsWith("REJECT");
 }
 
 export function isUserProxyGroup(item: ClashProxyItem): boolean {
@@ -111,12 +125,29 @@ export function buildProxyNameSets(data: ClashProxiesResponse): {
   for (const item of Object.values(data.proxies)) {
     if (isProxyGroup(item)) {
       groupNames.add(item.name);
-    } else if (!isHiddenProxyGroup(item.name)) {
+    } else if (!isHiddenProxyGroup(item.name) && !isBuiltinSpecialNode(item.name)) {
       leafNames.add(item.name);
     }
   }
 
   return { groupNames, leafNames };
+}
+
+/** Server names from a proxy-provider (subscription URL), not Clash builtins. */
+export function collectProviderServers(
+  data: ClashProvidersResponse | null | undefined,
+  providerName: string,
+): string[] {
+  const provider = data?.providers?.[providerName];
+  const names = new Set<string>();
+  for (const item of provider?.proxies ?? []) {
+    const name = item.name;
+    if (!name) continue;
+    if (isBuiltinSpecialNode(name) || isHiddenProxyGroup(name) || name === "DIRECT") continue;
+    if (isProxyGroup(item)) continue;
+    names.add(name);
+  }
+  return Array.from(names).sort((a, b) => a.localeCompare(b));
 }
 
 /** Servers for bulk select: DIRECT + subscription nodes from user groups (not PASS/REJECT*). */

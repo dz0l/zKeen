@@ -116,6 +116,9 @@ const translations: Translations = {
     "proxies.refreshProvider": "Обновить",
     "proxies.refreshError": "Не удалось обновить провайдер",
     "proxies.testAllServers": "Тест ({count})",
+    "proxies.updateGeo": "Обновить GEO",
+    "proxies.geoError": "Не удалось обновить GEO",
+    "proxies.providerEmpty": "Нет серверов. Укажите URL подписки в Config и нажмите «Обновить».",
 
     // Config
     "config.title": "Config",
@@ -417,6 +420,9 @@ const translations: Translations = {
     "proxies.refreshProvider": "Refresh",
     "proxies.refreshError": "Failed to refresh provider",
     "proxies.testAllServers": "Test ({count})",
+    "proxies.updateGeo": "Update GEO",
+    "proxies.geoError": "Failed to update GEO",
+    "proxies.providerEmpty": "No servers. Set subscription URL in Config and press Refresh.",
 
     // Config
     "config.title": "Config",

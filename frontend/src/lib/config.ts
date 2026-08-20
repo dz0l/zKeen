@@ -220,6 +220,11 @@ export async function refreshProxyProvider(
   });
 }
 
+/** Trigger Mihomo GEO database download (`POST /configs/geo`). */
+export async function updateGeoDatabases(clash: ClashConnection): Promise<void> {
+  await clashJson("configs/geo", clash, { method: "POST" }, 120000);
+}
+
 const providerBlockRe = (provider: string) =>
   new RegExp(
     `\\n  ${provider}:[\\s\\S]*?(?=\\n  [a-zA-Z][\\w-]*:|\\nproxies:|\\nproxy-groups:|\\nrules:|\\ndns:|\\ngeox-url:)`,
