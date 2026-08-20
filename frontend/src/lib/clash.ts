@@ -150,6 +150,24 @@ export function collectProviderServers(
   return Array.from(names).sort((a, b) => a.localeCompare(b));
 }
 
+/** Last health-check delays from provider proxy history (0 / missing → -1). */
+export function delaysFromProvider(
+  data: ClashProvidersResponse | null | undefined,
+  providerName: string,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const item of data?.providers?.[providerName]?.proxies ?? []) {
+    if (!item.name || isBuiltinSpecialNode(item.name)) continue;
+    const last = item.history?.[item.history.length - 1];
+    if (!last || typeof last.delay !== "number" || last.delay <= 0) {
+      out[item.name] = -1;
+    } else {
+      out[item.name] = last.delay;
+    }
+  }
+  return out;
+}
+
 /** Servers for bulk select: DIRECT + subscription nodes from user groups (not PASS/REJECT*). */
 export function collectBulkServerOptions(data: ClashProxiesResponse): string[] {
   const { groupNames } = buildProxyNameSets(data);

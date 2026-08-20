@@ -220,9 +220,27 @@ export async function refreshProxyProvider(
   });
 }
 
-/** Trigger Mihomo GEO database download (`POST /configs/geo`). */
+/** Run health-check for all nodes in a proxy-provider (updates delay history). */
+export async function healthCheckProxyProvider(
+  providerName: string,
+  clash: ClashConnection,
+  timeoutMs = 300000,
+): Promise<void> {
+  await clashJson(
+    `providers/proxies/${encodeURIComponent(providerName)}/healthcheck`,
+    clash,
+    undefined,
+    timeoutMs,
+  );
+}
+
+/** Trigger Mihomo GEO database download (`POST /configs/geo`, fallback `/upgrade/geo`). */
 export async function updateGeoDatabases(clash: ClashConnection): Promise<void> {
-  await clashJson("configs/geo", clash, { method: "POST" }, 120000);
+  try {
+    await clashJson("configs/geo", clash, { method: "POST" }, 180000);
+  } catch {
+    await clashJson("upgrade/geo", clash, { method: "POST" }, 180000);
+  }
 }
 
 const providerBlockRe = (provider: string) =>

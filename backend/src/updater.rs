@@ -51,22 +51,44 @@ pub async fn fetch_latest_version(
     client: &reqwest::Client, core: &str, proxies: &[String], current_ver: Option<&str>,
 ) -> Option<(String, String)> {
     let repo = get_repo(core)?;
-    let url = format!("{}/{}/releases?per_page=10", GITHUB_API, repo);
-    let list = std::iter::once(url.clone()).chain(
-        proxies
-            .iter()
-            .map(|p| p.trim())
-            .filter(|p| !p.is_empty())
-            .map(|p| format!("{}/{}", p.trim_end_matches('/'), url)),
-    );
-
     let is_alpha = current_ver.map_or(false, |v| v.contains("alpha"));
 
-    for u in list {
+    // Prefer API /releases/latest, then list, then HTML redirect (better behind GitHub blocks).
+    if let Some(v) = fetch_latest_from_api(client, repo, proxies, is_alpha && core == "mihomo").await {
+        return Some(v);
+    }
+    fetch_latest_from_redirect(client, repo, proxies).await
+}
+
+fn github_url_candidates(url: &str, proxies: &[String]) -> Vec<String> {
+    std::iter::once(url.to_string())
+        .chain(
+            proxies
+                .iter()
+                .map(|p| p.trim())
+                .filter(|p| !p.is_empty())
+                .map(|p| format!("{}/{}", p.trim_end_matches('/'), url)),
+        )
+        .collect()
+}
+
+async fn fetch_latest_from_api(
+    client: &reqwest::Client, repo: &str, proxies: &[String], mihomo_alpha: bool,
+) -> Option<(String, String)> {
+    let latest_url = format!("{}/{}/releases/latest", GITHUB_API, repo);
+    for u in github_url_candidates(&latest_url, proxies) {
+        if let Some(v) = parse_single_release_json(client, &u).await {
+            return Some(v);
+        }
+    }
+
+    let list_url = format!("{}/{}/releases?per_page=10", GITHUB_API, repo);
+    for u in github_url_candidates(&list_url, proxies) {
         let res = match client
             .get(&u)
             .header("Accept", "application/vnd.github+json")
-            .timeout(Duration::from_secs(15))
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .timeout(Duration::from_secs(25))
             .send()
             .await
         {
@@ -85,7 +107,7 @@ pub async fn fetch_latest_version(
             Err(_) => continue,
         };
 
-        if is_alpha && core == "mihomo" {
+        if mihomo_alpha {
             if let Some(r) = rels.iter().find(|r| r.tag_name == "Prerelease-Alpha") {
                 for asset in &r.assets {
                     if let Some(idx) = asset.name.find("alpha-") {
@@ -96,9 +118,89 @@ pub async fn fetch_latest_version(
             }
         }
 
-        if let Some(r) = rels.into_iter().find(|r| !r.prerelease) {
+        if let Some(r) = rels.into_iter().find(|r| !r.prerelease && !r.tag_name.is_empty()) {
             let tag = r.tag_name.clone();
             return Some((tag.trim_start_matches('v').to_string(), tag));
+        }
+    }
+    None
+}
+
+async fn parse_single_release_json(client: &reqwest::Client, url: &str) -> Option<(String, String)> {
+    let res = client
+        .get(url)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .timeout(Duration::from_secs(25))
+        .send()
+        .await
+        .ok()?;
+    if !res.status().is_success() {
+        return None;
+    }
+    if res
+        .headers()
+        .get("content-type")
+        .map_or(false, |v| v.to_str().unwrap_or("").contains("text/html"))
+    {
+        return None;
+    }
+    let r = res.json::<GhRelease>().await.ok()?;
+    if r.prerelease || r.tag_name.is_empty() {
+        return None;
+    }
+    let tag = r.tag_name;
+    Some((tag.trim_start_matches('v').to_string(), tag))
+}
+
+/// Follow `/releases/latest` redirect — works when API is blocked but github.com/proxy is reachable.
+async fn fetch_latest_from_redirect(
+    client: &reqwest::Client, repo: &str, proxies: &[String],
+) -> Option<(String, String)> {
+    let page = format!("{GITHUB_RELEASE}/{repo}/releases/latest");
+    for u in github_url_candidates(&page, proxies) {
+        let res = match client.get(&u).timeout(Duration::from_secs(25)).send().await {
+            Ok(r) if r.status().is_success() || r.status().is_redirection() => r,
+            _ => continue,
+        };
+        let final_url = res.url().clone();
+        if let Some(tag) = tag_from_release_url(final_url.as_str()) {
+            return Some((tag.trim_start_matches('v').to_string(), tag));
+        }
+        if let Ok(body) = res.text().await {
+            if let Some(tag) = tag_from_release_html(&body) {
+                return Some((tag.trim_start_matches('v').to_string(), tag));
+            }
+        }
+    }
+    None
+}
+
+fn tag_from_release_url(url: &str) -> Option<String> {
+    let marker = "/releases/tag/";
+    let idx = url.find(marker)?;
+    let tag = url[idx + marker.len()..]
+        .split(|c| c == '/' || c == '?' || c == '#')
+        .next()?
+        .trim();
+    if tag.is_empty() {
+        None
+    } else if tag.starts_with('v') {
+        Some(tag.to_string())
+    } else {
+        Some(format!("v{tag}"))
+    }
+}
+
+fn tag_from_release_html(body: &str) -> Option<String> {
+    for part in body.split("/releases/tag/") {
+        let tag = part
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-' && c != '_')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if tag.starts_with('v') && tag.contains('.') {
+            return Some(tag.to_string());
         }
     }
     None

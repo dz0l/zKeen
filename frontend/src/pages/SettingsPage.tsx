@@ -38,10 +38,15 @@ export function SettingsPage() {
     setChecking(true);
     setCheckError("");
     try {
-      const res = await apiJson<VersionInfo & { success?: boolean }>("/api/version/check", {
+      const res = await apiJson<
+        VersionInfo & { success?: boolean; check_ok?: boolean; check_error?: string }
+      >("/api/version/check", {
         method: "POST",
       });
       setVersions(res);
+      if (res.check_ok === false) {
+        setCheckError(res.check_error || t("settings.checkError"));
+      }
     } catch (err) {
       setCheckError(err instanceof ApiError ? err.message : t("settings.checkError"));
     } finally {

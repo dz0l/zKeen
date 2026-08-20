@@ -118,6 +118,14 @@ const translations: Translations = {
     "proxies.testAllServers": "Тест ({count})",
     "proxies.updateGeo": "Обновить GEO",
     "proxies.geoError": "Не удалось обновить GEO",
+    "proxies.geoTitle": "GEO-базы",
+    "proxies.geoSub": "GeoIP / GeoSite · автообновление каждые 168 ч",
+    "proxies.geoUpdating": "Обновление…",
+    "proxies.geoSuccess": "Успех",
+    "proxies.geoFail": "Ошибка",
+    "proxies.geoLast": "Последнее обновление {date}",
+    "proxies.geoNever": "Ещё не обновляли вручную",
+    "proxies.testError": "Не удалось протестировать серверы",
     "proxies.providerEmpty": "Нет серверов. Укажите URL подписки в Config и нажмите «Обновить».",
 
     // Config
@@ -422,6 +430,14 @@ const translations: Translations = {
     "proxies.testAllServers": "Test ({count})",
     "proxies.updateGeo": "Update GEO",
     "proxies.geoError": "Failed to update GEO",
+    "proxies.geoTitle": "GEO databases",
+    "proxies.geoSub": "GeoIP / GeoSite · auto-update every 168h",
+    "proxies.geoUpdating": "Updating…",
+    "proxies.geoSuccess": "Success",
+    "proxies.geoFail": "Error",
+    "proxies.geoLast": "Last update {date}",
+    "proxies.geoNever": "Not updated manually yet",
+    "proxies.testError": "Failed to test servers",
     "proxies.providerEmpty": "No servers. Set subscription URL in Config and press Refresh.",
 
     // Config

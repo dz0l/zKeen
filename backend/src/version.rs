@@ -35,6 +35,10 @@ pub async fn get_local_core_version(core: &str) -> Option<String> {
 }
 
 pub async fn version_handler(State(state): State<AppState>) -> impl IntoResponse {
+    Json(build_version_payload(&state).await)
+}
+
+async fn build_version_payload(state: &AppState) -> serde_json::Value {
     let check = |outdated, last: &std::sync::RwLock<Option<Instant>>| {
         outdated && {
             let mut l = last.write().unwrap();
@@ -117,8 +121,7 @@ pub async fn version_handler(State(state): State<AppState>) -> impl IntoResponse
     }
 
     res.insert("success".into(), json!(true));
-
-    Json(res)
+    serde_json::Value::Object(res)
 }
 
 pub fn start_update_checker(state: AppState) {
@@ -188,6 +191,8 @@ fn compare_versions(latest: &str, current: &str) -> bool {
 /// Force-refresh GitHub latest tags for UI and current core, then return `/api/version` payload.
 pub async fn check_updates_handler(State(state): State<AppState>) -> impl IntoResponse {
     let proxies = state.settings.read().unwrap().updater.github_proxy.clone();
+    let mut ui_ok = false;
+    let mut core_ok = false;
 
     {
         let cur = VERSION.trim_start_matches('v');
@@ -197,6 +202,7 @@ pub async fn check_updates_handler(State(state): State<AppState>) -> impl IntoRe
             *state.update_checker.ui_outdated.write().unwrap() = compare_versions(&latest, cur);
             *state.update_checker.ui_latest_tag.write().unwrap() = Some(tag);
             *state.update_checker.last_ui_check.write().unwrap() = Some(Instant::now());
+            ui_ok = true;
         }
     }
 
@@ -214,8 +220,21 @@ pub async fn check_updates_handler(State(state): State<AppState>) -> impl IntoRe
             }
             *state.update_checker.core_latest_tag.write().unwrap() = Some(tag);
             *state.update_checker.last_core_check.write().unwrap() = Some(Instant::now());
+            core_ok = true;
         }
     }
 
-    version_handler(State(state)).await
+    let mut res = build_version_payload(&state).await;
+    if let Some(obj) = res.as_object_mut() {
+        obj.insert("check_ok".into(), json!(ui_ok));
+        obj.insert("core_check_ok".into(), json!(core_ok));
+        if !ui_ok {
+            obj.insert(
+                "check_error".into(),
+                json!("Не удалось получить релизы с GitHub. Проверьте сеть или github_proxy в настройках."),
+            );
+        }
+        obj.insert("success".into(), json!(true));
+    }
+    Json(res)
 }

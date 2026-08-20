@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button, Card, CardHeader, Select } from "../components/ui";
 import { IconChevron } from "../components/icons";
-import { useT } from "../lib/i18n";
+import { useT, useI18n } from "../lib/i18n";
 import { useSession } from "../lib/session";
 import { ApiError, clashJson } from "../lib/api";
 import {
@@ -9,6 +9,7 @@ import {
   ensureMihomoRunning,
   fetchMihomoConfig,
   getTopLevelScalar,
+  healthCheckProxyProvider,
   isClashConnectionError,
   refreshProxyProvider,
   saveMihomoConfig,
@@ -20,6 +21,7 @@ import {
   buildProxyNameSets,
   collectBulkServerOptions,
   collectProviderServers,
+  delaysFromProvider,
   filterGroupMembers,
   isBuiltinSpecialNode,
   isUserProxyGroup,
@@ -30,6 +32,14 @@ import {
 } from "../lib/clash";
 
 type PageTab = "groups" | "provider";
+
+const GEO_LAST_KEY = "zkeen-geo-last-ok";
+
+function formatGeoDate(iso: string, locale: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString(locale === "en" ? "en-GB" : "ru-RU");
+}
 
 interface ProxyNode {
   name: string;
@@ -74,6 +84,7 @@ function selectedMap(data: ClashProxiesResponse): Record<string, string> {
 
 export function ProxiesPage() {
   const t = useT();
+  const { locale } = useI18n();
   const { clash, setClash, settings } = useSession();
   const [groups, setGroups] = useState<ProxyGroup[]>([]);
   const [bulkServers, setBulkServers] = useState<string[]>(["DIRECT"]);
@@ -90,6 +101,14 @@ export function ProxiesPage() {
   const [testing, setTesting] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [geoUpdating, setGeoUpdating] = useState(false);
+  const [geoStatus, setGeoStatus] = useState<"idle" | "ok" | "err">("idle");
+  const [geoLastOk, setGeoLastOk] = useState(() => {
+    try {
+      return localStorage.getItem(GEO_LAST_KEY) || "";
+    } catch {
+      return "";
+    }
+  });
   const [coreMode, setCoreMode] = useState("rule");
   const [modeSaving, setModeSaving] = useState(false);
   const [pageTab, setPageTab] = useState<PageTab>("groups");
@@ -241,18 +260,27 @@ export function ProxiesPage() {
   const testDelay = useCallback(
     async (name: string) => {
       if (isBuiltinSpecialNode(name) || name === "DIRECT") return;
-      const url = encodeURIComponent(settings?.clash_api.ping_url || "https://www.gstatic.com/generate_204");
-      const timeout = settings?.clash_api.ping_timeout || 5000;
+      const url = encodeURIComponent(settings?.clash_api.ping_url || "http://www.gstatic.com/generate_204");
+      const timeout = Math.max(settings?.clash_api.ping_timeout || 5000, 8000);
       try {
-        const res = await clashJson<ClashDelayResponse>(
-          `proxies/${encodeURIComponent(name)}/delay?url=${url}&timeout=${timeout}`,
-          clashRef.current,
-          undefined,
-          timeout + 5000,
-        );
-        if (res.delay >= 0) {
-          setDelays((d) => ({ ...d, [name]: res.delay }));
+        // Prefer provider-scoped delay API (more reliable for subscription nodes).
+        let res: ClashDelayResponse;
+        try {
+          res = await clashJson<ClashDelayResponse>(
+            `providers/proxies/${encodeURIComponent(DEFAULT_PROVIDER)}/${encodeURIComponent(name)}/delay?url=${url}&timeout=${timeout}`,
+            clashRef.current,
+            undefined,
+            timeout + 10000,
+          );
+        } catch {
+          res = await clashJson<ClashDelayResponse>(
+            `proxies/${encodeURIComponent(name)}/delay?url=${url}&timeout=${timeout}`,
+            clashRef.current,
+            undefined,
+            timeout + 10000,
+          );
         }
+        setDelays((d) => ({ ...d, [name]: res.delay > 0 ? res.delay : -1 }));
       } catch {
         setDelays((d) => ({ ...d, [name]: -1 }));
       }
@@ -263,16 +291,44 @@ export function ProxiesPage() {
   const testAllServers = useCallback(async () => {
     setTesting(true);
     setError("");
+    const names = serverNames.filter((n) => !isBuiltinSpecialNode(n) && n !== "DIRECT");
+    // Mark pending
+    setDelays((prev) => {
+      const next = { ...prev };
+      for (const n of names) next[n] = prev[n] ?? 0;
+      return next;
+    });
     try {
-      const names = serverNames.filter((n) => !isBuiltinSpecialNode(n) && n !== "DIRECT");
-      const chunkSize = 10;
+      // Bulk health-check updates provider history in one Mihomo call.
+      try {
+        await healthCheckProxyProvider(DEFAULT_PROVIDER, clashRef.current, 300000);
+        const providers = await clashJson<ClashProvidersResponse>(
+          "providers/proxies",
+          clashRef.current,
+          undefined,
+          20000,
+        );
+        const fromHist = delaysFromProvider(providers, DEFAULT_PROVIDER);
+        if (Object.keys(fromHist).length > 0) {
+          setDelays((d) => ({ ...d, ...fromHist }));
+          const anyOk = Object.values(fromHist).some((v) => v > 0);
+          if (anyOk) return;
+        }
+      } catch {
+        /* fall through to per-node delay */
+      }
+
+      // Sequential / small batches — routers choke on many parallel delay tests.
+      const chunkSize = 2;
       for (let i = 0; i < names.length; i += chunkSize) {
         await Promise.all(names.slice(i, i + chunkSize).map((n) => testDelay(n)));
       }
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : t("proxies.testError"));
     } finally {
       setTesting(false);
     }
-  }, [serverNames, testDelay]);
+  }, [serverNames, testDelay, t]);
 
   const refreshProvider = useCallback(async () => {
     setRefreshing(true);
@@ -289,10 +345,20 @@ export function ProxiesPage() {
 
   const refreshGeo = useCallback(async () => {
     setGeoUpdating(true);
+    setGeoStatus("idle");
     setError("");
     try {
       await updateGeoDatabases(clashRef.current);
+      const iso = new Date().toISOString();
+      try {
+        localStorage.setItem(GEO_LAST_KEY, iso);
+      } catch {
+        /* ignore */
+      }
+      setGeoLastOk(iso);
+      setGeoStatus("ok");
     } catch (err) {
+      setGeoStatus("err");
       setError(err instanceof ApiError ? err.message : t("proxies.geoError"));
     } finally {
       setGeoUpdating(false);
@@ -375,68 +441,91 @@ export function ProxiesPage() {
       </div>
 
       {pageTab === "provider" ? (
-        <Card>
-          <CardHeader title={t("proxies.providerTitle")} subtitle={t("proxies.providerSub")} />
-          <div className="flex flex-wrap gap-2 p-4 sm:p-5">
-            <Button
-              size="md"
-              variant="primary"
-              disabled={refreshing || testing || geoUpdating || !!busy}
-              onClick={() => void refreshProvider()}
-            >
-              {refreshing ? t("app.loading") : t("proxies.refreshProvider")}
-            </Button>
-            <Button
-              size="md"
-              variant="secondary"
-              disabled={testing || refreshing || geoUpdating || !!busy || serverNames.length === 0}
-              onClick={() => void testAllServers()}
-            >
-              {testing
-                ? t("app.loading")
-                : t("proxies.testAllServers", { count: serverNames.length })}
-            </Button>
-            <Button
-              size="md"
-              variant="secondary"
-              disabled={geoUpdating || refreshing || testing || !!busy}
-              onClick={() => void refreshGeo()}
-            >
-              {geoUpdating ? t("app.loading") : t("proxies.updateGeo")}
-            </Button>
-          </div>
-          {providerEmpty && serverNames.length === 0 && (
-            <p className="border-t border-zk-border-soft px-4 py-3 text-xs text-zk-muted sm:px-5">
-              {t("proxies.providerEmpty")}
-            </p>
-          )}
-          {serverNames.length > 0 && (
-            <div className="max-h-64 overflow-y-auto border-t border-zk-border-soft px-4 py-3 sm:px-5">
-              <div className="grid gap-1 sm:grid-cols-2 lg:grid-cols-3">
-                {serverNames.map((name) => {
-                  const delay = delays[name];
-                  return (
-                    <div
-                      key={name}
-                      className="flex items-center justify-between rounded-lg px-2 py-1.5 text-sm"
-                    >
-                      <span className="truncate text-zk-text">{name}</span>
-                      {delay !== undefined && (
-                        <span
-                          className={`ml-2 shrink-0 font-mono text-xs ${
-                            delay < 0 ? "text-zk-coral" : delayColor(delay)
-                          }`}
-                        >
-                          {delay < 0 ? "—" : `${delay}ms`}
-                        </span>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
+        <div className="space-y-4">
+          <Card>
+            <CardHeader title={t("proxies.providerTitle")} subtitle={t("proxies.providerSub")} />
+            <div className="flex flex-wrap gap-2 p-4 sm:p-5">
+              <Button
+                size="md"
+                variant="primary"
+                disabled={refreshing || testing || !!busy}
+                onClick={() => void refreshProvider()}
+              >
+                {refreshing ? t("app.loading") : t("proxies.refreshProvider")}
+              </Button>
+              <Button
+                size="md"
+                variant="secondary"
+                disabled={testing || refreshing || !!busy || serverNames.length === 0}
+                onClick={() => void testAllServers()}
+              >
+                {testing
+                  ? t("app.loading")
+                  : t("proxies.testAllServers", { count: serverNames.length })}
+              </Button>
             </div>
-          )}
-        </Card>
+            {providerEmpty && serverNames.length === 0 && (
+              <p className="border-t border-zk-border-soft px-4 py-3 text-xs text-zk-muted sm:px-5">
+                {t("proxies.providerEmpty")}
+              </p>
+            )}
+            {serverNames.length > 0 && (
+              <div className="max-h-64 overflow-y-auto border-t border-zk-border-soft px-4 py-3 sm:px-5">
+                <div className="grid gap-1 sm:grid-cols-2 lg:grid-cols-3">
+                  {serverNames.map((name) => {
+                    const delay = delays[name];
+                    return (
+                      <div
+                        key={name}
+                        className="flex items-center justify-between rounded-lg px-2 py-1.5 text-sm"
+                      >
+                        <span className="truncate text-zk-text">{name}</span>
+                        {delay !== undefined && (
+                          <span
+                            className={`ml-2 shrink-0 font-mono text-xs ${
+                              delay < 0
+                                ? "text-zk-coral"
+                                : delay === 0
+                                  ? "text-zk-dim"
+                                  : delayColor(delay)
+                            }`}
+                          >
+                            {delay < 0 ? "—" : delay === 0 ? "…" : `${delay}ms`}
+                          </span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </Card>
+
+          <Card>
+            <CardHeader title={t("proxies.geoTitle")} subtitle={t("proxies.geoSub")} />
+            <div className="flex flex-wrap items-center gap-3 p-4 sm:p-5">
+              <Button
+                size="md"
+                variant="secondary"
+                disabled={geoUpdating || !!busy}
+                onClick={() => void refreshGeo()}
+              >
+                {geoUpdating ? t("app.loading") : t("proxies.updateGeo")}
+              </Button>
+              <span className="text-xs text-zk-muted">
+                {geoUpdating
+                  ? t("proxies.geoUpdating")
+                  : geoStatus === "ok"
+                    ? t("proxies.geoSuccess")
+                    : geoStatus === "err"
+                      ? t("proxies.geoFail")
+                      : geoLastOk
+                        ? t("proxies.geoLast", { date: formatGeoDate(geoLastOk, locale) })
+                        : t("proxies.geoNever")}
+              </span>
+            </div>
+          </Card>
+        </div>
       ) : (
         <>
           <Card>
