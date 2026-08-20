@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { ApiError } from "./api";
+import { useApiError } from "./errors";
 import { useT } from "./i18n";
 import {
   fetchMihomoConfig,
@@ -11,6 +11,7 @@ import {
 
 export function useMihomoConfig() {
   const t = useT();
+  const apiErr = useApiError();
   const [configPath, setConfigPath] = useState("");
   const [yaml, setYaml] = useState("");
   const [loading, setLoading] = useState(true);
@@ -32,11 +33,11 @@ export function useMihomoConfig() {
         setDirty(false);
       }
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "load failed");
+      setError(apiErr(err, "config.notFound"));
     } finally {
       setLoading(false);
     }
-  }, [t]);
+  }, [t, apiErr]);
 
   useEffect(() => {
     load();

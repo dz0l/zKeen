@@ -6,19 +6,15 @@ import { OnboardingGate } from "./components/OnboardingGate";
 import { AppShell } from "./components/layout";
 import { StatusPage } from "./pages/StatusPage";
 import { ProxiesPage } from "./pages/ProxiesPage";
-import { ConfigPage } from "./pages/ConfigPage";
-import { GroupsPoliciesPage } from "./pages/GroupsPoliciesPage";
+import { ConfigHubPage } from "./pages/ConfigHubPage";
 import { ConnectionsPage } from "./pages/ConnectionsPage";
-import { SettingsPage } from "./pages/SettingsPage";
 import type { PageId } from "./lib/types";
 
 const PAGES: Record<PageId, ComponentType> = {
   status: StatusPage,
   connections: ConnectionsPage,
   proxies: ProxiesPage,
-  config: ConfigPage,
-  groups: GroupsPoliciesPage,
-  settings: SettingsPage,
+  config: ConfigHubPage,
 };
 
 function Router() {

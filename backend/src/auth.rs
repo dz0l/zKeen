@@ -116,7 +116,7 @@ pub async fn post_setup(
             StatusCode::FORBIDDEN,
             Json(ApiResponse::<()> {
                 success: false,
-                error: Some("Password already set".into()),
+                error: Some("password_already_set".into()),
                 data: None,
             }),
         )
@@ -166,10 +166,7 @@ pub async fn post_login(
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(ApiResponse::<()> {
                     success: false,
-                    error: Some(format!(
-                        "Слишком много попыток. Повторите через {} секунд",
-                        LOCKOUT_SECS
-                    )),
+                    error: Some(format!("too_many_attempts:{}", LOCKOUT_SECS)),
                     data: None,
                 }),
             )
@@ -184,7 +181,7 @@ pub async fn post_login(
                 StatusCode::FORBIDDEN,
                 Json(ApiResponse::<()> {
                     success: false,
-                    error: Some("No password set".into()),
+                    error: Some("no_password_set".into()),
                     data: None,
                 }),
             )
@@ -213,7 +210,7 @@ pub async fn post_login(
             StatusCode::UNAUTHORIZED,
             Json(ApiResponse::<()> {
                 success: false,
-                error: Some("Неверный пароль".into()),
+                error: Some("invalid_password".into()),
                 data: None,
             }),
         )

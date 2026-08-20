@@ -4,6 +4,7 @@ import { IconChevron } from "../components/icons";
 import { useT, useI18n } from "../lib/i18n";
 import { useSession } from "../lib/session";
 import { ApiError, clashJson } from "../lib/api";
+import { useApiError } from "../lib/errors";
 import {
   DEFAULT_PROVIDER,
   ensureMihomoRunning,
@@ -85,6 +86,7 @@ function selectedMap(data: ClashProxiesResponse): Record<string, string> {
 export function ProxiesPage() {
   const t = useT();
   const { locale } = useI18n();
+  const apiErr = useApiError();
   const { clash, setClash, settings } = useSession();
   const [groups, setGroups] = useState<ProxyGroup[]>([]);
   const [bulkServers, setBulkServers] = useState<string[]>(["DIRECT"]);
@@ -157,7 +159,7 @@ export function ProxiesPage() {
         setOffline(true);
         setError(t("proxies.mihomoOffline"));
       } else {
-        setError(err instanceof ApiError ? err.message : t("proxies.loadError"));
+        setError(apiErr(err, "proxies.loadError"));
       }
     } finally {
       setLoading(false);
@@ -172,7 +174,7 @@ export function ProxiesPage() {
       setClash(conn);
       await loadProxies();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : t("proxies.startError"));
+      setError(apiErr(err, "proxies.startError"));
     } finally {
       setStarting(false);
     }
@@ -223,7 +225,7 @@ export function ProxiesPage() {
         }
         setSelected({ ...next });
       } catch (err) {
-        setError(err instanceof ApiError ? err.message : t("proxies.switchError"));
+        setError(apiErr(err, "proxies.switchError"));
         await loadProxies();
       } finally {
         setBusy("");
@@ -249,7 +251,7 @@ export function ProxiesPage() {
         );
         setSelected((s) => ({ ...s, [groupName]: nodeName }));
       } catch (err) {
-        setError(err instanceof ApiError ? err.message : t("proxies.switchError"));
+        setError(apiErr(err, "proxies.switchError"));
       } finally {
         setBusy("");
       }
@@ -324,7 +326,7 @@ export function ProxiesPage() {
         await Promise.all(names.slice(i, i + chunkSize).map((n) => testDelay(n)));
       }
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : t("proxies.testError"));
+      setError(apiErr(err, "proxies.testError"));
     } finally {
       setTesting(false);
     }
@@ -337,7 +339,7 @@ export function ProxiesPage() {
       await refreshProxyProvider(DEFAULT_PROVIDER, clashRef.current);
       await loadProxies();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : t("proxies.refreshError"));
+      setError(apiErr(err, "proxies.refreshError"));
     } finally {
       setRefreshing(false);
     }
@@ -359,7 +361,7 @@ export function ProxiesPage() {
       setGeoStatus("ok");
     } catch (err) {
       setGeoStatus("err");
-      setError(err instanceof ApiError ? err.message : t("proxies.geoError"));
+      setError(apiErr(err, "proxies.geoError"));
     } finally {
       setGeoUpdating(false);
     }
@@ -378,7 +380,7 @@ export function ProxiesPage() {
         setClash(conn);
         setCoreMode(value);
       } catch (err) {
-        setError(err instanceof ApiError ? err.message : t("proxies.modeError"));
+        setError(apiErr(err, "proxies.modeError"));
       } finally {
         setModeSaving(false);
       }
@@ -529,8 +531,16 @@ export function ProxiesPage() {
       ) : (
         <>
           <Card>
-            <div className="space-y-2 p-3 sm:p-4">
-              <div className="flex items-center gap-3">
+            <div className="flex flex-col gap-3 p-3 sm:flex-row sm:items-end sm:gap-4 sm:p-4">
+              <Select
+                inline
+                className="min-w-0 flex-1"
+                label={t("proxies.allTo")}
+                options={bulkServers.map((n) => ({ value: n, label: n }))}
+                value={bulkServer}
+                onChange={applyToAll}
+              />
+              <div className="flex min-w-0 flex-1 items-end gap-2">
                 <Select
                   inline
                   className="min-w-0 flex-1"
@@ -543,26 +553,7 @@ export function ProxiesPage() {
                     { value: "direct", label: "direct" },
                   ]}
                 />
-                {modeSaving && <span className="shrink-0 text-xs text-zk-muted">{t("app.loading")}</span>}
-              </div>
-              <div className="flex items-center gap-2">
-                <Select
-                  inline
-                  className="min-w-0 flex-1"
-                  label={t("proxies.quickSelect")}
-                  options={bulkServers.map((n) => ({ value: n, label: n }))}
-                  value={bulkServer}
-                  onChange={applyToAll}
-                />
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="shrink-0"
-                  onClick={() => applyToAll("DIRECT")}
-                  disabled={!!busy || !groups.some((g) => g.nodes.some((n) => n.name === "DIRECT"))}
-                >
-                  {t("proxies.resetAll")}
-                </Button>
+                {modeSaving && <span className="shrink-0 pb-2 text-xs text-zk-muted">{t("app.loading")}</span>}
               </div>
             </div>
           </Card>

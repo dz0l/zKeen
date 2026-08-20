@@ -3,7 +3,8 @@ import { Badge, Button, Card, CardHeader, StatTile } from "../components/ui";
 import { useApp } from "../lib/store";
 import { useT } from "../lib/i18n";
 import { useSession } from "../lib/session";
-import { ApiError, apiJson, clashJson } from "../lib/api";
+import { apiJson, clashJson } from "../lib/api";
+import { useApiError } from "../lib/errors";
 import {
   formatBytes,
   formatTrafficTotal,
@@ -16,6 +17,7 @@ import {
 export function StatusPage() {
   const { mode } = useApp();
   const t = useT();
+  const apiErr = useApiError();
   const { control, versions, clash, refreshSession } = useSession();
   const [clashVersion, setClashVersion] = useState("");
   const [memory, setMemory] = useState("—");
@@ -74,7 +76,7 @@ export function StatusPage() {
       await refreshSession();
       await loadClashStats();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : t("status.actionError"));
+      setError(apiErr(err, "status.actionError"));
     } finally {
       setBusy("");
     }

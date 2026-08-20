@@ -1,11 +1,12 @@
 import { useState, type FormEvent } from "react";
 import { Button, Card, CardHeader, Input } from "./ui";
 import { useSession, useNeedsAuth } from "../lib/session";
-import { ApiError } from "../lib/api";
+import { useApiError } from "../lib/errors";
 import { useT } from "../lib/i18n";
 
 export function AuthGate({ children }: { children: React.ReactNode }) {
   const t = useT();
+  const apiErr = useApiError();
   const { booting, loginInfo } = useSession();
   const needsAuth = useNeedsAuth();
   const { login, setup } = useSession();
@@ -46,7 +47,7 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
       setPassword("");
       setConfirm("");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : t("auth.failed"));
+      setError(apiErr(err, "auth.failed"));
     } finally {
       setLoading(false);
     }

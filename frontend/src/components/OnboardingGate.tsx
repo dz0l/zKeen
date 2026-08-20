@@ -1,12 +1,13 @@
 import { useState, type FormEvent } from "react";
 import { Button, Card, CardHeader, Input } from "./ui";
-import { ApiError } from "../lib/api";
+import { useApiError } from "../lib/errors";
 import { applySubscriptionUrl, completeOnboarding, isOnboardingComplete } from "../lib/config";
 import { useSession } from "../lib/session";
 import { useT } from "../lib/i18n";
 
 export function OnboardingGate({ children }: { children: React.ReactNode }) {
   const t = useT();
+  const apiErr = useApiError();
   const { booting, clash, setClash, refreshSession } = useSession();
   const [done, setDone] = useState(isOnboardingComplete);
   const [url, setUrl] = useState("");
@@ -30,7 +31,7 @@ export function OnboardingGate({ children }: { children: React.ReactNode }) {
       completeOnboarding();
       setDone(true);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : t("onboarding.failed"));
+      setError(apiErr(err, "onboarding.failed"));
     } finally {
       setLoading(false);
     }

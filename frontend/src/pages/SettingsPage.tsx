@@ -2,7 +2,8 @@ import { useState, useEffect } from "react";
 import { Card, CardHeader, Input, Select, Button, Badge } from "../components/ui";
 import { useI18n, useT, AVAILABLE_LOCALES } from "../lib/i18n";
 import { useSession, type VersionEntry, type VersionInfo } from "../lib/session";
-import { apiJson, ApiError, type ClashConnection } from "../lib/api";
+import { apiJson, type ClashConnection } from "../lib/api";
+import { displayApiError, useApiError } from "../lib/errors";
 
 function stripV(v?: string): string {
   if (!v) return "—";
@@ -14,9 +15,10 @@ function displayLatest(entry?: VersionEntry): string {
   return stripV(entry.latest || entry.version);
 }
 
-export function SettingsPage() {
+export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
   const t = useT();
   const { locale, setLocale } = useI18n();
+  const apiErr = useApiError();
   const { clash, setClash, versions, setVersions, logout, loginInfo } = useSession();
   const [draft, setDraft] = useState<ClashConnection>(clash);
   const [saved, setSaved] = useState(false);
@@ -45,10 +47,12 @@ export function SettingsPage() {
       });
       setVersions(res);
       if (res.check_ok === false) {
-        setCheckError(res.check_error || t("settings.checkError"));
+        setCheckError(
+          displayApiError(res.check_error || "", t, "settings.checkError", locale),
+        );
       }
     } catch (err) {
-      setCheckError(err instanceof ApiError ? err.message : t("settings.checkError"));
+      setCheckError(apiErr(err, "settings.checkError"));
     } finally {
       setChecking(false);
     }
@@ -70,7 +74,7 @@ export function SettingsPage() {
       });
       await checkUpdates();
     } catch (err) {
-      setCheckError(err instanceof ApiError ? err.message : t("settings.updateError"));
+      setCheckError(apiErr(err, "settings.updateError"));
     } finally {
       setUpdating("");
     }
@@ -81,11 +85,13 @@ export function SettingsPage() {
   const xray = versions?.xray;
 
   return (
-    <div className="page-enter space-y-4">
-      <div>
-        <h1 className="text-xl font-bold tracking-tight sm:text-2xl">{t("settings.title")}</h1>
-        <p className="mt-1 text-sm text-zk-muted">{t("settings.subtitle")}</p>
-      </div>
+    <div className={embedded ? "space-y-4" : "page-enter space-y-4"}>
+      {!embedded && (
+        <div>
+          <h1 className="text-xl font-bold tracking-tight sm:text-2xl">{t("settings.title")}</h1>
+          <p className="mt-1 text-sm text-zk-muted">{t("settings.subtitle")}</p>
+        </div>
+      )}
 
       <Card>
         <CardHeader title={t("settings.language")} />

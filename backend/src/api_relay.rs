@@ -52,7 +52,7 @@ pub async fn get_device_list(State(state): State<AppState>) -> impl IntoResponse
     if !response.status().is_success() {
         return Json(serde_json::json!({
             "success": false,
-            "error": format!("RCI вернул {}", response.status()),
+            "error": format!("RCI returned {}", response.status()),
         }));
     }
 
@@ -320,7 +320,7 @@ async fn resolve_clash_target(
             if tokio::fs::metadata(&path).await.is_ok() {
                 return Ok(ClashTarget::Unix { path });
             }
-            return Err("Unix сокет не найден на диске".into());
+            return Err("unix_socket_missing".into());
         }
     }
 
@@ -332,7 +332,7 @@ async fn resolve_clash_target(
         });
     }
 
-    Err("Фронт не передал данные для подключения".into())
+    Err("clash_connection_missing".into())
 }
 
 fn sanitize_unix_name(raw: &str) -> Option<String> {

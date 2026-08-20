@@ -97,7 +97,7 @@ export function BottomNav() {
           type="button"
           onClick={() => setMenuOpen(true)}
           className={`flex flex-1 flex-col items-center gap-0.5 py-2 text-[10px] font-medium transition-colors ${
-            page === "settings" || page === "groups" ? "text-zk-accent" : "text-zk-dim"
+            "text-zk-dim"
           }`}
         >
           <IconMenu className="h-5 w-5" />

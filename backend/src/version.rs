@@ -229,10 +229,7 @@ pub async fn check_updates_handler(State(state): State<AppState>) -> impl IntoRe
         obj.insert("check_ok".into(), json!(ui_ok));
         obj.insert("core_check_ok".into(), json!(core_ok));
         if !ui_ok {
-            obj.insert(
-                "check_error".into(),
-                json!("Не удалось получить релизы с GitHub. Проверьте сеть или github_proxy в настройках."),
-            );
+            obj.insert("check_error".into(), json!("github_unreachable"));
         }
         obj.insert("success".into(), json!(true));
     }

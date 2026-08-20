@@ -4,7 +4,8 @@ import { Badge, Button, Card, CardHeader, Select, StatTile } from "../components
 import { useApp } from "../lib/store";
 import { useT } from "../lib/i18n";
 import { useSession } from "../lib/session";
-import { ApiError, clashJson, clashWsUrl } from "../lib/api";
+import { clashJson, clashWsUrl } from "../lib/api";
+import { useApiError } from "../lib/errors";
 import {
   applyMihomoConfigChanges,
   fetchMihomoConfig,
@@ -224,6 +225,7 @@ function IpDropdown({
 
 export function ConnectionsPage() {
   const t = useT();
+  const apiErr = useApiError();
   const { mode } = useApp();
   const { clash, setClash } = useSession();
   const clashRef = useRef(clash);
@@ -288,7 +290,7 @@ export function ConnectionsPage() {
       setDownloadTotal(data.downloadTotal ?? 0);
       setError("");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : t("conn.loadError"));
+      setError(apiErr(err, "conn.loadError"));
     } finally {
       setLoading(false);
     }
@@ -424,7 +426,7 @@ export function ConnectionsPage() {
         for (const c of target) prevMapRef.current.delete(c.id);
         await loadConnections();
       } catch (err) {
-        setError(err instanceof ApiError ? err.message : t("conn.closeError"));
+        setError(apiErr(err, "conn.closeError"));
       } finally {
         setBusy(false);
       }
@@ -444,7 +446,7 @@ export function ConnectionsPage() {
       setLogLevel(value);
       setLogLines([]);
     } catch (err) {
-      setLogsError(err instanceof ApiError ? err.message : t("conn.logsSaveError"));
+      setLogsError(apiErr(err, "conn.logsSaveError"));
     } finally {
       setLogsSaving(false);
     }

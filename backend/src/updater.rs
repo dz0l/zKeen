@@ -1,3 +1,4 @@
+use crate::types::MIHOMO_CONF_DIR;
 use crate::logger::log;
 use crate::types::*;
 use axum::extract::State;
@@ -47,17 +48,84 @@ pub fn get_repo(core: &str) -> Option<&'static str> {
     }
 }
 
+/// Read `mixed-port` from Mihomo config (default 1080). Outbound via this port
+/// follows the user's Proxy selection (GitHub group / GLOBAL), unlike DIRECT.
+pub fn read_mihomo_mixed_port() -> u16 {
+    let path = format!("{MIHOMO_CONF_DIR}/config.yaml");
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return 1080;
+    };
+    for line in content.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("mixed-port:") {
+            let v = rest.split('#').next().unwrap_or(rest).trim();
+            if let Ok(p) = v.parse::<u16>() {
+                if p > 0 {
+                    return p;
+                }
+            }
+        }
+    }
+    1080
+}
+
+/// HTTP client that sends traffic through local Mihomo mixed-port (HTTP/SOCKS).
+pub fn build_mihomo_proxy_client() -> Option<reqwest::Client> {
+    let port = read_mihomo_mixed_port();
+    let proxy = reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).ok()?;
+    reqwest::Client::builder()
+        .user_agent("zKeen-UI")
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(90))
+        .proxy(proxy)
+        .build()
+        .ok()
+}
+
+/// Clients to try for GitHub: 1) via Mihomo (user proxy), 2) direct (CDN mirrors).
+fn github_http_clients<'a>(direct: &'a reqwest::Client) -> Vec<reqwest::Client> {
+    let mut out = Vec::with_capacity(2);
+    if let Some(via) = build_mihomo_proxy_client() {
+        out.push(via);
+    }
+    out.push(direct.clone());
+    out
+}
+
 pub async fn fetch_latest_version(
     client: &reqwest::Client, core: &str, proxies: &[String], current_ver: Option<&str>,
 ) -> Option<(String, String)> {
     let repo = get_repo(core)?;
     let is_alpha = current_ver.map_or(false, |v| v.contains("alpha"));
+    let mihomo_alpha = is_alpha && core == "mihomo";
+    let has_mihomo = build_mihomo_proxy_client().is_some();
 
-    // Prefer API /releases/latest, then list, then HTML redirect (better behind GitHub blocks).
-    if let Some(v) = fetch_latest_from_api(client, repo, proxies, is_alpha && core == "mihomo").await {
-        return Some(v);
+    for (i, c) in github_http_clients(client).into_iter().enumerate() {
+        let via_mihomo = has_mihomo && i == 0;
+        // Via Mihomo: try raw GitHub first (follows user Proxy selection), then CDN mirrors.
+        // Direct client: CDN mirrors + GitHub (existing behavior).
+        let empty: &[String] = &[];
+        let mirror_pass: Vec<&[String]> = if via_mihomo {
+            vec![empty, proxies]
+        } else {
+            vec![proxies]
+        };
+        for mirrors in mirror_pass {
+            if let Some(v) = fetch_latest_from_api(&c, repo, mirrors, mihomo_alpha).await {
+                if via_mihomo {
+                    log("INFO", "Версия получена через Mihomo mixed-port".into());
+                }
+                return Some(v);
+            }
+            if let Some(v) = fetch_latest_from_redirect(&c, repo, mirrors).await {
+                if via_mihomo {
+                    log("INFO", "Версия получена через Mihomo mixed-port (redirect)".into());
+                }
+                return Some(v);
+            }
+        }
     }
-    fetch_latest_from_redirect(client, repo, proxies).await
+    None
 }
 
 fn github_url_candidates(url: &str, proxies: &[String]) -> Vec<String> {
@@ -277,52 +345,59 @@ async fn download(
         None
     }
 
-    let list = std::iter::once(url.to_string()).chain(proxies.iter().map(|p| format!("{}/{}", p, url)));
-    for (i, u) in list.enumerate() {
-        let (source, is_proxy) = if i == 0 {
-            ("напрямую", false)
-        } else {
-            ("прокси", true)
-        };
-        if is_proxy {
-            log(
-                "INFO",
-                format!("Попытка загрузки через прокси #{}: {}", i, proxies[i - 1]),
-            );
-        }
-
-        match client.get(&u).send().await {
-            Ok(r) if r.status().is_success() => {
-                if r.headers()
-                    .get("content-type")
-                    .map_or(false, |v| v.to_str().unwrap_or("").contains("text/html"))
-                {
-                    log(
-                        "WARN",
-                        if is_proxy {
-                            format!("Прокси #{} вернул HTML", i)
-                        } else {
-                            "Прямой URL вернул HTML".into()
-                        },
-                    );
-                    continue;
-                }
-                if let Some(res) = load(
-                    r,
-                    tmp_path,
-                    &format!("{}{}", source, if is_proxy { format!(" #{}", i) } else { "".into() }),
-                )
-                .await
-                {
-                    return Ok(res);
-                }
+    let urls: Vec<String> = std::iter::once(url.to_string())
+        .chain(proxies.iter().map(|p| format!("{}/{}", p, url)))
+        .collect();
+    let clients = github_http_clients(client);
+    let mihomo_first = clients.len() > 1;
+    for (ci, http) in clients.iter().enumerate() {
+        let via_mihomo = mihomo_first && ci == 0;
+        let via_label = if via_mihomo { "mihomo" } else { "direct" };
+        for (i, u) in urls.iter().enumerate() {
+            let (source, is_cdn) = if i == 0 {
+                (format!("напрямую/{via_label}"), false)
+            } else {
+                (format!("CDN/{via_label}"), true)
+            };
+            if is_cdn {
+                log(
+                    "INFO",
+                    format!("Попытка загрузки через CDN #{} ({via_label}): {}", i, proxies[i - 1]),
+                );
+            } else if via_mihomo {
+                log(
+                    "INFO",
+                    format!("Попытка загрузки через Mihomo mixed-port:{}", read_mihomo_mixed_port()),
+                );
             }
-            Ok(r) => log("WARN", format!("Ошибка загрузки: {}", r.status())),
-            Err(e) => log("WARN", format!("Ошибка загрузки: {}", e)),
+
+            match http.get(u).send().await {
+                Ok(r) if r.status().is_success() => {
+                    if r.headers()
+                        .get("content-type")
+                        .map_or(false, |v| v.to_str().unwrap_or("").contains("text/html"))
+                    {
+                        log(
+                            "WARN",
+                            if is_cdn {
+                                format!("CDN #{} вернул HTML", i)
+                            } else {
+                                "URL вернул HTML".into()
+                            },
+                        );
+                        continue;
+                    }
+                    if let Some(res) = load(r, tmp_path, &source).await {
+                        return Ok(res);
+                    }
+                }
+                Ok(r) => log("WARN", format!("Ошибка загрузки: {}", r.status())),
+                Err(e) => log("WARN", format!("Ошибка загрузки: {}", e)),
+            }
         }
     }
     log("ERROR", "Не удалось выполнить обновление".into());
-    Err("Не удалось выполнить обновление".into())
+    Err("update_failed".into())
 }
 async fn save(dl: DownloadResult, out_path: PathBuf) -> std::io::Result<()> {
     tokio::task::spawn_blocking(move || {
@@ -388,7 +463,7 @@ async fn install_jq() -> Result<(), String> {
         .await
         .map_err(|e| format!("opkg update: {}", e))?;
     if !update.success() {
-        return Err("Ошибка обновления opkg кеша".into());
+        return Err("opkg_update_failed".into());
     }
     let install = Command::new("opkg")
         .args(["install", "jq"])
@@ -396,7 +471,7 @@ async fn install_jq() -> Result<(), String> {
         .await
         .map_err(|e| format!("opkg install jq: {}", e))?;
     if !install.success() {
-        return Err("Ошибка установки jq".into());
+        return Err("jq_install_failed".into());
     }
     log("INFO", "Пакет jq установлен".into());
     Ok(())
@@ -417,14 +492,14 @@ async fn install_yq(client: &reqwest::Client, proxies: &[String], tmp_dir: &Path
             "{}/mikefarah/yq/releases/download/v4.52.2/yq_linux_mips",
             GITHUB_RELEASE
         ),
-        _ => return Err("Архитектура не поддерживается для yq".into()),
+        _ => return Err("arch_unsupported".into()),
     };
 
     log("INFO", format!("Загрузка yq: {}", url));
     let dl_res = download(client, &url, proxies, &tmp_dir.join("yq.tmp")).await?;
     let target = "/opt/sbin/yq";
     if let Err(e) = save(dl_res, tmp_dir.join("yq.bin")).await {
-        return Err(format!("Ошибка записи yq: {}", e));
+        return Err("save_failed".to_string());
     }
 
     log("INFO", "Установка yq...".into());
@@ -432,7 +507,7 @@ async fn install_yq(client: &reqwest::Client, proxies: &[String], tmp_dir: &Path
     if fs::rename(&src, target).await.is_err() {
         fs::copy(&src, target)
             .await
-            .map_err(|e| format!("Ошибка установки yq: {}", e))?;
+            .map_err(|e| "install_failed".to_string())?;
         _ = fs::remove_file(&src).await;
     }
     _ = fs::set_permissions(target, std::fs::Permissions::from_mode(0o755)).await;
@@ -442,7 +517,7 @@ async fn install_yq(client: &reqwest::Client, proxies: &[String], tmp_dir: &Path
 
 pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateReq>) -> impl IntoResponse {
     let Some(repo) = get_repo(&req.core) else {
-        return response(false, Some("Неизвестное ядро".into()));
+        return response(false, Some("unknown_core".into()));
     };
     let ver = if req.version.starts_with(|c: char| c.is_ascii_digit()) {
         format!("v{}", req.version)
@@ -473,7 +548,7 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
             "aarch64" => "arm64-v8a",
             "mips" if cfg!(target_endian = "little") => "mips32le",
             "mips" => "mips32",
-            _ => return response(false, Some("Архитектура не поддерживается".into())),
+            _ => return response(false, Some("arch_unsupported".into())),
         };
 
         log("INFO", "Загрузка исполняемого файла...".into());
@@ -487,30 +562,30 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
 
         let source = tmp_dir.join(format!("zkeen-ui_{}", ver));
         if let Err(e) = save(bin_d, source.clone()).await {
-            return response(false, Some(format!("Ошибка сохранения: {}", e)));
+            return response(false, Some("save_failed".to_string()));
         }
 
         let integrity_check = tokio::task::spawn_blocking({
             let source = source.clone();
             move || -> Result<(), String> {
                 let meta = std::fs::metadata(&source)
-                    .map_err(|e| format!("Ошибка проверки файла: {}", e))?;
+                    .map_err(|e| format!("verify_file: {}", e))?;
                 if meta.len() < 1024 * 1024 {
-                    return Err("Файл меньше 1МБ — повреждённый артефакт".into());
+                    return Err("artifact_too_small".into());
                 }
                 let mut f = std::fs::File::open(&source)
-                    .map_err(|e| format!("Ошибка открытия файла: {}", e))?;
+                    .map_err(|e| format!("open_file: {}", e))?;
                 let mut magic = [0u8; 4];
                 f.read_exact(&mut magic)
-                    .map_err(|e| format!("Ошибка чтения файла: {}", e))?;
+                    .map_err(|e| format!("read_file: {}", e))?;
                 if magic != [0x7F, b'E', b'L', b'F'] {
-                    return Err("Файл не является ELF-бинарём — отменено".into());
+                    return Err("artifact_not_elf".into());
                 }
                 Ok(())
             }
         })
         .await
-        .map_err(|e| format!("Ошибка проверки: {}", e))
+        .map_err(|e| format!("verify: {}", e))
         .and_then(|r| r);
 
         if let Err(e) = integrity_check {
@@ -522,7 +597,7 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
 
         let target = "/opt/sbin/zkeen-ui";
         if let Err(e) = fs::rename(&source, target).await {
-            return response(false, Some(format!("Ошибка установки: {}", e)));
+            return response(false, Some("install_failed".to_string()));
         }
 
         _ = fs::set_permissions(target, std::fs::Permissions::from_mode(0o755)).await;
@@ -552,7 +627,7 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
                 "aarch64" => "Xray-linux-arm64-v8a.zip",
                 "mips" if cfg!(target_endian = "little") => "Xray-linux-mips32le.zip",
                 "mips" => "Xray-linux-mips32.zip",
-                _ => return response(false, Some("Архитектура не поддерживается".into())),
+                _ => return response(false, Some("arch_unsupported".into())),
             };
             (x.into(), format!("{GITHUB_RELEASE}/{repo}/releases/download/{ver}/{x}"))
         }
@@ -561,7 +636,7 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
                 "aarch64" => "arm64",
                 "mips" if cfg!(target_endian = "little") => "mipsle-softfloat",
                 "mips" => "mips-softfloat",
-                _ => return response(false, Some("Архитектура не поддерживается".into())),
+                _ => return response(false, Some("arch_unsupported".into())),
             };
             if ver == "Prerelease-Alpha" {
                 let arch_suffix = format!("mihomo-linux-{}", m);
@@ -576,7 +651,7 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
                         format!("{}/{}/releases/download/{}/{}", GITHUB_RELEASE, repo, ver, name),
                     ),
                     None => {
-                        return response(false, Some("Ассет не найден — обновите страницу и повторите".into()));
+                        return response(false, Some("asset_not_found".into()));
                     }
                 }
             } else {
@@ -587,7 +662,7 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
                 )
             }
         }
-        _ => return response(false, Some("Неизвестное ядро".into())),
+        _ => return response(false, Some("unknown_core".into())),
     };
 
     match req.core.as_str() {
@@ -641,7 +716,7 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
     .await;
 
     if let Ok(Err(e)) | Err(e) = unpack.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) {
-        return response(false, Some(format!("Ошибка распаковки: {}", e)));
+        return response(false, Some("unpack_failed".to_string()));
     }
 
     let target = format!("/opt/sbin/{}", req.core);
@@ -677,7 +752,7 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
             _ = crate::controller::run_init_command(&state, &["stop"]).await;
         }
         if let Err(e) = fs::copy(&source, &target).await {
-            return response(false, Some(format!("Ошибка установки: {}", e)));
+            return response(false, Some("install_failed".to_string()));
         }
         _ = fs::remove_file(&source).await;
         _ = fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).await;

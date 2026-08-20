@@ -104,7 +104,5 @@ export const PAGE_ICONS: Record<PageId, FC<IconProps>> = {
   status: IconStatus,
   connections: IconConnections,
   proxies: IconProxy,
-  config: IconConfig,
-  groups: IconGroups,
-  settings: IconSettings,
+  config: IconSettings,
 };

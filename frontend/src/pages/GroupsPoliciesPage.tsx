@@ -4,7 +4,7 @@ import { GroupEditModal, rulesToDraft, type GroupEditDraft } from "../components
 import { useApp } from "../lib/store";
 import { useT } from "../lib/i18n";
 import { useSession } from "../lib/session";
-import { ApiError } from "../lib/api";
+import { useApiError } from "../lib/errors";
 import {
   applyMihomoConfigChanges,
   fetchMihomoConfig,
@@ -48,11 +48,18 @@ function GroupIcon({ name, icon }: { name: string; icon?: string }) {
   );
 }
 
-export function GroupsPoliciesPage() {
+export function GroupsPoliciesPage({
+  embedded = false,
+  forceTab,
+}: {
+  embedded?: boolean;
+  forceTab?: Tab;
+} = {}) {
   const t = useT();
+  const apiErr = useApiError();
   const { mode } = useApp();
   const { clash, setClash } = useSession();
-  const [tab, setTab] = useState<Tab>("groups");
+  const [tab, setTab] = useState<Tab>(forceTab || "groups");
   const [yaml, setYaml] = useState("");
   const [configPath, setConfigPath] = useState("");
   const [loading, setLoading] = useState(true);
@@ -64,6 +71,12 @@ export function GroupsPoliciesPage() {
   const [policyIp, setPolicyIp] = useState("");
   const [policyTarget, setPolicyTarget] = useState("DIRECT");
 
+  useEffect(() => {
+    if (forceTab) setTab(forceTab);
+  }, [forceTab]);
+
+  const activeTab = forceTab || tab;
+
   const load = useCallback(async () => {
     setLoading(true);
     setError("");
@@ -73,7 +86,7 @@ export function GroupsPoliciesPage() {
       setYaml(data.content);
       setConfigPath(data.path);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : t("groups.loadError"));
+      setError(apiErr(err, "groups.loadError"));
     } finally {
       setLoading(false);
     }
@@ -146,7 +159,7 @@ export function GroupsPoliciesPage() {
       await persist(next);
       setDraft(null);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : err instanceof Error ? err.message : t("groups.saveError"));
+      setError(apiErr(err, "groups.saveError"));
       throw err;
     }
   };
@@ -166,7 +179,7 @@ export function GroupsPoliciesPage() {
       await persist(next);
       setPolicyIp("");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : String(err));
+      setError(apiErr(err, "groups.saveError"));
     }
   };
 
@@ -175,7 +188,7 @@ export function GroupsPoliciesPage() {
       const next = removeIpPolicy(yaml, p.raw);
       await persist(next);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : String(err));
+      setError(apiErr(err, "groups.saveError"));
     }
   };
 
@@ -186,40 +199,44 @@ export function GroupsPoliciesPage() {
   }
 
   return (
-    <div className="page-enter space-y-4">
+    <div className={embedded ? "space-y-4" : "page-enter space-y-4"}>
       {error && (
         <div className="rounded-xl border border-zk-coral/25 bg-zk-coral/10 px-3 py-2 text-xs text-zk-coral">
           {error}
         </div>
       )}
 
-      <div>
-        <h1 className="text-xl font-bold tracking-tight sm:text-2xl">{t("groups.title")}</h1>
-        <p className="mt-1 text-sm text-zk-muted">{t("groups.pageSub")}</p>
-      </div>
+      {!embedded && (
+        <div>
+          <h1 className="text-xl font-bold tracking-tight sm:text-2xl">{t("groups.title")}</h1>
+          <p className="mt-1 text-sm text-zk-muted">{t("groups.pageSub")}</p>
+        </div>
+      )}
 
-      <div className="flex rounded-xl border border-zk-border-soft bg-zk-bg-elevated p-1">
-        <button
-          type="button"
-          onClick={() => setTab("groups")}
-          className={`flex-1 rounded-lg px-3 py-2 text-xs font-semibold transition-all ${
-            tab === "groups" ? "bg-zk-surface text-zk-text shadow-sm" : "text-zk-muted hover:text-zk-text"
-          }`}
-        >
-          {t("groups.tabGroups")} ({groups.length})
-        </button>
-        <button
-          type="button"
-          onClick={() => setTab("policies")}
-          className={`flex-1 rounded-lg px-3 py-2 text-xs font-semibold transition-all ${
-            tab === "policies" ? "bg-zk-surface text-zk-text shadow-sm" : "text-zk-muted hover:text-zk-text"
-          }`}
-        >
-          {t("groups.tabPolicies")} ({policies.length})
-        </button>
-      </div>
+      {!embedded && (
+        <div className="flex rounded-xl border border-zk-border-soft bg-zk-bg-elevated p-1">
+          <button
+            type="button"
+            onClick={() => setTab("groups")}
+            className={`flex-1 rounded-lg px-3 py-2 text-xs font-semibold transition-all ${
+              tab === "groups" ? "bg-zk-surface text-zk-text shadow-sm" : "text-zk-muted hover:text-zk-text"
+            }`}
+          >
+            {t("groups.tabGroups")} ({groups.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => setTab("policies")}
+            className={`flex-1 rounded-lg px-3 py-2 text-xs font-semibold transition-all ${
+              tab === "policies" ? "bg-zk-surface text-zk-text shadow-sm" : "text-zk-muted hover:text-zk-text"
+            }`}
+          >
+            {t("groups.tabPolicies")} ({policies.length})
+          </button>
+        </div>
+      )}
 
-      {tab === "groups" ? (
+      {activeTab === "groups" ? (
         <>
           <Card>
             <CardHeader title={t("groups.newGroup")} subtitle={t("groups.newGroupSub")} />

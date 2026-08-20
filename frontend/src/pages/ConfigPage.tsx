@@ -4,26 +4,39 @@ import { useApp } from "../lib/store";
 import { useT } from "../lib/i18n";
 import { useMihomoConfig } from "../lib/useMihomoConfig";
 import { useSession } from "../lib/session";
-import { ApiError } from "../lib/api";
+import { useApiError } from "../lib/errors";
 import { DEFAULT_PROVIDER, applyMihomoConfigChanges, ensureMihomoRunning, ensureZkeenMihomoConfig, refreshProxyProvider } from "../lib/config";
 
 type ConfigTab = "editor" | "quick";
 
-export function ConfigPage() {
+export function ConfigPage({
+  embedded = false,
+  forceTab,
+}: {
+  embedded?: boolean;
+  forceTab?: ConfigTab;
+} = {}) {
   const { mode } = useApp();
   const t = useT();
+  const apiErr = useApiError();
   const { clash, setClash, refreshSession } = useSession();
   const cfg = useMihomoConfig();
-  const [tab, setTab] = useState<ConfigTab>(mode === "safe" ? "quick" : "editor");
+  const [tab, setTab] = useState<ConfigTab>(forceTab || (mode === "safe" ? "quick" : "editor"));
   const [validated, setValidated] = useState<boolean | null>(null);
   const [actionError, setActionError] = useState("");
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
+    if (forceTab) {
+      setTab(forceTab);
+      return;
+    }
     if (mode === "safe" && tab === "editor") {
       setTab("quick");
     }
-  }, [mode, tab]);
+  }, [mode, tab, forceTab]);
+
+  const activeTab = forceTab || tab;
 
   if (cfg.loading) {
     return (
@@ -52,7 +65,7 @@ export function ConfigPage() {
       setValidated(true);
     } catch (err) {
       setValidated(false);
-      setActionError(err instanceof ApiError ? err.message : t("config.validateError"));
+      setActionError(apiErr(err, "config.validateError"));
     } finally {
       setSaving(false);
     }
@@ -65,7 +78,7 @@ export function ConfigPage() {
       await cfg.save(validate);
       setValidated(validate ? true : null);
     } catch (err) {
-      setActionError(err instanceof ApiError ? err.message : t("config.saveError"));
+      setActionError(apiErr(err, "config.saveError"));
       if (validate) setValidated(false);
     } finally {
       setSaving(false);
@@ -86,31 +99,39 @@ export function ConfigPage() {
       await refreshSession();
       setValidated(null);
     } catch (err) {
-      setActionError(err instanceof ApiError ? err.message : t("config.saveError"));
+      setActionError(apiErr(err, "config.saveError"));
     } finally {
       setSaving(false);
     }
   }
 
   return (
-    <div className="page-enter space-y-4">
+    <div className={embedded ? "space-y-4" : "page-enter space-y-4"}>
       {actionError && (
         <div className="rounded-xl border border-zk-coral/25 bg-zk-coral/10 px-3 py-2 text-xs text-zk-coral">
           {actionError}
         </div>
       )}
 
-      <div className="flex items-end justify-between gap-3">
-        <div>
-          <h1 className="text-xl font-bold tracking-tight sm:text-2xl">{t("config.title")}</h1>
-          <p className="mt-1 text-sm text-zk-muted">
-            {cfg.configPath || t("config.subtitle")}
-          </p>
+      {!embedded && (
+        <div className="flex items-end justify-between gap-3">
+          <div>
+            <h1 className="text-xl font-bold tracking-tight sm:text-2xl">{t("config.title")}</h1>
+            <p className="mt-1 text-sm text-zk-muted">
+              {cfg.configPath || t("config.subtitle")}
+            </p>
+          </div>
+          <ImportExportButtons yaml={cfg.yaml} setYaml={cfg.setYaml} />
         </div>
-        <ImportExportButtons yaml={cfg.yaml} setYaml={cfg.setYaml} />
-      </div>
+      )}
 
-      {mode !== "safe" && (
+      {embedded && activeTab === "editor" && (
+        <div className="flex justify-end">
+          <ImportExportButtons yaml={cfg.yaml} setYaml={cfg.setYaml} />
+        </div>
+      )}
+
+      {!embedded && mode !== "safe" && (
         <div className="flex rounded-xl bg-zk-bg-elevated p-1 border border-zk-border-soft">
           <button
             type="button"
@@ -137,13 +158,13 @@ export function ConfigPage() {
         </div>
       )}
 
-      {mode === "safe" && (
+      {mode === "safe" && activeTab === "quick" && (
         <div className="rounded-xl border border-zk-safe/30 bg-zk-safe/8 px-4 py-3 text-xs text-zk-safe">
           <strong>Safe mode:</strong> {t("config.safeBanner")}
         </div>
       )}
 
-      {(mode !== "safe" ? tab === "editor" : false) && (
+      {activeTab === "editor" && mode !== "safe" && (
         <EditorTab
           yaml={cfg.yaml}
           setYaml={cfg.setYaml}
@@ -152,10 +173,10 @@ export function ConfigPage() {
           mode={mode}
           saving={saving}
           onValidate={handleValidate}
-          onSave={() => handleSave(mode === "safe")}
+          onSave={() => handleSave(false)}
         />
       )}
-      {(mode === "safe" || tab === "quick") && (
+      {activeTab === "quick" && (
         <QuickSettingsTab
           subscriptionUrl={cfg.subscriptionUrl}
           subscriptionHwid={cfg.subscriptionHwid}
@@ -294,6 +315,7 @@ function QuickSettingsTab({
   saving: boolean;
 }) {
   const t = useT();
+  const apiErr = useApiError();
   const { clash, setClash } = useSession();
   const [refreshing, setRefreshing] = useState(false);
   const [localError, setLocalError] = useState("");
@@ -306,7 +328,7 @@ function QuickSettingsTab({
       setClash(conn);
       await refreshProxyProvider(DEFAULT_PROVIDER, conn);
     } catch (err) {
-      setLocalError(err instanceof ApiError ? err.message : t("config.refreshError"));
+      setLocalError(apiErr(err, "config.refreshError"));
     } finally {
       setRefreshing(false);
     }

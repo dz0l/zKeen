@@ -37,14 +37,14 @@ pub async fn patch_settings(State(state): State<AppState>, Json(patch): Json<ser
     };
 
     if settings.log.timezone < -12 || settings.log.timezone > 14 {
-        return Json(serde_json::json!({"success": false, "error": "Неверный часовой пояс"}));
+        return Json(serde_json::json!({"success": false, "error": "invalid_timezone"}));
     }
     settings.clash_api.ping_url = settings.clash_api.ping_url.trim().to_string();
     if settings.clash_api.ping_url.is_empty() {
-        return Json(serde_json::json!({"success": false, "error": "URL пинг-теста не может быть пустым"}));
+        return Json(serde_json::json!({"success": false, "error": "ping_url_empty"}));
     }
     if settings.clash_api.ping_timeout == 0 {
-        return Json(serde_json::json!({"success": false, "error": "Таймаут пинг-теста должен быть больше 0"}));
+        return Json(serde_json::json!({"success": false, "error": "ping_timeout_invalid"}));
     }
     settings.normalize_proxies();
 

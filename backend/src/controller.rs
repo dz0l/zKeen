@@ -63,7 +63,7 @@ async fn resolve_init_file(state: &AppState) -> Result<String, String> {
     let new_path = tokio::task::spawn_blocking(|| find_init_file(false))
         .await
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Не найден init файл XKeen".to_string())?;
+        .ok_or_else(|| "xkeen_init_missing".to_string())?;
     println!("{} [INFO] Updated initd_file: {}", crate::logger::ts(), new_path);
     *state.init_file.write().unwrap() = Some(new_path.clone());
     Ok(new_path)
@@ -158,7 +158,7 @@ pub async fn soft_restart(core: &str) -> Result<(), String> {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     match child.try_wait() {
         Ok(Some(status)) if !status.success() => {
-            return Err(format!("Не удалось перезапустить {}: {}", core, status));
+            return Err(format!("restart_failed:{}:{}", core, status));
         }
         _ => {
             tokio::spawn(async move {
@@ -253,9 +253,7 @@ async fn check_core_config(core: &str) -> Result<(), String> {
             })
             .unwrap_or(false);
         if !has_json {
-            return Err(
-                "Не найдены конфигурационные файлы. Настройте их в /opt/etc/xray/configs перед запуском".into(),
-            );
+            return Err("missing_core_config".into());
         }
     }
     Ok(())
@@ -300,11 +298,7 @@ pub async fn post_control(State(state): State<AppState>, Json(req): Json<Control
                 log("ERROR", e);
                 return Json(ApiResponse {
                     success: false,
-                    error: Some(format!(
-                        "Не удалось запустить {}{}",
-                        &req.core[..1].to_uppercase(),
-                        &req.core[1..]
-                    )),
+                    error: Some("start_failed".into()),
                     data: None,
                 });
             }
@@ -344,11 +338,7 @@ pub async fn post_control(State(state): State<AppState>, Json(req): Json<Control
                     log("ERROR", e);
                     return Json(ApiResponse {
                         success: false,
-                        error: Some(format!(
-                            "Не удалось запустить {}{}",
-                            &cur_name[..1].to_uppercase(),
-                            &cur_name[1..]
-                        )),
+                        error: Some("start_failed".into()),
                         data: None,
                     });
                 }
