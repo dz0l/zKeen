@@ -446,26 +446,64 @@ fn is_zkeen_ready_config(content: &str) -> bool {
     content.contains("external-controller:") && content.contains("proxy-groups:")
 }
 
+fn parse_yaml_inline_value(raw: &str) -> Option<String> {
+    let value = raw.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn extract_subscription_fields(content: &str) -> (Option<String>, Option<String>) {
+    let mut in_subscription = false;
+    let mut url = None;
+    let mut hwid = None;
+    let mut in_hwid = false;
+
+    for line in content.lines() {
+        if line.starts_with("  subscription:") {
+            in_subscription = true;
+            in_hwid = false;
+            continue;
+        }
+
+        if !in_subscription {
+            continue;
+        }
+
+        if line.starts_with("  ") && !line.starts_with("    ") {
+            let trimmed = line.trim();
+            if trimmed.ends_with(':') && !trimmed.starts_with("subscription:") {
+                break;
+            }
+        }
+
+        if url.is_none() && line.contains("url:") {
+            url = line.split("url:").nth(1).and_then(parse_yaml_inline_value);
+            continue;
+        }
+
+        if line.contains("x-hwid:") {
+            in_hwid = true;
+            continue;
+        }
+
+        if in_hwid && line.trim().starts_with('-') {
+            hwid = parse_yaml_inline_value(line.trim().trim_start_matches('-'));
+            in_hwid = false;
+        }
+    }
+
+    (url, hwid)
+}
+
 fn extract_subscription_url(content: &str) -> Option<String> {
-    let re = regex_lite::Regex::new(
-        r"(?ms)  subscription:.*?^\s+url:\s*['\"]?([^'\"#\n]+)['\"]?\s*$",
-    )
-    .ok()?;
-    re.captures(content)
-        .and_then(|caps| caps.get(1))
-        .map(|m| m.as_str().trim().to_string())
-        .filter(|s| !s.is_empty())
+    extract_subscription_fields(content).0
 }
 
 fn extract_subscription_hwid(content: &str) -> Option<String> {
-    let re = regex_lite::Regex::new(
-        r"(?ms)  subscription:.*?x-hwid:\s*\n\s*-\s*['\"]?([^'\"#\n]+)['\"]?",
-    )
-    .ok()?;
-    re.captures(content)
-        .and_then(|caps| caps.get(1))
-        .map(|m| m.as_str().trim().to_string())
-        .filter(|s| !s.is_empty())
+    extract_subscription_fields(content).1
 }
 
 fn inject_subscription_defaults(mut content: String, url: Option<&str>, hwid: Option<&str>) -> String {
