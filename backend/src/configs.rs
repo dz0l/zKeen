@@ -440,7 +440,7 @@ fn truncate_validation_error(raw: &str) -> String {
 }
 
 const DEFAULT_MIHOMO_CONFIG: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../install/mihomo-config.default.yaml"));
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/mihomo-config.default.yaml"));
 
 fn is_zkeen_ready_config(content: &str) -> bool {
     content.contains("external-controller:") && content.contains("proxy-groups:")
