@@ -1,10 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Badge, Button, Card, CardHeader, StatTile } from "../components/ui";
-import { useApp } from "../lib/store";
+import { Badge, Card, CardHeader, StatTile } from "../components/ui";
 import { useT } from "../lib/i18n";
 import { useSession } from "../lib/session";
-import { apiJson, clashJson } from "../lib/api";
-import { useApiError } from "../lib/errors";
+import { clashJson } from "../lib/api";
 import {
   formatBytes,
   formatTrafficTotal,
@@ -15,16 +13,12 @@ import {
 } from "../lib/clash";
 
 export function StatusPage() {
-  const { mode } = useApp();
   const t = useT();
-  const apiErr = useApiError();
-  const { control, versions, clash, refreshSession } = useSession();
+  const { control, versions, clash } = useSession();
   const [clashVersion, setClashVersion] = useState("");
   const [memory, setMemory] = useState("—");
   const [connections, setConnections] = useState("—");
   const [traffic, setTraffic] = useState("—");
-  const [busy, setBusy] = useState("");
-  const [error, setError] = useState("");
   const clashRef = useRef(clash);
   clashRef.current = clash;
 
@@ -61,35 +55,8 @@ export function StatusPage() {
     return () => clearInterval(id);
   }, [loadClashStats, clash.port, clash.secret, clash.unix]);
 
-  async function runControl(action: string) {
-    if (mode === "safe") {
-      const label = action === "stop" ? t("status.stop") : t("status.restart");
-      if (!window.confirm(`${label}?`)) return;
-    }
-    setBusy(action);
-    setError("");
-    try {
-      await apiJson("/api/control", {
-        method: "POST",
-        body: JSON.stringify({ action }),
-      });
-      await refreshSession();
-      await loadClashStats();
-    } catch (err) {
-      setError(apiErr(err, "status.actionError"));
-    } finally {
-      setBusy("");
-    }
-  }
-
   return (
     <div className="page-enter space-y-4">
-      {error && (
-        <div className="rounded-xl border border-zk-coral/25 bg-zk-coral/10 px-3 py-2 text-xs text-zk-coral">
-          {error}
-        </div>
-      )}
-
       <div>
         <h1 className="text-xl font-bold tracking-tight sm:text-2xl">{t("status.title")}</h1>
         <p className="mt-1 text-sm text-zk-muted">{t("status.subtitle")}</p>
@@ -123,29 +90,6 @@ export function StatusPage() {
             value={clashVersion || versions?.mihomo?.version?.replace(/^v/i, "") || "—"}
           />
         </div>
-        <div className="flex flex-wrap gap-2 border-t border-zk-border-soft px-4 py-3 sm:px-5">
-          <Button
-            size="sm"
-            variant="secondary"
-            disabled={!!busy}
-            onClick={() => runControl("restart")}
-          >
-            {busy === "restart" ? t("app.loading") : t("status.restart")}
-          </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            disabled={!!busy}
-            onClick={() => runControl("stop")}
-          >
-            {busy === "stop" ? t("app.loading") : t("status.stop")}
-          </Button>
-          {mode === "safe" && (
-            <span className="ml-auto self-center text-[10px] text-zk-safe">
-              {t("status.safeRestart")}
-            </span>
-          )}
-        </div>
       </Card>
 
       <div className="grid gap-3 sm:grid-cols-2">
@@ -172,21 +116,15 @@ export function StatusPage() {
         </Card>
 
         <Card>
-          <CardHeader title="zkeen-ui" subtitle={t("status.panel")} />
+          <CardHeader title="zKeen UI" subtitle={t("status.panel")} />
           <div className="space-y-2 p-4 sm:p-5">
             <div className="flex justify-between text-sm">
               <span className="text-zk-muted">{t("status.versionLabel")}</span>
-              <span className="font-medium">
-                {versions?.["zkeen-ui"]?.version || "—"}
-              </span>
-            </div>
-            <div className="flex justify-between text-sm">
-              <span className="text-zk-muted">{t("status.modeLabel")}</span>
-              <Badge variant={mode === "safe" ? "safe" : "expert"}>{mode}</Badge>
+              <span className="font-mono text-xs">{versions?.["zkeen-ui"]?.version || "—"}</span>
             </div>
             <div className="flex justify-between text-sm">
               <span className="text-zk-muted">{t("status.portLabel")}</span>
-              <span className="font-mono text-xs">:{panelPort}</span>
+              <span className="font-mono text-xs">{panelPort}</span>
             </div>
           </div>
         </Card>

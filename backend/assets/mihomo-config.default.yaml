@@ -1,0 +1,469 @@
+# zKeen UI — default Mihomo config (no secrets)
+# Subscription URL: set in onboarding or Settings → Subscription
+
+redir-port: 1182
+tproxy-port: 1181
+mixed-port: 1080
+
+tcp-concurrent: true
+allow-lan: true
+mode: rule
+geo-auto-update: true
+geo-update-interval: 168
+log-level: silent
+ipv6: false
+external-controller: 0.0.0.0:9090
+geodata-mode: true
+profile:
+  store-selected: true
+  tracing: true
+find-process-mode: "off"
+
+sniffer:
+  enable: true
+  force-dns-mapping: true
+  sniff:
+    HTTP:
+      ports: [80]
+      override-destination: true
+    TLS:
+      ports: [443]
+    QUIC:
+      ports: [443]
+
+proxy-providers:
+  subscription:
+    type: http
+    url: ""
+    path: ./proxy-providers/subscription.yaml
+    interval: 0
+    header:
+      User-Agent:
+        - "Mihomo"
+    health-check:
+      enable: false
+      url: http://www.msftncsi.com/ncsi.txt
+      interval: 3000
+
+proxies: []
+
+dns:
+  enable: true
+  listen: 0.0.0.0:7874
+  ipv6: false
+  cache-algorithm: arc
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  default-nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+    - 208.67.222.222
+    - 208.67.220.220
+  nameserver:
+    - https://dns10.quad9.net/dns-query
+    - https://dns.aa.net.uk/dns-query
+    - https://doh.opendns.com/dns-query
+    - tls://dns.quad9.net
+    - tls://1.1.1.1
+    - tls://dns.opendns.com
+  nameserver-policy:
+    '+.supercell.net': 'https://dns.google/dns-query'
+    '+.brawlestarsgame.com': 'https://dns.google/dns-query'
+  fake-ip-filter-mode: blacklist
+  fake-ip-filter:
+    - '*.lan'
+    - '*.local'
+    - +.pool.ntp.org
+    - +.msftconnecttest.com
+    - +.3gppnetwork.org
+
+proxy-groups:
+
+  - name: 'Gemini'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/331406/gemini.svg"
+
+  - name: 'Spotify'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/349511/spotify.svg"
+
+  - name: 'Discord'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/331368/discord-v2.svg"
+
+  - name: 'Whatsapp'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/452213/whatsapp-1.svg"
+
+  - name: 'Netflix'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/303341/netflix-1-logo.svg"
+
+  - name: 'Fastly'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/353730/fastly.svg"
+
+  - name: 'Viber'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/125448/viber.svg"
+
+  - name: 'Notion'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/361558/notion-logo.svg"
+
+  - name: '2IP.IO'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/415672/address-location-map.svg"
+
+  - name: 'Twitter'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/452121/twitter-1.svg"
+
+  - name: 'Apple'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/501448/apple.svg"
+
+  - name: 'Instagram'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/452229/instagram-1.svg"
+
+  - name: '18+'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/530357/peach.svg"
+
+  - name: 'Google'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/475656/google-color.svg"
+
+  - name: 'Google Play'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/353828/google-play-icon.svg"
+
+  - name: 'Twitch'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/448251/twitch.svg"
+
+  - name: 'TikTok'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/349530/tiktok.svg"
+
+  - name: 'Microsoft'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/452062/microsoft.svg"
+
+  - name: 'GitHub'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/344880/github.svg"
+
+  - name: 'Tidal'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/504993/tidal.svg"
+
+  - name: 'Roblox'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/443377/brand-roblox.svg"
+
+  - name: 'Telegram'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/354443/telegram.svg"
+
+  - name: 'Speedtest'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/355484/speed.svg"
+
+  - name: 'Linkedin'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/448234/linkedin.svg"
+
+  - name: 'Facebook'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/475647/facebook-color.svg"
+
+  - name: 'Oculus'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/293111/maps-and-flags-global.svg"
+
+  - name: 'RU traffic'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/508628/flag-ru.svg"
+
+  - name: 'Other traffic'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/293111/maps-and-flags-global.svg"
+
+  # Per-IP PROXY policies (SRC-IP → PROXY). Pick VPS here in Proxy tab.
+  # DIRECT policies use builtin DIRECT (no group — no VPS picker).
+  - name: 'PROXY'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/448244/proxy.svg"
+
+  - name: 'Adblock'
+    type: select
+    # Default REJECT drops matched ads; DIRECT allows temporary bypass.
+    proxies:
+      - REJECT
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/300290/sign-roadblock.svg"
+
+  - name: 'YouTube'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/13671/youtube.svg"
+
+  - name: 'OpenAI'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/306500/openai.svg"
+
+  - name: 'Steam'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/452107/steam.svg"
+
+  - name: 'intel'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/349412/intel.svg"
+
+  - name: GLOBAL
+    type: select
+    hidden: true
+    proxies:
+      - 'YouTube'
+      - 'Google'
+      - 'Google Play'
+      - 'Steam'
+      - 'Microsoft'
+      - 'GitHub'
+      - 'Gemini'
+      - 'Instagram'
+      - 'Linkedin'
+      - 'Facebook'
+      - 'Oculus'
+      - '18+'
+      - 'Apple'
+      - 'Telegram'
+      - 'Roblox'
+      - 'Fastly'
+      - 'Viber'
+      - 'Twitter'
+      - 'intel'
+      - 'Notion'
+      - 'TikTok'
+      - 'Speedtest'
+      - 'Discord'
+      - 'Twitch'
+      - 'Whatsapp'
+      - 'Netflix'
+      - 'Spotify'
+      - 'OpenAI'
+      - 'Tidal'
+      - 'RU traffic'
+      - 'Adblock'
+      - 'PROXY'
+      - 'Other traffic'
+      - DIRECT
+
+geox-url:
+  geosite: "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat"
+  geoip: "https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geoip.dat"
+
+rule-providers:
+  hagezi_pro:
+    type: http
+    behavior: domain
+    format: mrs
+    url: https://github.com/zxc-rv/ad-filter/releases/latest/download/adlist.mrs
+    path: ./adblock/adlist.mrs
+    interval: 86400
+
+  discord:
+    type: inline
+    behavior: classical
+    format: text
+    payload:
+      - AND,((DOMAIN-KEYWORD,discord),(NOT,((DOMAIN-SUFFIX,ru))))
+      - AND,((IP-CIDR,34.0.192.0/18,no-resolve),(NETWORK,UDP),(DST-PORT,50000-50100))
+      - AND,((IP-CIDR,35.192.0.0/11,no-resolve),(NETWORK,UDP),(DST-PORT,50000-50100))
+      - AND,((IP-CIDR,66.22.192.0/18,no-resolve),(NETWORK,UDP),(DST-PORT,50000-50100))
+
+rules:
+  - GEOSITE,category-ads-all,Adblock
+  - RULE-SET,hagezi_pro,Adblock
+  - GEOIP,private,DIRECT,no-resolve
+  - GEOSITE,category-ru,RU traffic
+  - DOMAIN-SUFFIX,ru,RU traffic
+  - DOMAIN-SUFFIX,by,RU traffic
+  - DOMAIN-SUFFIX,xn--p1ai,RU traffic
+  - GEOSITE,category-gov-ru,RU traffic
+  - GEOIP,RU,RU traffic,no-resolve
+  - OR,((DOMAIN-SUFFIX,gql.twitch.tv),(DOMAIN-SUFFIX,usher.ttvnw.net)),Twitch
+  - GEOSITE,openai,OpenAI
+  - RULE-SET,discord,Discord
+  - GEOSITE,tidal,Tidal
+  - GEOSITE,linkedin,Linkedin
+  - GEOSITE,facebook,Facebook
+  - GEOSITE,netflix,Netflix
+  - GEOIP,netflix,Netflix
+  - GEOSITE,spotify,Spotify
+  - GEOSITE,speedtest,Speedtest
+  - GEOSITE,ookla-speedtest,Speedtest
+  - GEOSITE,category-speedtest,Speedtest
+  - GEOSITE,instagram,Instagram
+  - GEOSITE,steam,Steam
+  - GEOSITE,apple,Apple
+  - GEOSITE,youtube,YouTube
+  - GEOSITE,twitter,Twitter
+  - GEOSITE,tiktok,TikTok
+  - GEOSITE,intel,intel
+  - GEOSITE,notion,Notion
+  - GEOSITE,google,Google
+  - GEOSITE,google-play,Google Play
+  - GEOSITE,google-gemini,Gemini
+  - GEOSITE,github,GitHub
+  - GEOSITE,microsoft,Microsoft
+  - GEOSITE,telegram,Telegram
+  - GEOIP,telegram,Telegram
+  - GEOIP,fastly,Fastly
+  - AND,((IP-ASN,22697),(DST-PORT,49152-65535)),Roblox
+  - DOMAIN-SUFFIX,roblox.com,Roblox
+  - DOMAIN-SUFFIX,rbxcdn.com,Roblox
+  - DOMAIN-SUFFIX,rbxinfra.net,Roblox
+  - GEOSITE,viber,Viber
+  - GEOSITE,whatsapp,Whatsapp
+  - IP-ASN,32934,Whatsapp
+  - IP-ASN,11917,Whatsapp
+  - IP-ASN,9002,Whatsapp
+  - GEOSITE,supercell,Other traffic
+  - DOMAIN-KEYWORD,supercell,Other traffic
+  - DOMAIN-SUFFIX,2ip.io,2IP.IO
+  - GEOSITE,category-porn,18+
+  - MATCH,Other traffic

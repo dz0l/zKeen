@@ -279,6 +279,9 @@ const translations: Translations = {
     "settings.resetConfigExport": "Сначала скачать текущий config.yaml на ПК?",
     "settings.resetConfigDone": "Config сброшен, Mihomo перезапущен",
     "settings.resetConfigError": "Не удалось сбросить config",
+    "settings.restart": "Перезапуск",
+    "settings.restartService": "Перезапуск сервиса XKeen",
+    "settings.restartConfirm": "Перезапустить {name}?",
 
     // Mock banner
     "mock.banner": "UI-прототип · данные демонстрационные · функционал не подключён",
@@ -323,6 +326,9 @@ const translations: Translations = {
     "api.invalidTimezone": "Неверный часовой пояс",
     "api.pingUrlEmpty": "URL пинг-теста не может быть пустым",
     "api.pingTimeoutInvalid": "Таймаут пинг-теста должен быть больше 0",
+    "api.defaultTemplateEmpty":
+      "Шаблон config пуст. Обновите zkeen-ui или положите mihomo-config.default.yaml в /opt/etc/mihomo/",
+    "api.panelInitMissing": "Не найден init-скрипт панели S99zkeen-ui",
 
     // Proxies API
     "proxies.loadError": "Не удалось загрузить proxy-группы",
@@ -635,6 +641,9 @@ const translations: Translations = {
     "settings.resetConfigExport": "Download the current config.yaml to your PC first?",
     "settings.resetConfigDone": "Config reset, Mihomo restarted",
     "settings.resetConfigError": "Failed to reset config",
+    "settings.restart": "Restart",
+    "settings.restartService": "Restart XKeen service",
+    "settings.restartConfirm": "Restart {name}?",
 
     // Mock banner
     "mock.banner": "UI prototype · demo data · functionality not connected",
@@ -676,6 +685,9 @@ const translations: Translations = {
     "api.invalidTimezone": "Invalid timezone",
     "api.pingUrlEmpty": "Ping test URL cannot be empty",
     "api.pingTimeoutInvalid": "Ping test timeout must be greater than 0",
+    "api.defaultTemplateEmpty":
+      "Default config template is empty. Update zkeen-ui or place mihomo-config.default.yaml in /opt/etc/mihomo/",
+    "api.panelInitMissing": "Panel init script S99zkeen-ui not found",
     "proxies.loadError": "Failed to load proxy groups",
     "proxies.mihomoOffline": "Mihomo Clash API (port 9090) is not reachable. Core is stopped or another core is active.",
     "proxies.startMihomo": "Start mihomo",

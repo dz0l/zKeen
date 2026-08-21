@@ -442,8 +442,22 @@ fn truncate_validation_error(raw: &str) -> String {
 const DEFAULT_MIHOMO_CONFIG: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/mihomo-config.default.yaml"));
 
+/// On-router copy of the pristine template (install.sh / updates). Used if embed is empty.
+const ROUTER_DEFAULT_TEMPLATE: &str = "/opt/etc/mihomo/mihomo-config.default.yaml";
+
 fn is_zkeen_ready_config(content: &str) -> bool {
     content.contains("external-controller:") && content.contains("proxy-groups:")
+}
+
+async fn load_default_mihomo_template() -> Result<String, String> {
+    if is_zkeen_ready_config(DEFAULT_MIHOMO_CONFIG) {
+        return Ok(DEFAULT_MIHOMO_CONFIG.to_string());
+    }
+    match tokio::fs::read_to_string(ROUTER_DEFAULT_TEMPLATE).await {
+        Ok(content) if is_zkeen_ready_config(&content) => Ok(content),
+        Ok(_) => Err("default_template_invalid".into()),
+        Err(_) => Err("default_template_empty".into()),
+    }
 }
 
 fn parse_yaml_inline_value(raw: &str) -> Option<String> {
@@ -567,8 +581,18 @@ pub async fn bootstrap_mihomo_config(
 
     let preserved_url = existing.as_deref().and_then(extract_subscription_url);
     let preserved_hwid = existing.as_deref().and_then(extract_subscription_hwid);
+    let template = match load_default_mihomo_template().await {
+        Ok(t) => t,
+        Err(code) => {
+            return Json(ApiResponse::<BootstrapData> {
+                success: false,
+                error: Some(code),
+                data: None,
+            });
+        }
+    };
     let content = inject_subscription_defaults(
-        DEFAULT_MIHOMO_CONFIG.to_string(),
+        template,
         preserved_url.as_deref(),
         preserved_hwid.as_deref(),
     );
@@ -589,10 +613,10 @@ pub async fn bootstrap_mihomo_config(
         let _ = tokio::fs::create_dir_all(parent.join("adblock")).await;
     }
 
-    if content.trim().is_empty() {
+    if !is_zkeen_ready_config(&content) {
         return Json(ApiResponse::<BootstrapData> {
             success: false,
-            error: Some("Default config template is empty".into()),
+            error: Some("default_template_empty".into()),
             data: None,
         });
     }

@@ -708,6 +708,15 @@ install_mihomo_config() {
         && grep -q 'external-controller:' "$MIHOMO_CONFIG" \
         && grep -q 'proxy-groups:' "$MIHOMO_CONFIG"; then
         log_info "Mihomo config OK: ${MIHOMO_CONFIG}"
+        # Refresh pristine template for Reset Config when missing/outdated.
+        if [ ! -s "${MIHOMO_DIR}/mihomo-config.default.yaml" ]; then
+            _tmp_cfg="/opt/tmp/mihomo-config.default.$$"
+            if curl_fetch "$DEFAULT_CONFIG_URL" "$_tmp_cfg" && [ -s "$_tmp_cfg" ]; then
+                cp -f "$_tmp_cfg" "${MIHOMO_DIR}/mihomo-config.default.yaml"
+                log_info "Template saved: ${MIHOMO_DIR}/mihomo-config.default.yaml"
+            fi
+            rm -f "$_tmp_cfg"
+        fi
         return 0
     fi
 
@@ -754,11 +763,14 @@ install_mihomo_config() {
         ' "$_tmp_cfg" > "${MIHOMO_CONFIG}.new.$$"
         mv -f "${MIHOMO_CONFIG}.new.$$" "$MIHOMO_CONFIG"
     else
-        mv -f "$_tmp_cfg" "$MIHOMO_CONFIG"
+        cp -f "$_tmp_cfg" "$MIHOMO_CONFIG"
     fi
+    # Keep pristine template for panel «Reset Config» (not the live config.yaml).
+    cp -f "$_tmp_cfg" "${MIHOMO_DIR}/mihomo-config.default.yaml"
     rm -f "$_tmp_cfg"
 
     log_info "Default config installed: ${MIHOMO_CONFIG}"
+    log_info "Template saved: ${MIHOMO_DIR}/mihomo-config.default.yaml"
     return 0
 }
 

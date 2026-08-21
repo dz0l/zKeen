@@ -361,6 +361,36 @@ pub async fn post_control(State(state): State<AppState>, Json(req): Json<Control
                 });
             }
         }
+        "restartPanel" => {
+            if !Path::new(S99ZKEEN_UI).exists() {
+                return Json(ApiResponse {
+                    success: false,
+                    error: Some("panel_init_missing".into()),
+                    data: None,
+                });
+            }
+            if let Err(e) = Command::new(S99ZKEEN_UI)
+                .arg("restart")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                return Json(ApiResponse {
+                    success: false,
+                    error: Some(format!("restart_failed:panel:{e}")),
+                    data: None,
+                });
+            }
+        }
+        "restartXkeen" => {
+            if let Err(e) = run_init_command(&state, &["restart", "on"]).await {
+                return Json(ApiResponse {
+                    success: false,
+                    error: Some(e),
+                    data: None,
+                });
+            }
+        }
         _ => {
             return Json(ApiResponse {
                 success: false,

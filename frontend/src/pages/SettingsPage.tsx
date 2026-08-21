@@ -1,9 +1,9 @@
-import { useState, useEffect } from "react";
-import { Card, CardHeader, Input, Select, Button, Badge } from "../components/ui";
+import { useState } from "react";
+import { Card, CardHeader, Select, Button, Badge } from "../components/ui";
 import { useI18n, useT, AVAILABLE_LOCALES } from "../lib/i18n";
 import { useApp } from "../lib/store";
 import { useSession, type VersionEntry, type VersionInfo } from "../lib/session";
-import { apiJson, ApiError, type ClashConnection } from "../lib/api";
+import { apiJson, ApiError } from "../lib/api";
 import { displayApiError, useApiError } from "../lib/errors";
 import {
   applyMihomoConfigChanges,
@@ -22,29 +22,30 @@ function displayLatest(entry?: VersionEntry): string {
   return stripV(entry.latest || entry.version);
 }
 
+function IconRestart({ className = "" }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+      <path
+        d="M21 12a9 9 0 1 1-2.6-6.2M21 3v6h-6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
   const t = useT();
   const { mode } = useApp();
   const { locale, setLocale } = useI18n();
   const apiErr = useApiError();
   const { clash, setClash, versions, setVersions, logout, loginInfo, refreshSession } = useSession();
-  const [draft, setDraft] = useState<ClashConnection>(clash);
-  const [saved, setSaved] = useState(false);
   const [checking, setChecking] = useState(false);
   const [checkError, setCheckError] = useState("");
   const [updating, setUpdating] = useState("");
+  const [restarting, setRestarting] = useState("");
   const [resetting, setResetting] = useState(false);
   const [resetMsg, setResetMsg] = useState("");
-
-  useEffect(() => {
-    setDraft(clash);
-  }, [clash]);
-
-  function saveClash() {
-    setClash(draft);
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
-  }
 
   async function checkUpdates() {
     setChecking(true);
@@ -87,6 +88,25 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
       setCheckError(apiErr(err, "settings.updateError"));
     } finally {
       setUpdating("");
+    }
+  }
+
+  async function runRestart(action: string, key: string) {
+    if (mode === "safe" && !window.confirm(t("settings.restartConfirm", { name: key }))) return;
+    setRestarting(key);
+    setCheckError("");
+    try {
+      await apiJson("/api/control", {
+        method: "POST",
+        body: JSON.stringify({ action, core: "mihomo" }),
+      });
+      if (action !== "restartPanel") {
+        await refreshSession();
+      }
+    } catch (err) {
+      setCheckError(apiErr(err, "status.actionError"));
+    } finally {
+      setRestarting("");
     }
   }
 
@@ -134,6 +154,7 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
   const ui = versions?.["zkeen-ui"];
   const mihomo = versions?.mihomo;
   const xray = versions?.xray;
+  const xrayInstalled = Boolean(xray?.version && stripV(xray.version) !== "—");
 
   return (
     <div className={embedded ? "space-y-4" : "page-enter space-y-4"}>
@@ -166,41 +187,6 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
           </div>
         </Card>
       )}
-
-      <Card>
-        <CardHeader title={t("settings.clashApi")} subtitle={t("settings.clashApiSub")} />
-        <div className="grid gap-3 p-4 sm:grid-cols-2 sm:p-5">
-          <Input
-            label="Port"
-            placeholder="9090"
-            mono
-            value={draft.port}
-            onChange={(v) => setDraft((d) => ({ ...d, port: v, unix: "" }))}
-          />
-          <Input
-            label="Unix socket"
-            placeholder="controller.sock"
-            mono
-            value={draft.unix}
-            onChange={(v) => setDraft((d) => ({ ...d, unix: v, port: v ? "" : d.port || "9090" }))}
-            hint={t("settings.unixHint")}
-          />
-          <div className="sm:col-span-2">
-            <Input
-              label="Secret"
-              type="password"
-              placeholder="••••••••"
-              value={draft.secret}
-              onChange={(v) => setDraft((d) => ({ ...d, secret: v }))}
-            />
-          </div>
-          <div className="sm:col-span-2 flex items-center gap-3">
-            <Button size="sm" variant="primary" onClick={saveClash}>
-              {saved ? t("settings.saved") : t("settings.saveClash")}
-            </Button>
-          </div>
-        </div>
-      </Card>
 
       {mode === "expert" && (
         <Card>
@@ -246,7 +232,9 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
               latest={displayLatest(ui)}
               outdated={!!ui?.outdated || (stripV(ui?.version) !== displayLatest(ui) && displayLatest(ui) !== "—")}
               updating={updating === "self"}
+              restarting={restarting === "zkeen-ui"}
               onUpdate={() => void runUpdate("self", displayLatest(ui))}
+              onRestart={() => void runRestart("restartPanel", "zkeen-ui")}
             />
             <UpdateRow
               name="mihomo"
@@ -257,18 +245,32 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
                 (stripV(mihomo?.version) !== displayLatest(mihomo) && displayLatest(mihomo) !== "—")
               }
               updating={updating === "mihomo"}
+              restarting={restarting === "mihomo"}
               onUpdate={() => void runUpdate("mihomo", displayLatest(mihomo))}
+              onRestart={() => void runRestart("hardRestart", "mihomo")}
             />
             <UpdateRow
-              name="xray"
-              version={stripV(xray?.version)}
-              latest={displayLatest(xray)}
-              outdated={
-                !!xray?.outdated || (stripV(xray?.version) !== displayLatest(xray) && displayLatest(xray) !== "—")
-              }
-              updating={updating === "xray"}
-              onUpdate={() => void runUpdate("xray", displayLatest(xray))}
+              name="xkeen"
+              version="—"
+              latest="—"
+              outdated={false}
+              restartOnly
+              restarting={restarting === "xkeen"}
+              onRestart={() => void runRestart("restartXkeen", "xkeen")}
             />
+            {xrayInstalled && (
+              <UpdateRow
+                name="xray"
+                version={stripV(xray?.version)}
+                latest={displayLatest(xray)}
+                outdated={
+                  !!xray?.outdated ||
+                  (stripV(xray?.version) !== displayLatest(xray) && displayLatest(xray) !== "—")
+                }
+                updating={updating === "xray"}
+                onUpdate={() => void runUpdate("xray", displayLatest(xray))}
+              />
+            )}
           </div>
         </div>
       </Card>
@@ -282,17 +284,23 @@ function UpdateRow({
   latest,
   outdated,
   updating,
+  restarting,
+  restartOnly,
   onUpdate,
+  onRestart,
 }: {
   name: string;
   version: string;
   latest: string;
   outdated: boolean;
   updating?: boolean;
+  restarting?: boolean;
+  restartOnly?: boolean;
   onUpdate?: () => void;
+  onRestart?: () => void;
 }) {
   const t = useT();
-  const hasUpdate = outdated && version !== "—" && latest !== "—" && version !== latest;
+  const hasUpdate = !restartOnly && outdated && version !== "—" && latest !== "—" && version !== latest;
   return (
     <div className="flex items-center justify-between gap-3 rounded-xl border border-zk-border-soft bg-zk-bg-elevated/60 px-4 py-3">
       <div className="min-w-0">
@@ -300,20 +308,44 @@ function UpdateRow({
           <span className="text-sm font-semibold">{name}</span>
           {hasUpdate && <Badge variant="success">{t("settings.updateAvailable")}</Badge>}
         </div>
-        <p className="mt-0.5 text-xs text-zk-muted">
-          {t("settings.installed")}: <span className="font-mono">{version}</span>
-          {" · "}
-          {t("settings.latest")}: <span className="font-mono">{latest}</span>
-        </p>
+        {!restartOnly && (
+          <p className="mt-0.5 text-xs text-zk-muted">
+            {t("settings.installed")}: <span className="font-mono">{version}</span>
+            {" · "}
+            {t("settings.latest")}: <span className="font-mono">{latest}</span>
+          </p>
+        )}
+        {restartOnly && (
+          <p className="mt-0.5 text-xs text-zk-muted">{t("settings.restartService")}</p>
+        )}
       </div>
-      <Button
-        size="sm"
-        variant={hasUpdate ? "primary" : "ghost"}
-        disabled={!hasUpdate || updating}
-        onClick={onUpdate}
-      >
-        {updating ? t("app.loading") : hasUpdate ? t("settings.update") : t("settings.upToDate")}
-      </Button>
+      <div className="flex shrink-0 items-center gap-1.5">
+        {onRestart && (
+          <button
+            type="button"
+            title={t("settings.restart")}
+            disabled={!!restarting || !!updating}
+            onClick={onRestart}
+            className="rounded-lg border border-zk-border-soft p-2 text-zk-muted transition-colors hover:border-zk-accent/40 hover:text-zk-accent disabled:opacity-40"
+          >
+            {restarting ? (
+              <span className="block h-4 w-4 animate-pulse rounded-full bg-zk-dim" />
+            ) : (
+              <IconRestart className="h-4 w-4" />
+            )}
+          </button>
+        )}
+        {!restartOnly && (
+          <Button
+            size="sm"
+            variant={hasUpdate ? "primary" : "ghost"}
+            disabled={!hasUpdate || updating}
+            onClick={onUpdate}
+          >
+            {updating ? t("app.loading") : hasUpdate ? t("settings.update") : t("settings.upToDate")}
+          </Button>
+        )}
+      </div>
     </div>
   );
 }
