@@ -7,12 +7,12 @@ import { GroupsPoliciesPage } from "./GroupsPoliciesPage";
 
 type HubTab = "main" | "quick" | "groups" | "policies" | "editor";
 
-const TABS: { id: HubTab; labelKey: string }[] = [
+const TABS: { id: HubTab; labelKey: string; expertOnly?: boolean }[] = [
   { id: "main", labelKey: "hub.tabMain" },
   { id: "quick", labelKey: "hub.tabQuick" },
-  { id: "groups", labelKey: "hub.tabGroups" },
-  { id: "policies", labelKey: "hub.tabPolicies" },
-  { id: "editor", labelKey: "hub.tabEditor" },
+  { id: "groups", labelKey: "hub.tabGroups", expertOnly: true },
+  { id: "policies", labelKey: "hub.tabPolicies", expertOnly: true },
+  { id: "editor", labelKey: "hub.tabEditor", expertOnly: true },
 ];
 
 export function ConfigHubPage() {
@@ -21,7 +21,9 @@ export function ConfigHubPage() {
   const [tab, setTab] = useState<HubTab>(mode === "safe" ? "quick" : "main");
 
   useEffect(() => {
-    if (mode === "safe" && tab === "editor") setTab("quick");
+    if (mode === "safe" && (tab === "editor" || tab === "groups" || tab === "policies")) {
+      setTab("quick");
+    }
   }, [mode, tab]);
 
   return (
@@ -33,7 +35,7 @@ export function ConfigHubPage() {
 
       <div className="flex flex-wrap gap-1 rounded-xl border border-zk-border-soft bg-zk-bg-elevated p-1">
         {TABS.map((item) => {
-          if (mode === "safe" && item.id === "editor") return null;
+          if (mode === "safe" && item.expertOnly) return null;
           return (
             <button
               key={item.id}

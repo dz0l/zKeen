@@ -127,6 +127,49 @@ export function listUserProxyGroups(yaml: string): ProxyGroupConfig[] {
   return parseProxyGroups(yaml).filter((g) => !HIDDEN_GROUP_NAMES.has(g.name) && !g.hidden);
 }
 
+/** Group names in config.yaml order (including hidden). */
+export function proxyGroupNamesInOrder(yaml: string): string[] {
+  return parseProxyGroups(yaml).map((g) => g.name);
+}
+
+/** Ensure PROXY select group exists (per-IP PROXY policies). DIRECT uses builtin outbound. */
+export function ensurePolicyGroups(yaml: string): string {
+  const names = new Set(parseProxyGroups(yaml).map((g) => g.name));
+  if (names.has("PROXY")) return yaml;
+  return upsertProxyGroup(yaml, {
+    name: "PROXY",
+    type: "select",
+    use: ["subscription"],
+    proxies: ["DIRECT"],
+    icon: "https://www.svgrepo.com/show/448244/proxy.svg",
+  });
+}
+
+/** Replace all SRC-IP /32 IP-CIDR policies with the given list (yaml order: policies first). */
+export function replaceIpPolicies(
+  yaml: string,
+  policies: { ip: string; target: string }[],
+): string {
+  const range = findSectionRange(yaml, "rules");
+  const existing = range
+    ? yaml
+        .slice(range.start, range.end)
+        .split("\n")
+        .filter((l) => /^\s+- /.test(l))
+    : [];
+
+  const kept = existing.filter((l) => {
+    const raw = l.replace(/^\s+- /, "").trim();
+    if (raw.startsWith("SRC-IP,")) return false;
+    if (/^IP-CIDR,[^,]+\/32,/.test(raw)) return false;
+    return true;
+  });
+
+  const lines = policies.map((p) => `  - SRC-IP,${p.ip},${p.target}`);
+  const content = [...lines, ...kept].join("\n") + (lines.length || kept.length ? "\n" : "");
+  return replaceSection(yaml, "rules", content);
+}
+
 export function parseRules(yaml: string): ParsedRule[] {
   const range = findSectionRange(yaml, "rules");
   if (!range) return [];

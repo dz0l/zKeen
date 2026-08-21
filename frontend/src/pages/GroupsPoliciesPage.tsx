@@ -11,21 +11,22 @@ import {
   saveMihomoConfig,
 } from "../lib/config";
 import {
-  addIpPolicy,
   buildRuleLine,
   defaultNewGroup,
   deleteProxyGroup,
+  ensurePolicyGroups,
   listUserProxyGroups,
   parseIpPolicies,
-  removeIpPolicy,
+  replaceIpPolicies,
   rulesForGroup,
   setGroupRules,
   upsertProxyGroup,
-  type IpPolicy,
   type ProxyGroupConfig,
 } from "../lib/mihomoYaml";
 
 type Tab = "groups" | "policies";
+
+type PolicyDraft = { id: string; ip: string; target: "DIRECT" | "PROXY" };
 
 function GroupIcon({ name, icon }: { name: string; icon?: string }) {
   if (icon) {
@@ -69,7 +70,9 @@ export function GroupsPoliciesPage({
   const [draft, setDraft] = useState<GroupEditDraft | null>(null);
 
   const [policyIp, setPolicyIp] = useState("");
-  const [policyTarget, setPolicyTarget] = useState("DIRECT");
+  const [policyTarget, setPolicyTarget] = useState<"DIRECT" | "PROXY">("DIRECT");
+  const [policyDrafts, setPolicyDrafts] = useState<PolicyDraft[]>([]);
+  const [policiesDirty, setPoliciesDirty] = useState(false);
 
   useEffect(() => {
     if (forceTab) setTab(forceTab);
@@ -85,27 +88,27 @@ export function GroupsPoliciesPage({
       if (!data) throw new Error(t("config.notFound"));
       setYaml(data.content);
       setConfigPath(data.path);
+      const loaded = parseIpPolicies(data.content)
+        .filter((p) => p.target === "DIRECT" || p.target === "PROXY")
+        .map((p) => ({
+          id: p.id,
+          ip: p.ip,
+          target: p.target as "DIRECT" | "PROXY",
+        }));
+      setPolicyDrafts(loaded);
+      setPoliciesDirty(false);
     } catch (err) {
       setError(apiErr(err, "groups.loadError"));
     } finally {
       setLoading(false);
     }
-  }, [t]);
+  }, [t, apiErr]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
   const groups = useMemo(() => listUserProxyGroups(yaml), [yaml]);
-  const policies = useMemo(() => parseIpPolicies(yaml), [yaml]);
-  const targetOptions = useMemo(() => {
-    const opts = [
-      { value: "DIRECT", label: "DIRECT" },
-      { value: "REJECT", label: "REJECT" },
-      ...groups.map((g) => ({ value: g.name, label: g.name })),
-    ];
-    return opts;
-  }, [groups]);
 
   const persist = async (nextYaml: string) => {
     if (mode === "safe" && !window.confirm(t("groups.confirmApply"))) {
@@ -170,23 +173,33 @@ export function GroupsPoliciesPage({
     setDraft(null);
   };
 
-  const handleAddPolicy = async () => {
+  const handleAddPolicyDraft = () => {
     const ip = policyIp.trim();
     if (!ip) return;
     setError("");
-    try {
-      const next = addIpPolicy(yaml, ip, policyTarget);
-      await persist(next);
-      setPolicyIp("");
-    } catch (err) {
-      setError(apiErr(err, "groups.saveError"));
-    }
+    setPolicyDrafts((prev) => {
+      const without = prev.filter((p) => p.ip !== ip);
+      return [...without, { id: `draft:${ip}:${policyTarget}`, ip, target: policyTarget }];
+    });
+    setPoliciesDirty(true);
+    setPolicyIp("");
   };
 
-  const handleRemovePolicy = async (p: IpPolicy) => {
+  const handleRemovePolicyDraft = (id: string) => {
+    setPolicyDrafts((prev) => prev.filter((p) => p.id !== id));
+    setPoliciesDirty(true);
+  };
+
+  const handleApplyPolicies = async () => {
+    setError("");
     try {
-      const next = removeIpPolicy(yaml, p.raw);
+      let next = ensurePolicyGroups(yaml);
+      next = replaceIpPolicies(
+        next,
+        policyDrafts.map((p) => ({ ip: p.ip, target: p.target })),
+      );
       await persist(next);
+      setPoliciesDirty(false);
     } catch (err) {
       setError(apiErr(err, "groups.saveError"));
     }
@@ -231,7 +244,7 @@ export function GroupsPoliciesPage({
               tab === "policies" ? "bg-zk-surface text-zk-text shadow-sm" : "text-zk-muted hover:text-zk-text"
             }`}
           >
-            {t("groups.tabPolicies")} ({policies.length})
+            {t("groups.tabPolicies")} ({policyDrafts.length})
           </button>
         </div>
       )}
@@ -302,18 +315,21 @@ export function GroupsPoliciesPage({
                 hint={t("policies.ipHint")}
               />
               <Select
-                label={t("policies.proxyGroup")}
+                label={t("policies.policyType")}
                 value={policyTarget}
-                onChange={setPolicyTarget}
-                options={targetOptions}
+                onChange={(v) => setPolicyTarget(v as "DIRECT" | "PROXY")}
+                options={[
+                  { value: "DIRECT", label: "DIRECT" },
+                  { value: "PROXY", label: "PROXY" },
+                ]}
               />
               <Button
                 size="md"
-                variant="primary"
-                disabled={saving || !policyIp.trim()}
-                onClick={() => void handleAddPolicy()}
+                variant="secondary"
+                disabled={!policyIp.trim()}
+                onClick={handleAddPolicyDraft}
               >
-                {saving ? t("app.loading") : t("policies.add")}
+                {t("policies.add")}
               </Button>
             </div>
           </Card>
@@ -321,13 +337,23 @@ export function GroupsPoliciesPage({
           <Card className="overflow-hidden">
             <CardHeader
               title={t("policies.activeTitle")}
-              subtitle={t("policies.rules", { count: policies.length })}
+              subtitle={t("policies.rules", { count: policyDrafts.length })}
+              action={
+                <Button
+                  size="sm"
+                  variant="primary"
+                  disabled={saving || !policiesDirty}
+                  onClick={() => void handleApplyPolicies()}
+                >
+                  {saving ? t("app.loading") : t("policies.apply")}
+                </Button>
+              }
             />
             <div className="divide-y divide-zk-border-soft">
-              {policies.length === 0 ? (
+              {policyDrafts.length === 0 ? (
                 <p className="px-4 py-8 text-center text-sm text-zk-dim sm:px-5">{t("policies.empty")}</p>
               ) : (
-                policies.map((p) => (
+                policyDrafts.map((p) => (
                   <div key={p.id} className="flex items-center gap-3 px-4 py-2.5 sm:px-5">
                     <div className="min-w-0 flex-1">
                       <p className="font-mono text-sm">{p.ip}</p>
@@ -339,7 +365,7 @@ export function GroupsPoliciesPage({
                       size="sm"
                       variant="ghost"
                       disabled={saving}
-                      onClick={() => void handleRemovePolicy(p)}
+                      onClick={() => handleRemovePolicyDraft(p.id)}
                     >
                       {t("groups.delete")}
                     </Button>
@@ -347,6 +373,11 @@ export function GroupsPoliciesPage({
                 ))
               )}
             </div>
+            {policiesDirty && (
+              <p className="border-t border-zk-border-soft px-4 py-2 text-[11px] text-zk-amber sm:px-5">
+                {t("policies.dirtyHint")}
+              </p>
+            )}
           </Card>
         </>
       )}

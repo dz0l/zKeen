@@ -25,12 +25,14 @@ import {
   delaysFromProvider,
   filterGroupMembers,
   isBuiltinSpecialNode,
+  isBulkSkipGroup,
   isUserProxyGroup,
   parseGroupIcons,
   type ClashDelayResponse,
   type ClashProvidersResponse,
   type ClashProxiesResponse,
 } from "../lib/clash";
+import { proxyGroupNamesInOrder } from "../lib/mihomoYaml";
 
 type PageTab = "groups" | "provider";
 
@@ -60,17 +62,26 @@ function delayColor(ms: number) {
   return "text-zk-coral";
 }
 
-function mapGroups(data: ClashProxiesResponse, icons: Record<string, string>): ProxyGroup[] {
+function mapGroups(
+  data: ClashProxiesResponse,
+  icons: Record<string, string>,
+  yamlOrder: string[],
+): ProxyGroup[] {
   const { groupNames } = buildProxyNameSets(data);
-  return Object.values(data.proxies)
+  const groups = Object.values(data.proxies)
     .filter(isUserProxyGroup)
     .map((g) => ({
       name: g.name,
       type: g.type,
       icon: icons[g.name],
       nodes: filterGroupMembers(g.all, groupNames).map((name) => ({ name })),
-    }))
-    .sort((a, b) => a.name.localeCompare(b.name));
+    }));
+
+  if (yamlOrder.length) {
+    const idx = new Map(yamlOrder.map((n, i) => [n, i]));
+    return groups.sort((a, b) => (idx.get(a.name) ?? 9999) - (idx.get(b.name) ?? 9999));
+  }
+  return groups;
 }
 
 function selectedMap(data: ClashProxiesResponse): Record<string, string> {
@@ -135,6 +146,7 @@ export function ProxiesPage() {
         fetchMihomoConfig().catch(() => null),
       ]);
       const icons = config ? parseGroupIcons(config.content) : {};
+      const yamlOrder = config ? proxyGroupNamesInOrder(config.content) : [];
       if (config) {
         setCoreMode(getTopLevelScalar(config.content, "mode") || "rule");
       }
@@ -152,7 +164,7 @@ export function ProxiesPage() {
         setServerNames(fallback);
         setProviderEmpty(true);
       }
-      setGroups(mapGroups(data, icons));
+      setGroups(mapGroups(data, icons, yamlOrder));
       setSelected(selectedMap(data));
     } catch (err) {
       if (isClashConnectionError(err)) {
@@ -197,7 +209,9 @@ export function ProxiesPage() {
       setError("");
       const conn = clashRef.current;
       try {
-        const targets = groups.filter((g) => g.nodes.some((n) => n.name === server));
+        const targets = groups.filter(
+          (g) => !isBulkSkipGroup(g.name) && g.nodes.some((n) => n.name === server),
+        );
         if (!targets.length) {
           throw new ApiError(400, t("proxies.noGroupsForServer"));
         }

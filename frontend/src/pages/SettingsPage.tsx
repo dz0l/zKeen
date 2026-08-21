@@ -1,9 +1,15 @@
 import { useState, useEffect } from "react";
 import { Card, CardHeader, Input, Select, Button, Badge } from "../components/ui";
 import { useI18n, useT, AVAILABLE_LOCALES } from "../lib/i18n";
+import { useApp } from "../lib/store";
 import { useSession, type VersionEntry, type VersionInfo } from "../lib/session";
 import { apiJson, type ClashConnection } from "../lib/api";
 import { displayApiError, useApiError } from "../lib/errors";
+import {
+  applyMihomoConfigChanges,
+  ensureZkeenMihomoConfig,
+  fetchMihomoConfig,
+} from "../lib/config";
 
 function stripV(v?: string): string {
   if (!v) return "—";
@@ -17,14 +23,17 @@ function displayLatest(entry?: VersionEntry): string {
 
 export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
   const t = useT();
+  const { mode } = useApp();
   const { locale, setLocale } = useI18n();
   const apiErr = useApiError();
-  const { clash, setClash, versions, setVersions, logout, loginInfo } = useSession();
+  const { clash, setClash, versions, setVersions, logout, loginInfo, refreshSession } = useSession();
   const [draft, setDraft] = useState<ClashConnection>(clash);
   const [saved, setSaved] = useState(false);
   const [checking, setChecking] = useState(false);
   const [checkError, setCheckError] = useState("");
   const [updating, setUpdating] = useState("");
+  const [resetting, setResetting] = useState(false);
+  const [resetMsg, setResetMsg] = useState("");
 
   useEffect(() => {
     setDraft(clash);
@@ -77,6 +86,43 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
       setCheckError(apiErr(err, "settings.updateError"));
     } finally {
       setUpdating("");
+    }
+  }
+
+  async function resetConfig() {
+    setResetMsg("");
+    setCheckError("");
+    if (!window.confirm(t("settings.resetConfigConfirm"))) return;
+
+    try {
+      const current = await fetchMihomoConfig();
+      if (current?.content) {
+        const wantExport = window.confirm(t("settings.resetConfigExport"));
+        if (wantExport) {
+          const blob = new Blob([current.content], { type: "text/yaml" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = "config.yaml";
+          a.click();
+          URL.revokeObjectURL(url);
+        }
+      }
+    } catch {
+      /* export optional */
+    }
+
+    setResetting(true);
+    try {
+      await ensureZkeenMihomoConfig(true);
+      const conn = await applyMihomoConfigChanges(clash, { hardRestart: true });
+      setClash(conn);
+      await refreshSession();
+      setResetMsg(t("settings.resetConfigDone"));
+    } catch (err) {
+      setCheckError(apiErr(err, "settings.resetConfigError"));
+    } finally {
+      setResetting(false);
     }
   }
 
@@ -150,6 +196,27 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
           </div>
         </div>
       </Card>
+
+      {mode === "expert" && (
+        <Card>
+          <CardHeader title={t("settings.resetConfig")} subtitle={t("settings.resetConfigSub")} />
+          <div className="space-y-3 p-4 sm:p-5">
+            {resetMsg && (
+              <p className="rounded-lg border border-zk-accent/25 bg-zk-accent/10 px-3 py-2 text-xs text-zk-accent">
+                {resetMsg}
+              </p>
+            )}
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={resetting}
+              onClick={() => void resetConfig()}
+            >
+              {resetting ? t("app.loading") : t("settings.resetConfig")}
+            </Button>
+          </div>
+        </Card>
+      )}
 
       <Card>
         <CardHeader

@@ -166,9 +166,9 @@ export function GroupEditModal({
 
           <div className="space-y-2 rounded-xl border border-zk-border-soft p-3">
             <p className="text-sm font-semibold">{t("groups.rulesTitle")}</p>
-            <p className="text-[11px] text-zk-muted">{t("groups.rulesSub")}</p>
-            <div className="grid gap-2 sm:grid-cols-[1fr_1.2fr_auto]">
+            <div className="grid gap-2 sm:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)_auto]">
               <Select
+                compact
                 label={t("groups.ruleType")}
                 value={ruleType}
                 onChange={setRuleType}

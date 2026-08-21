@@ -175,6 +175,7 @@ export function Select({
   onChange,
   inline = false,
   className = "",
+  compact = false,
 }: {
   label: string;
   options: { value: string; label: string }[];
@@ -183,18 +184,22 @@ export function Select({
   /** Label and select on one row. */
   inline?: boolean;
   className?: string;
+  /** Smaller label/control for dense forms. */
+  compact?: boolean;
 }) {
   return (
     <label className={`block ${inline ? "flex min-w-0 items-center gap-3" : ""} ${className}`}>
       <span
-        className={`shrink-0 text-xs font-medium text-zk-muted ${inline ? "whitespace-nowrap" : "mb-1.5 block"}`}
+        className={`shrink-0 font-medium text-zk-muted ${compact ? "text-[10px]" : "text-xs"} ${inline ? "whitespace-nowrap" : "mb-1.5 block"}`}
       >
         {label}
       </span>
       <select
         value={value}
         onChange={(e) => onChange?.(e.target.value)}
-        className={`${inline ? "min-w-0 flex-1" : "w-full"} appearance-none rounded-xl border border-zk-border-soft bg-zk-bg-elevated px-3.5 py-2 text-sm text-zk-text outline-none focus:border-zk-accent/50`}
+        className={`${inline ? "min-w-0 flex-1" : "w-full"} appearance-none rounded-xl border border-zk-border-soft bg-zk-bg-elevated text-zk-text outline-none focus:border-zk-accent/50 ${
+          compact ? "px-2 py-1.5 text-[11px]" : "px-3.5 py-2 text-sm"
+        }`}
       >
         {options.map((o) => (
           <option key={o.value} value={o.value}>

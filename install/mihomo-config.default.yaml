@@ -109,7 +109,7 @@ proxy-groups:
       - subscription
     proxies:
       - DIRECT
-    icon: "https://www.svgrepo.com/show/349511/spotify.svg"
+    icon: "https://www.svgrepo.com/show/452213/whatsapp-1.svg"
 
   - name: 'Netflix'
     type: select
@@ -303,6 +303,16 @@ proxy-groups:
       - DIRECT
     icon: "https://www.svgrepo.com/show/293111/maps-and-flags-global.svg"
 
+  # Per-IP PROXY policies (SRC-IP → PROXY). Pick VPS here in Proxy tab.
+  # DIRECT policies use builtin DIRECT (no group — no VPS picker).
+  - name: 'PROXY'
+    type: select
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+    icon: "https://www.svgrepo.com/show/448244/proxy.svg"
+
   - name: 'Adblock'
     type: select
     # Default REJECT drops matched ads; DIRECT allows temporary bypass.
@@ -378,6 +388,7 @@ proxy-groups:
       - 'Tidal'
       - 'RU traffic'
       - 'Adblock'
+      - 'PROXY'
       - 'Other traffic'
       - DIRECT
 
@@ -405,7 +416,6 @@ rule-providers:
       - AND,((IP-CIDR,66.22.192.0/18,no-resolve),(NETWORK,UDP),(DST-PORT,50000-50100))
 
 rules:
-  # Ads → Adblock (default outbound REJECT)
   - GEOSITE,category-ads-all,Adblock
   - RULE-SET,hagezi_pro,Adblock
   - GEOIP,private,DIRECT,no-resolve

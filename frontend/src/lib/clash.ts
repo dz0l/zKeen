@@ -191,11 +191,18 @@ export function collectBulkServerOptions(data: ClashProxiesResponse): string[] {
 
 export function filterGroupMembers(all: string[] | undefined, groupNames: Set<string>): string[] {
   return (all ?? []).filter((name) => {
-    if (name === "DIRECT") return true;
+    if (name === "DIRECT" || name === "REJECT") return true;
     if (groupNames.has(name)) return false;
     if (isBuiltinSpecialNode(name)) return false;
     return true;
   });
+}
+
+/** Groups skipped by "All to" / bulk select (policy + adblock). */
+export const BULK_SKIP_GROUPS = new Set(["PROXY", "DIRECT", "Adblock"]);
+
+export function isBulkSkipGroup(name: string): boolean {
+  return BULK_SKIP_GROUPS.has(name);
 }
 
 export function parseGroupIcons(yaml: string): Record<string, string> {
