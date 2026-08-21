@@ -913,6 +913,9 @@ main() {
 
     printf "\n${GREEN}${BOLD}  Done!${NC}\n"
     printf "  Panel: ${CYAN}http://${IP_ADDR}:${PORT}${NC}\n\n"
+    log_warn "Не забудьте добавить политику XKeen в веб-интерфейсе роутера"
+    log_warn "(маршрутизация / политики), иначе трафик не пойдёт через Mihomo."
+    printf "\n"
 }
 
 main

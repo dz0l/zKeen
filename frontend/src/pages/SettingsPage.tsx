@@ -3,12 +3,13 @@ import { Card, CardHeader, Input, Select, Button, Badge } from "../components/ui
 import { useI18n, useT, AVAILABLE_LOCALES } from "../lib/i18n";
 import { useApp } from "../lib/store";
 import { useSession, type VersionEntry, type VersionInfo } from "../lib/session";
-import { apiJson, type ClashConnection } from "../lib/api";
+import { apiJson, ApiError, type ClashConnection } from "../lib/api";
 import { displayApiError, useApiError } from "../lib/errors";
 import {
   applyMihomoConfigChanges,
   ensureZkeenMihomoConfig,
   fetchMihomoConfig,
+  isZkeenReadyConfig,
 } from "../lib/config";
 
 function stripV(v?: string): string {
@@ -115,6 +116,10 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
     setResetting(true);
     try {
       await ensureZkeenMihomoConfig(true);
+      const loaded = await fetchMihomoConfig();
+      if (!loaded?.content || !isZkeenReadyConfig(loaded.content)) {
+        throw new ApiError(500, t("settings.resetConfigError"));
+      }
       const conn = await applyMihomoConfigChanges(clash, { hardRestart: true });
       setClash(conn);
       await refreshSession();

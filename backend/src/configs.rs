@@ -509,6 +509,7 @@ fn extract_subscription_hwid(content: &str) -> Option<String> {
 fn inject_subscription_defaults(mut content: String, url: Option<&str>, hwid: Option<&str>) -> String {
     if let Some(url) = url.filter(|s| !s.is_empty()) {
         content = content.replacen("url: \"\"", &format!("url: \"{url}\""), 1);
+        content = content.replacen("enable: false\n      url: http://www.msftncsi.com", "enable: true\n      url: http://www.msftncsi.com", 1);
     }
     if let Some(hwid) = hwid.filter(|s| !s.is_empty()) {
         content = content.replace(
@@ -588,12 +589,48 @@ pub async fn bootstrap_mihomo_config(
         let _ = tokio::fs::create_dir_all(parent.join("adblock")).await;
     }
 
-    if let Err(e) = tokio::fs::write(&path, &content).await {
+    if content.trim().is_empty() {
+        return Json(ApiResponse::<BootstrapData> {
+            success: false,
+            error: Some("Default config template is empty".into()),
+            data: None,
+        });
+    }
+
+    let tmp = format!("{path}.zkeen-new");
+    if let Err(e) = tokio::fs::write(&tmp, &content).await {
         return Json(ApiResponse::<BootstrapData> {
             success: false,
             error: Some(format!("Write error: {e}")),
             data: None,
         });
+    }
+    if let Err(e) = tokio::fs::rename(&tmp, &path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Json(ApiResponse::<BootstrapData> {
+            success: false,
+            error: Some(format!("Replace error: {e}")),
+            data: None,
+        });
+    }
+
+    // Confirm the new file is on disk before reporting success.
+    match tokio::fs::read_to_string(&path).await {
+        Ok(written) if is_zkeen_ready_config(&written) => {}
+        Ok(_) => {
+            return Json(ApiResponse::<BootstrapData> {
+                success: false,
+                error: Some("Config was written but looks invalid".into()),
+                data: None,
+            });
+        }
+        Err(e) => {
+            return Json(ApiResponse::<BootstrapData> {
+                success: false,
+                error: Some(format!("Verify error: {e}")),
+                data: None,
+            });
+        }
     }
 
     log("INFO", format!("Installed zKeen Mihomo config template: {path}"));

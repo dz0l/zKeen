@@ -41,7 +41,7 @@ proxy-providers:
       User-Agent:
         - "Mihomo"
     health-check:
-      enable: true
+      enable: false
       url: http://www.msftncsi.com/ncsi.txt
       interval: 3000
 

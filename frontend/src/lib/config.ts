@@ -192,22 +192,26 @@ export async function applyMihomoConfigChanges(
   clash: ClashConnection,
   opts?: { hardRestart?: boolean },
 ): Promise<ClashConnection> {
-  const conn = await ensureMihomoRunning(clash);
+  const conn = await resolveClashConnection(clash);
   if (opts?.hardRestart) {
+    // Prefer hard restart after template replace — don't start on a stale/missing config first.
     await apiJson("/api/control", {
       method: "POST",
       body: JSON.stringify({ action: "hardRestart", core: "mihomo" }),
     });
     await waitForClashApi(conn, 40, 500);
   } else {
+    const running = await ensureMihomoRunning(clash);
     try {
-      await reloadClashConfig(conn);
+      await reloadClashConfig(running);
     } catch {
       await reloadMihomoCore();
-      await waitForClashApi(conn);
+      await waitForClashApi(running);
     }
   }
-  await refreshProxyProvider(DEFAULT_PROVIDER, conn);
+  await refreshProxyProvider(DEFAULT_PROVIDER, conn).catch(() => {
+    /* empty subscription URL or provider not ready — core may still be fine */
+  });
   return conn;
 }
 

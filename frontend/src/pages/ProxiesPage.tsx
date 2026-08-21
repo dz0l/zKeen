@@ -426,9 +426,6 @@ export function ProxiesPage() {
       <div className="flex items-end justify-between gap-3">
         <div>
           <h1 className="text-xl font-bold tracking-tight sm:text-2xl">{t("proxies.title")}</h1>
-          <p className="mt-1 text-sm text-zk-muted">
-            {t("proxies.subtitle", { count: groups.length })}
-          </p>
         </div>
         <Button size="sm" variant="ghost" onClick={loadProxies} disabled={!!busy || refreshing}>
           ⟳
