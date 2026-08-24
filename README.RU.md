@@ -69,8 +69,7 @@ zkeen -v
 
 ## Скриншоты
 
-*в процессе*
-
+![Меню zKeen UI](screenshots/zkeenmenu.gif)
 
 
 ## Обновление

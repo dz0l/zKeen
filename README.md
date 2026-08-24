@@ -68,7 +68,8 @@ for testers:
 
 
 ## Screenshots
-*in progress*
+
+![zKeen UI menu](screenshots/zkeenmenu.gif)
 
 
 ## Update
