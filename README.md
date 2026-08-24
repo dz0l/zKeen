@@ -56,7 +56,7 @@ Check:
 
 ```sh
 cat /opt/etc/xkeen/zkeen-ui.channel   # beta | stable
-zkeen-ui -v
+zkeen -v
 ```
 
 for testers:
@@ -87,7 +87,7 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/dz0l/zKeen/main/install.sh
 
 ```sh
 /opt/etc/init.d/S99zkeen-ui stop
-rm -f /opt/sbin/zkeen-ui /opt/etc/init.d/S99zkeen-ui
+rm -f /opt/sbin/zkeen-ui /opt/sbin/zkeen /opt/etc/init.d/S99zkeen-ui
 rm -f /opt/etc/xkeen/zkeen-ui.json
 rm -f /opt/etc/xkeen/zkeen-ui.channel
 ```
@@ -97,8 +97,10 @@ Does not remove Mihomo configs (`/opt/etc/mihomo`) or XKeen.
 ## Commands
 
 ```sh
-zkeen-ui -v                 # version
-zkeen-ui -p 8080            # port (default 7220)
+zkeen -v                 # version
+zkeen -p 8080            # port (default 7220)
+zkeen status             # service status
+zkeen ?                  # help (same as -h / --help)
 /opt/etc/init.d/S99zkeen-ui start|stop|restart|status
-zkeen-ui reset-password     # reset panel password
+zkeen reset-password     # reset panel password
 ```

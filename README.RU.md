@@ -56,7 +56,7 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/dz0l/zKeen/main/install.sh
 
 ```sh
 cat /opt/etc/xkeen/zkeen-ui.channel   # beta | stable
-zkeen-ui -v
+zkeen -v
 ```
 
 для тестеров:
@@ -89,7 +89,7 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/dz0l/zKeen/main/install.sh
 
 ```sh
 /opt/etc/init.d/S99zkeen-ui stop
-rm -f /opt/sbin/zkeen-ui /opt/etc/init.d/S99zkeen-ui
+rm -f /opt/sbin/zkeen-ui /opt/sbin/zkeen /opt/etc/init.d/S99zkeen-ui
 rm -f /opt/etc/xkeen/zkeen-ui.json
 rm -f /opt/etc/xkeen/zkeen-ui.channel
 ```
@@ -99,8 +99,10 @@ rm -f /opt/etc/xkeen/zkeen-ui.channel
 ## Команды
 
 ```sh
-zkeen-ui -v                 # версия
-zkeen-ui -p 8080            # порт (по умолчанию 7220)
+zkeen -v                 # версия
+zkeen -p 8080            # порт (по умолчанию 7220)
+zkeen status             # статус сервиса
+zkeen ?                  # справка (как -h / --help)
 /opt/etc/init.d/S99zkeen-ui start|stop|restart|status
-zkeen-ui reset-password     # сброс пароля панели
+zkeen reset-password     # сброс пароля панели
 ```
