@@ -1,0 +1,48 @@
+# === Local working files ===
+.local/
+refs/
+
+# === Dependencies ===
+node_modules/
+target/
+
+# === Builds ===
+frontend/dist/
+backend/frontend-dist/
+dist/
+*.tar.gz
+
+# === Configs ===
+*.local.md
+.env
+.env.*
+*.pem
+*.key
+credentials.*
+
+# === IDE ===
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# === OS ===
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# === Rust build ===
+backend/target/
+**/*.rs.bk
+Cargo.lock
+
+# === Logs ===
+*.log
+logs/
+
+# === Temporary ===
+*.tmp
+*.bak
+*.orig

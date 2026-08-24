@@ -1,0 +1,98 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install & build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+
+  build-backend:
+    needs: build-frontend
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-musl
+            asset_name: zkeen-ui-arm64-v8a
+            toolchain: stable
+          - target: mipsel-unknown-linux-musl
+            asset_name: zkeen-ui-mips32le
+            toolchain: nightly
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: Stage frontend for rust-embed
+        run: rm -rf backend/frontend-dist && cp -r frontend/dist backend/frontend-dist
+
+      - name: Stage Mihomo default config
+        run: mkdir -p backend/assets && cp install/mihomo-config.default.yaml backend/assets/
+
+      - name: Build release binary
+        working-directory: backend
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Prepare asset
+        run: |
+          cp backend/target/${{ matrix.target }}/release/zkeen-ui ${{ matrix.asset_name }}
+          chmod +x ${{ matrix.asset_name }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+
+  release:
+    needs: build-backend
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/zkeen-ui-arm64-v8a/zkeen-ui-arm64-v8a
+            artifacts/zkeen-ui-mips32le/zkeen-ui-mips32le
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') || contains(github.ref_name, '-alpha') }}

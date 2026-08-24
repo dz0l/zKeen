@@ -1,0 +1,670 @@
+use crate::logger::log;
+use crate::types::*;
+use axum::extract::{Query, State};
+use axum::response::{IntoResponse, Json};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+
+#[derive(Serialize)]
+struct ConfigItem {
+    file: String,
+    content: String,
+}
+#[derive(Deserialize)]
+pub struct ConfigReq {
+    file: String,
+    content: String,
+}
+#[derive(Deserialize)]
+pub struct DeleteReq {
+    file: String,
+}
+#[derive(Deserialize)]
+pub struct RenameReq {
+    file: String,
+    new_file: String,
+}
+
+async fn collect_configs(paths: &[String], is_mihomo: bool) -> Vec<ConfigItem> {
+    let mut results = Vec::new();
+    for path_str in paths {
+        let path = Path::new(path_str);
+        if path.is_dir() {
+            match tokio::fs::read_dir(path).await {
+                Err(e) => {
+                    log("ERROR", format!("Не удалось открыть директорию {}: {}", path_str, e));
+                }
+                Ok(mut entries) => {
+                    while let Ok(Some(entry)) = entries.next_entry().await {
+                        let entry_path = entry.path();
+                        let matches = if is_mihomo {
+                            entry_path.extension().map_or(false, |e| e == "yaml" || e == "yml")
+                        } else {
+                            entry_path.extension().map_or(false, |e| e == "json")
+                        };
+                        if matches {
+                            match tokio::fs::read_to_string(&entry_path).await {
+                                Ok(content) => results.push(ConfigItem {
+                                    file: entry_path.to_string_lossy().into(),
+                                    content,
+                                }),
+                                Err(e) => {
+                                    log(
+                                        "ERROR",
+                                        format!("Не удалось прочитать файл {}: {}", entry_path.display(), e),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if path.exists() {
+            match tokio::fs::read_to_string(path).await {
+                Ok(content) => results.push(ConfigItem {
+                    file: path_str.clone(),
+                    content,
+                }),
+                Err(e) => {
+                    log("ERROR", format!("Не удалось прочитать файл {}: {}", path_str, e));
+                }
+            }
+        } else {
+            log("WARN", format!("Файл не найден: {}", path_str));
+        }
+    }
+    results.sort_by(|a, b| a.file.cmp(&b.file));
+    results.dedup_by(|a, b| a.file == b.file);
+    results
+}
+
+pub async fn get_configs(
+    State(state): State<AppState>, Query(parameters): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let target_core = parameters
+        .get("core")
+        .cloned()
+        .unwrap_or_else(|| state.core.read().unwrap().name.clone());
+    let is_mihomo = target_core == "mihomo";
+
+    let core_paths = {
+        let settings = state.settings.read().unwrap();
+        let default_path = if is_mihomo {
+            MIHOMO_CONF_DIR.to_string()
+        } else {
+            XRAY_CONF_DIR.to_string()
+        };
+        let mut paths = vec![default_path];
+        let extra = if is_mihomo {
+            settings.append_config_paths.mihomo.clone()
+        } else {
+            settings.append_config_paths.xray.clone()
+        };
+        paths.extend(extra);
+        paths
+    };
+
+    let mut core_configs = collect_configs(&core_paths, is_mihomo).await;
+    let mut lst_configs = Vec::new();
+
+    if let Ok(mut entries) = tokio::fs::read_dir(XKEEN_CONF_DIR).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if path.extension().map_or(false, |e| e == "lst") || name == "xkeen.json" {
+                if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                    lst_configs.push(ConfigItem {
+                        file: path.to_string_lossy().into(),
+                        content,
+                    });
+                }
+            }
+        }
+    }
+
+    lst_configs.sort_by(|a, b| a.file.cmp(&b.file));
+    core_configs.append(&mut lst_configs);
+
+    Json(serde_json::json!({ "success": true, "configs": core_configs }))
+}
+
+fn all_write_prefixes(state: &AppState) -> Vec<String> {
+    let settings = state.settings.read().unwrap();
+    let mut paths = vec![
+        MIHOMO_CONF_DIR.to_string(),
+        XRAY_CONF_DIR.to_string(),
+        XKEEN_CONF_DIR.to_string(),
+    ];
+    paths.extend(settings.append_config_paths.mihomo.clone());
+    paths.extend(settings.append_config_paths.xray.clone());
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn is_path_allowed(file: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|prefix| {
+        let prefix_path = Path::new(prefix.as_str());
+        let file_path = Path::new(file);
+        if prefix_path.is_dir() {
+            file_path.starts_with(prefix_path)
+        } else {
+            file == prefix
+        }
+    })
+}
+
+fn check_access(file: &str, state: &AppState) -> Result<bool, &'static str> {
+    if file.contains("..") {
+        return Err("Invalid path");
+    }
+    let prefixes = all_write_prefixes(state);
+    if !is_path_allowed(file, &prefixes) {
+        return Err("Path not allowed");
+    }
+    Ok(file.ends_with(".lst"))
+}
+
+pub async fn put_config(
+    State(state): State<AppState>, Query(params): Query<HashMap<String, String>>, Json(req): Json<ConfigReq>,
+) -> impl IntoResponse {
+    let is_lst = match check_access(&req.file, &state) {
+        Ok(val) => val,
+        Err(e) => {
+            return Json(ApiResponse::<()> {
+                success: false,
+                error: Some(e.into()),
+                data: None,
+            });
+        }
+    };
+    let content = if is_lst {
+        req.content.replace("\r\n", "\n")
+    } else {
+        req.content
+    };
+
+    if let Some(core_type) = params.get("validate") {
+        let mut validate_files = Vec::new();
+        if core_type == "mihomo" {
+            validate_files.push(ConfigReq {
+                file: req.file.clone(),
+                content: content.clone(),
+            });
+        } else if core_type == "xray" {
+            if let Ok(mut entries) = tokio::fs::read_dir(XRAY_CONF_DIR).await {
+                let mut found_current = false;
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |e| e == "json") {
+                        let path_str = path.to_string_lossy().into_owned();
+                        let file_content = if path_str == req.file {
+                            found_current = true;
+                            content.clone()
+                        } else {
+                            tokio::fs::read_to_string(&path).await.unwrap_or_default()
+                        };
+                        validate_files.push(ConfigReq {
+                            file: path_str,
+                            content: file_content,
+                        });
+                    }
+                }
+                if !found_current {
+                    validate_files.push(ConfigReq {
+                        file: req.file.clone(),
+                        content: content.clone(),
+                    });
+                }
+            } else {
+                validate_files.push(ConfigReq {
+                    file: req.file.clone(),
+                    content: content.clone(),
+                });
+            }
+        }
+
+        if let Err(err_msg) = validate_core(core_type, &validate_files).await {
+            log("ERROR", err_msg.clone());
+            let detail = truncate_validation_error(&err_msg);
+            return Json(ApiResponse::<()> {
+                success: false,
+                error: Some(if detail.is_empty() {
+                    "Validation failed".into()
+                } else {
+                    format!("Validation failed: {detail}")
+                }),
+                data: None,
+            });
+        }
+    }
+
+    if fs::write(&req.file, &content).is_err() {
+        return Json(ApiResponse::<()> {
+            success: false,
+            error: Some("Write error".into()),
+            data: None,
+        });
+    }
+    Json(ApiResponse::<()> {
+        success: true,
+        error: None,
+        data: None,
+    })
+}
+
+pub async fn post_config(State(state): State<AppState>, Json(req): Json<ConfigReq>) -> impl IntoResponse {
+    let is_lst = match check_access(&req.file, &state) {
+        Ok(val) => val,
+        Err(e) => {
+            return Json(ApiResponse::<()> {
+                success: false,
+                error: Some(e.into()),
+                data: None,
+            });
+        }
+    };
+    if Path::new(&req.file).exists() {
+        return Json(ApiResponse::<()> {
+            success: false,
+            error: Some("File already exists".into()),
+            data: None,
+        });
+    }
+    let content = if is_lst {
+        req.content.replace("\r\n", "\n")
+    } else {
+        req.content
+    };
+    if fs::write(&req.file, content).is_err() {
+        return Json(ApiResponse::<()> {
+            success: false,
+            error: Some("Write error".into()),
+            data: None,
+        });
+    }
+    Json(ApiResponse::<()> {
+        success: true,
+        error: None,
+        data: None,
+    })
+}
+
+pub async fn delete_config(State(state): State<AppState>, Json(req): Json<DeleteReq>) -> impl IntoResponse {
+    if let Err(e) = check_access(&req.file, &state) {
+        return Json(ApiResponse::<()> {
+            success: false,
+            error: Some(e.into()),
+            data: None,
+        });
+    }
+    if fs::remove_file(&req.file).is_err() {
+        return Json(ApiResponse::<()> {
+            success: false,
+            error: Some("Delete error".into()),
+            data: None,
+        });
+    }
+    Json(ApiResponse::<()> {
+        success: true,
+        error: None,
+        data: None,
+    })
+}
+
+pub async fn patch_config(State(state): State<AppState>, Json(req): Json<RenameReq>) -> impl IntoResponse {
+    if let Err(e) = check_access(&req.file, &state) {
+        return Json(ApiResponse::<()> {
+            success: false,
+            error: Some(e.into()),
+            data: None,
+        });
+    }
+    if let Err(e) = check_access(&req.new_file, &state) {
+        return Json(ApiResponse::<()> {
+            success: false,
+            error: Some(e.into()),
+            data: None,
+        });
+    }
+    if Path::new(&req.new_file).exists() {
+        return Json(ApiResponse::<()> {
+            success: false,
+            error: Some("File already exists".into()),
+            data: None,
+        });
+    }
+    if fs::rename(&req.file, &req.new_file).is_err() {
+        return Json(ApiResponse::<()> {
+            success: false,
+            error: Some("Rename error".into()),
+            data: None,
+        });
+    }
+    Json(ApiResponse::<()> {
+        success: true,
+        error: None,
+        data: None,
+    })
+}
+
+async fn validate_core(core: &str, files: &[ConfigReq]) -> Result<(), String> {
+    if core == "mihomo" {
+        let content = files
+            .iter()
+            .find(|f| {
+                f.file.ends_with(".yaml")
+                    || f.file.ends_with(".yml")
+                    || f.file.ends_with("config.yaml")
+            })
+            .map(|f| f.content.as_str())
+            .unwrap_or(&files[0].content);
+
+        let validate_path = Path::new(MIHOMO_CONF_DIR).join(".zkeen-validate.yaml");
+        tokio::fs::create_dir_all(MIHOMO_CONF_DIR)
+            .await
+            .map_err(|e| e.to_string())?;
+        tokio::fs::write(&validate_path, content)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let mut cmd = tokio::process::Command::new("mihomo");
+        cmd.args(["-t", "-f"]).arg(&validate_path);
+        cmd.env("CLASH_HOME_DIR", MIHOMO_CONF_DIR);
+
+        let output = cmd.output().await;
+        _ = tokio::fs::remove_file(&validate_path).await;
+
+        let output = output.map_err(|e| e.to_string())?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        return Err(combined);
+    }
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "xkeen-validate-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    ));
+    tokio::fs::create_dir_all(&temp_dir).await.map_err(|e| e.to_string())?;
+
+    for item in files {
+        let Some(name) = Path::new(&item.file).file_name() else {
+            continue;
+        };
+        if let Err(e) = tokio::fs::write(temp_dir.join(name), &item.content).await {
+            _ = tokio::fs::remove_dir_all(&temp_dir).await;
+            return Err(e.to_string());
+        }
+    }
+
+    let mut cmd = tokio::process::Command::new("xray");
+    cmd.args(["-test", "-confdir"]).arg(&temp_dir);
+    cmd.env("XRAY_LOCATION_ASSET", XRAY_ASSET_DIR);
+
+    let output = cmd.output().await;
+    _ = tokio::fs::remove_dir_all(&temp_dir).await;
+
+    let output = output.map_err(|e| e.to_string())?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    Err(combined)
+}
+
+fn truncate_validation_error(raw: &str) -> String {
+    let lines: Vec<&str> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let tail: Vec<&str> = lines.iter().copied().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect();
+    let summary = tail.join(" · ");
+    if summary.len() > 240 {
+        summary.chars().rev().take(240).collect::<String>().chars().rev().collect()
+    } else {
+        summary
+    }
+}
+
+const DEFAULT_MIHOMO_CONFIG: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/mihomo-config.default.yaml"));
+
+/// On-router copy of the pristine template (install.sh / updates). Used if embed is empty.
+const ROUTER_DEFAULT_TEMPLATE: &str = "/opt/etc/mihomo/mihomo-config.default.yaml";
+
+fn is_zkeen_ready_config(content: &str) -> bool {
+    content.contains("external-controller:") && content.contains("proxy-groups:")
+}
+
+async fn load_default_mihomo_template() -> Result<String, String> {
+    if is_zkeen_ready_config(DEFAULT_MIHOMO_CONFIG) {
+        return Ok(DEFAULT_MIHOMO_CONFIG.to_string());
+    }
+    match tokio::fs::read_to_string(ROUTER_DEFAULT_TEMPLATE).await {
+        Ok(content) if is_zkeen_ready_config(&content) => Ok(content),
+        Ok(_) => Err("default_template_invalid".into()),
+        Err(_) => Err("default_template_empty".into()),
+    }
+}
+
+fn parse_yaml_inline_value(raw: &str) -> Option<String> {
+    let value = raw.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn extract_subscription_fields(content: &str) -> (Option<String>, Option<String>) {
+    let mut in_subscription = false;
+    let mut url = None;
+    let mut hwid = None;
+    let mut in_hwid = false;
+
+    for line in content.lines() {
+        if line.starts_with("  subscription:") {
+            in_subscription = true;
+            in_hwid = false;
+            continue;
+        }
+
+        if !in_subscription {
+            continue;
+        }
+
+        if line.starts_with("  ") && !line.starts_with("    ") {
+            let trimmed = line.trim();
+            if trimmed.ends_with(':') && !trimmed.starts_with("subscription:") {
+                break;
+            }
+        }
+
+        if url.is_none() && line.contains("url:") {
+            url = line.split("url:").nth(1).and_then(parse_yaml_inline_value);
+            continue;
+        }
+
+        if line.contains("x-hwid:") {
+            in_hwid = true;
+            continue;
+        }
+
+        if in_hwid && line.trim().starts_with('-') {
+            hwid = parse_yaml_inline_value(line.trim().trim_start_matches('-'));
+            in_hwid = false;
+        }
+    }
+
+    (url, hwid)
+}
+
+fn extract_subscription_url(content: &str) -> Option<String> {
+    extract_subscription_fields(content).0
+}
+
+fn extract_subscription_hwid(content: &str) -> Option<String> {
+    extract_subscription_fields(content).1
+}
+
+fn inject_subscription_defaults(mut content: String, url: Option<&str>, hwid: Option<&str>) -> String {
+    if let Some(url) = url.filter(|s| !s.is_empty()) {
+        content = content.replacen("url: \"\"", &format!("url: \"{url}\""), 1);
+        content = content.replacen("enable: false\n      url: http://www.msftncsi.com", "enable: true\n      url: http://www.msftncsi.com", 1);
+    }
+    if let Some(hwid) = hwid.filter(|s| !s.is_empty()) {
+        content = content.replace(
+            "        - \"Mihomo\"\n    health-check:",
+            &format!(
+                "        - \"zkeen\"\n      x-hwid:\n        - \"{hwid}\"\n    health-check:"
+            ),
+        );
+    }
+    content
+}
+
+#[derive(Deserialize)]
+pub struct BootstrapReq {
+    file: Option<String>,
+    force: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct BootstrapData {
+    bootstrapped: bool,
+    file: String,
+}
+
+pub async fn bootstrap_mihomo_config(
+    State(state): State<AppState>,
+    Json(req): Json<BootstrapReq>,
+) -> impl IntoResponse {
+    let path = req
+        .file
+        .unwrap_or_else(|| format!("{MIHOMO_CONF_DIR}/config.yaml"));
+    let force = req.force.unwrap_or(false);
+
+    if let Err(e) = check_access(&path, &state) {
+        return Json(ApiResponse::<BootstrapData> {
+            success: false,
+            error: Some(e.into()),
+            data: None,
+        });
+    }
+
+    let existing = tokio::fs::read_to_string(&path).await.ok();
+    if let Some(ref content) = existing {
+        if is_zkeen_ready_config(content) && !force {
+            return Json(ApiResponse {
+                success: true,
+                error: None,
+                data: Some(BootstrapData {
+                    bootstrapped: false,
+                    file: path,
+                }),
+            });
+        }
+    }
+
+    let preserved_url = existing.as_deref().and_then(extract_subscription_url);
+    let preserved_hwid = existing.as_deref().and_then(extract_subscription_hwid);
+    let template = match load_default_mihomo_template().await {
+        Ok(t) => t,
+        Err(code) => {
+            return Json(ApiResponse::<BootstrapData> {
+                success: false,
+                error: Some(code),
+                data: None,
+            });
+        }
+    };
+    let content = inject_subscription_defaults(
+        template,
+        preserved_url.as_deref(),
+        preserved_hwid.as_deref(),
+    );
+
+    if let Some(ref old) = existing {
+        let backup = format!(
+            "{path}.bak.{}",
+            chrono::Local::now().format("%Y%m%d%H%M%S")
+        );
+        if tokio::fs::write(&backup, old).await.is_ok() {
+            log("INFO", format!("Backed up Mihomo config: {backup}"));
+        }
+    }
+
+    if let Some(parent) = Path::new(&path).parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+        let _ = tokio::fs::create_dir_all(parent.join("proxy-providers")).await;
+        let _ = tokio::fs::create_dir_all(parent.join("adblock")).await;
+    }
+
+    if !is_zkeen_ready_config(&content) {
+        return Json(ApiResponse::<BootstrapData> {
+            success: false,
+            error: Some("default_template_empty".into()),
+            data: None,
+        });
+    }
+
+    let tmp = format!("{path}.zkeen-new");
+    if let Err(e) = tokio::fs::write(&tmp, &content).await {
+        return Json(ApiResponse::<BootstrapData> {
+            success: false,
+            error: Some(format!("Write error: {e}")),
+            data: None,
+        });
+    }
+    if let Err(e) = tokio::fs::rename(&tmp, &path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Json(ApiResponse::<BootstrapData> {
+            success: false,
+            error: Some(format!("Replace error: {e}")),
+            data: None,
+        });
+    }
+
+    // Confirm the new file is on disk before reporting success.
+    match tokio::fs::read_to_string(&path).await {
+        Ok(written) if is_zkeen_ready_config(&written) => {}
+        Ok(_) => {
+            return Json(ApiResponse::<BootstrapData> {
+                success: false,
+                error: Some("Config was written but looks invalid".into()),
+                data: None,
+            });
+        }
+        Err(e) => {
+            return Json(ApiResponse::<BootstrapData> {
+                success: false,
+                error: Some(format!("Verify error: {e}")),
+                data: None,
+            });
+        }
+    }
+
+    log("INFO", format!("Installed zKeen Mihomo config template: {path}"));
+
+    Json(ApiResponse {
+        success: true,
+        error: None,
+        data: Some(BootstrapData {
+            bootstrapped: true,
+            file: path,
+        }),
+    })
+}
