@@ -327,7 +327,7 @@ get_latest_version() {
 
         pick_beta_tag_from_list "$RELEASE_LIST"
         if [ -z "$LATEST_TAG" ]; then
-            die "No beta/pre-release found. Publish a Pre-release tag (e.g. v0.0.24-beta.1)"
+            die "No beta/pre-release found. Publish a Pre-release tag (e.g. v0.1.0-beta.1)"
         fi
 
         # shellcheck disable=SC2086
