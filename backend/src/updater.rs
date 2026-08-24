@@ -447,6 +447,7 @@ async fn save(dl: DownloadResult, out_path: PathBuf) -> std::io::Result<()> {
 
 /// Remove known install/update leftovers under `/opt/tmp` (and archive copies in `/opt/sbin`).
 /// Does not wipe the whole tmp dir — other tools may store files there.
+/// Never touches `/opt/etc/mihomo/cache.db` (Mihomo `store-selected` for group picks).
 async fn cleanup_opt_tmp() {
     let prefixes = [
         "xkeen.tar",

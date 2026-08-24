@@ -345,7 +345,7 @@ proxy-groups:
     icon: "https://cdn.jsdelivr.net/gh/glincker/thesvg@main/public/icons/adblock/default.svg"
 
   # Per-IP PROXY policies (SRC-IP-CIDR → PROXY). Pick VPS here in Proxy tab.
-  # DIRECT policies use builtin DIRECT (no group — no VPS picker).
+  # DIRECT policies from the panel target STRAIGHT (DIRECT only).
   - name: 'PROXY'
     type: select
     use:
@@ -353,6 +353,12 @@ proxy-groups:
     proxies:
       - DIRECT
     icon: "https://cdn.jsdelivr.net/gh/glincker/thesvg@main/public/icons/azure-api-proxy/default.svg"
+
+  - name: STRAIGHT
+    type: select
+    proxies:
+      - DIRECT
+    icon: "https://cdn.jsdelivr.net/gh/glincker/thesvg@main/public/icons/azure-entra-global-secure-access/default.svg"
 
   - name: GLOBAL
     type: select
@@ -391,6 +397,7 @@ proxy-groups:
       - 'Other traffic'
       - 'Adblock'
       - 'PROXY'
+      - STRAIGHT
       - DIRECT
 
 geox-url:

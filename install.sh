@@ -917,6 +917,7 @@ start_service() {
 }
 
 # Remove install/update leftovers. Keeps unrelated files in /opt/tmp intact.
+# Do NOT delete /opt/etc/mihomo/cache.db — Mihomo store-selected (group server picks) lives there.
 cleanup_tmp() {
     log_step "Cleaning temporary files..."
     # XKeen / Mihomo / zKeen UI download leftovers

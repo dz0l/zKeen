@@ -33,7 +33,7 @@ import {
 type Tab = "groups" | "policies";
 
 const DEFAULT_PROXY_GROUP = "PROXY";
-const DEFAULT_DIRECT_GROUP = "RU traffic";
+const DEFAULT_DIRECT_GROUP = "STRAIGHT";
 
 function GroupIcon({ name, icon }: { name: string; icon?: string }) {
   if (icon) {

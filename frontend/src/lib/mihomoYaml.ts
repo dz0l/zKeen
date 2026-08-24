@@ -132,17 +132,33 @@ export function proxyGroupNamesInOrder(yaml: string): string[] {
   return parseProxyGroups(yaml).map((g) => g.name);
 }
 
-/** Ensure PROXY select group exists (per-IP PROXY policies). DIRECT uses builtin outbound. */
+const PROXY_GROUP_ICON =
+  "https://cdn.jsdelivr.net/gh/glincker/thesvg@main/public/icons/azure-api-proxy/default.svg";
+const STRAIGHT_GROUP_ICON =
+  "https://cdn.jsdelivr.net/gh/glincker/thesvg@main/public/icons/azure-entra-global-secure-access/default.svg";
+
+/** Ensure PROXY + STRAIGHT groups for panel policies (insert before GLOBAL). */
 export function ensurePolicyGroups(yaml: string): string {
-  const names = new Set(parseProxyGroups(yaml).map((g) => g.name));
-  if (names.has("PROXY")) return yaml;
-  return upsertProxyGroup(yaml, {
-    name: "PROXY",
-    type: "select",
-    use: ["subscription"],
-    proxies: ["DIRECT"],
-    icon: "https://www.svgrepo.com/show/448244/proxy.svg",
-  });
+  let next = yaml;
+  const names = () => new Set(parseProxyGroups(next).map((g) => g.name));
+  if (!names().has("PROXY")) {
+    next = upsertProxyGroup(next, {
+      name: "PROXY",
+      type: "select",
+      use: ["subscription"],
+      proxies: ["DIRECT"],
+      icon: PROXY_GROUP_ICON,
+    });
+  }
+  if (!names().has("STRAIGHT")) {
+    next = upsertProxyGroup(next, {
+      name: "STRAIGHT",
+      type: "select",
+      proxies: ["DIRECT"],
+      icon: STRAIGHT_GROUP_ICON,
+    });
+  }
+  return next;
 }
 
 const POLICY_BLOCK_START = "# zkeen:policies";
@@ -191,17 +207,19 @@ function isHostSrcIpPolicy(type: string, payload: string): boolean {
   return !payload.includes("/") || /\/32$/.test(payload);
 }
 
+/** Rule CSV lines must not quote outbound names — Mihomo treats quotes as part of the name. */
+function formatRuleTarget(target: string): string {
+  return target.trim().replace(/,/g, "");
+}
+
 function formatSrcIpPolicyLine(ip: string, target: string): string {
   const host = normalizePolicyIp(ip);
-  const tgt = needsQuote(target) ? `'${target}'` : target;
-  return `  - SRC-IP-CIDR,${host}/32,${tgt}`;
+  return `  - SRC-IP-CIDR,${host}/32,${formatRuleTarget(target)}`;
 }
 
 function formatDomainPolicyLine(domain: string, target: string): string {
   const host = normalizePolicyDomain(domain);
-  const dom = needsQuote(host) ? `'${host}'` : host;
-  const tgt = needsQuote(target) ? `'${target}'` : target;
-  return `  - DOMAIN-SUFFIX,${dom},${tgt}`;
+  return `  - DOMAIN-SUFFIX,${host},${formatRuleTarget(target)}`;
 }
 
 export function formatUserPolicyLine(p: UserPolicy): string {
@@ -434,6 +452,14 @@ export function upsertProxyGroup(yaml: string, group: ProxyGroupConfig): string 
   const idx = groups.findIndex((g) => g.name === group.name);
   if (idx >= 0) {
     groups[idx] = { ...groups[idx], ...group, name: group.name };
+  } else if (group.name === "STRAIGHT") {
+    const proxyIdx = groups.findIndex((g) => g.name === "PROXY");
+    if (proxyIdx >= 0) groups.splice(proxyIdx + 1, 0, group);
+    else {
+      const globalIdx = groups.findIndex((g) => g.name === "GLOBAL");
+      if (globalIdx >= 0) groups.splice(globalIdx, 0, group);
+      else groups.push(group);
+    }
   } else {
     // Insert before GLOBAL if present
     const globalIdx = groups.findIndex((g) => g.name === "GLOBAL");
@@ -446,9 +472,19 @@ export function upsertProxyGroup(yaml: string, group: ProxyGroupConfig): string 
   if (global && group.name !== "GLOBAL") {
     const proxies = [...(global.proxies ?? [])];
     if (!proxies.includes(group.name) && !proxies.includes(`'${group.name}'`)) {
-      const directIdx = proxies.findIndex((p) => p === "DIRECT");
-      if (directIdx >= 0) proxies.splice(directIdx, 0, group.name);
-      else proxies.push(group.name);
+      if (group.name === "STRAIGHT") {
+        const proxyIdx = proxies.findIndex((p) => p === "PROXY" || p === "'PROXY'");
+        if (proxyIdx >= 0) proxies.splice(proxyIdx + 1, 0, group.name);
+        else {
+          const directIdx = proxies.findIndex((p) => p === "DIRECT");
+          if (directIdx >= 0) proxies.splice(directIdx, 0, group.name);
+          else proxies.push(group.name);
+        }
+      } else {
+        const directIdx = proxies.findIndex((p) => p === "DIRECT");
+        if (directIdx >= 0) proxies.splice(directIdx, 0, group.name);
+        else proxies.push(group.name);
+      }
       global.proxies = proxies;
     }
   }
