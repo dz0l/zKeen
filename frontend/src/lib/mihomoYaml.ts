@@ -226,9 +226,9 @@ function parseUserPolicyFromRaw(raw: string): UserPolicy | null {
     return { kind: "ip", value: ip, target };
   }
   if (type === "DOMAIN-SUFFIX") {
-    const domain = (parts[1]?.trim() ?? "").replace(/^['"]|['"]$/g, "");
+    const domain = normalizePolicyDomain((parts[1]?.trim() ?? "").replace(/^['"]|['"]$/g, ""));
     const target = parsePolicyTarget(parts);
-    if (!domain.includes(".") || !target) return null;
+    if (!domain || !target) return null;
     return { kind: "domain", value: domain, target };
   }
   return null;
@@ -289,15 +289,24 @@ export function parseUserPolicies(yaml: string): UserPolicyDraft[] {
   return out;
 }
 
+/** Lines under `rules:` (excludes the `rules:` header itself). */
+function rulesSectionLines(yaml: string): string[] {
+  const range = findSectionRange(yaml, "rules");
+  if (!range) return [];
+  const section = yaml.slice(range.start, range.end);
+  const nl = section.indexOf("\n");
+  if (nl < 0) return [];
+  return section.slice(nl + 1).split("\n");
+}
+
 /** Replace panel-managed policies at the top of rules (marker block). */
 export function replaceUserPolicies(yaml: string, policies: UserPolicy[]): string {
-  const range = findSectionRange(yaml, "rules");
-  const existing = range
-    ? yaml.slice(range.start, range.end).split("\n")
-    : [];
+  const existing = rulesSectionLines(yaml);
 
   let body = stripPolicyMarkerBlock(existing);
   body = stripLegacyIpPolicyRules(body);
+  // Belt-and-suspenders: never re-embed a second `rules:` key inside the section.
+  body = body.filter((line) => !/^rules:\s*(?:#.*)?$/.test(line.trim()));
 
   const unique: UserPolicy[] = [];
   const seen = new Set<string>();
