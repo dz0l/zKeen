@@ -849,6 +849,7 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
             _ = crate::controller::run_init_command(state, &["stop"]).await;
         }
         if let Err(e) = fs::copy(&source, &target).await {
+            log("ERROR", format!("Не удалось скопировать бинарник: {}", e));
             return response(false, Some("install_failed".to_string()));
         }
         _ = fs::remove_file(&source).await;

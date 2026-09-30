@@ -7,11 +7,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Prefix of per-request validation files in MIHOMO_CONF_DIR (hidden from the config list).
 const VALIDATE_FILE_PREFIX: &str = ".zkeen-validate";
-static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+/// AtomicU64 is unavailable on 32-bit MIPS targets.
+static TEMP_SEQ: AtomicU32 = AtomicU32::new(0);
 
 fn unique_suffix() -> String {
     let nanos = std::time::SystemTime::now()
