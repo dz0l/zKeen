@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useApiError } from "./errors";
 import { useT } from "./i18n";
 import {
@@ -18,6 +18,10 @@ export function useMihomoConfig() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [dirty, setDirty] = useState(false);
+  /** Content known to be on disk (last load or successful save). */
+  const [savedYaml, setSavedYaml] = useState("");
+  const yamlRef = useRef(yaml);
+  yamlRef.current = yaml;
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -31,6 +35,7 @@ export function useMihomoConfig() {
       } else {
         setConfigPath(data.path);
         setYaml(data.content);
+        setSavedYaml(data.content);
         setDirty(false);
       }
     } catch (err) {
@@ -49,13 +54,16 @@ export function useMihomoConfig() {
     setDirty(true);
   }, []);
 
+  /** Save exactly `content` (a snapshot taken by the caller); edits made meanwhile stay dirty. */
   const save = useCallback(
-    async (validate: boolean) => {
+    async (content: string, validate: boolean) => {
       if (!configPath) throw new Error("config not found");
-      await saveMihomoConfig(configPath, yaml, validate);
-      setDirty(false);
+      const res = await saveMihomoConfig(configPath, content, validate);
+      setSavedYaml(content);
+      setDirty(yamlRef.current !== content);
+      return res;
     },
-    [configPath, yaml],
+    [configPath],
   );
 
   const subscriptionUrl = getSubscriptionUrl(yaml);
@@ -84,6 +92,7 @@ export function useMihomoConfig() {
     loading,
     error,
     dirty,
+    savedYaml,
     load,
     save,
     subscriptionUrl,

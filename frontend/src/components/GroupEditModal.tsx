@@ -5,9 +5,21 @@ import { useT } from "../lib/i18n";
 import {
   RULE_TYPES,
   buildRuleLine,
+  type GroupRuleDraft,
   type ProxyGroupConfig,
+  type ProxyGroupPatch,
   type ParsedRule,
 } from "../lib/mihomoYaml";
+
+/** Group types that use health-check url/interval. */
+const HEALTH_CHECK_TYPES = new Set(["url-test", "fallback", "load-balance"]);
+
+function splitCsv(csv: string): string[] {
+  return csv
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
 
 const GROUP_TYPES = [
   { value: "select", label: "select" },
@@ -19,7 +31,14 @@ const GROUP_TYPES = [
 
 export interface GroupEditDraft {
   group: ProxyGroupConfig;
-  rules: { type: string; value: string }[];
+  rules: GroupRuleDraft[];
+  isNew: boolean;
+}
+
+/** What the modal hands back: only the fields the user could change. */
+export interface GroupEditResult {
+  patch: ProxyGroupPatch;
+  rules: GroupRuleDraft[];
   isNew: boolean;
 }
 
@@ -34,7 +53,7 @@ export function GroupEditModal({
   open: boolean;
   draft: GroupEditDraft | null;
   onClose: () => void;
-  onSave: (draft: GroupEditDraft) => Promise<void>;
+  onSave: (result: GroupEditResult) => Promise<void>;
   onDelete?: (name: string) => Promise<void>;
   saving: boolean;
 }) {
@@ -42,11 +61,11 @@ export function GroupEditModal({
   const [name, setName] = useState("");
   const [type, setType] = useState("select");
   const [icon, setIcon] = useState("");
-  const [useCsv, setUseCsv] = useState("subscription");
-  const [proxiesCsv, setProxiesCsv] = useState("DIRECT");
+  const [useCsv, setUseCsv] = useState("");
+  const [proxiesCsv, setProxiesCsv] = useState("");
   const [url, setUrl] = useState("");
   const [interval, setInterval] = useState("");
-  const [rules, setRules] = useState<{ type: string; value: string }[]>([]);
+  const [rules, setRules] = useState<GroupRuleDraft[]>([]);
   const [ruleType, setRuleType] = useState("DOMAIN-SUFFIX");
   const [ruleValue, setRuleValue] = useState("");
   const [confirmDel, setConfirmDel] = useState(false);
@@ -57,8 +76,8 @@ export function GroupEditModal({
     setName(draft.group.name);
     setType(draft.group.type || "select");
     setIcon(draft.group.icon || "");
-    setUseCsv((draft.group.use ?? ["subscription"]).join(", "));
-    setProxiesCsv((draft.group.proxies ?? ["DIRECT"]).join(", "));
+    setUseCsv((draft.group.use ?? []).join(", "));
+    setProxiesCsv((draft.group.proxies ?? []).join(", "));
     setUrl(draft.group.url || "");
     setInterval(draft.group.interval != null ? String(draft.group.interval) : "");
     setRules(draft.rules);
@@ -86,23 +105,24 @@ export function GroupEditModal({
       setLocalError(t("groups.nameRequired"));
       return;
     }
-    const group: ProxyGroupConfig = {
+    const healthCheck = HEALTH_CHECK_TYPES.has(type);
+    const intervalNum = interval.trim() ? Number(interval.trim()) : null;
+    if (healthCheck && intervalNum !== null && !Number.isFinite(intervalNum)) {
+      setLocalError(t("groups.intervalInvalid"));
+      return;
+    }
+    const patch: ProxyGroupPatch = {
       name: trimmed,
       type,
-      icon: icon.trim() || undefined,
-      use: useCsv
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean),
-      proxies: proxiesCsv
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean),
-      url: type === "url-test" ? url.trim() || undefined : undefined,
-      interval: type === "url-test" && interval ? Number(interval) : undefined,
+      icon: icon.trim(),
+      use: splitCsv(useCsv),
+      proxies: splitCsv(proxiesCsv),
+      // Hidden inputs must not wipe url/interval of other group types.
+      url: healthCheck ? url.trim() : undefined,
+      interval: healthCheck ? intervalNum : undefined,
     };
     try {
-      await onSave({ group, rules, isNew: draft.isNew });
+      await onSave({ patch, rules, isNew: draft.isNew });
     } catch (e) {
       setLocalError(e instanceof Error ? e.message : t("groups.saveError"));
     }
@@ -156,7 +176,7 @@ export function GroupEditModal({
             placeholder="DIRECT"
             hint={t("groups.proxiesHint")}
           />
-          {type === "url-test" && (
+          {HEALTH_CHECK_TYPES.has(type) && (
             <>
               <Input label="url" value={url} onChange={setUrl} mono />
               <Input label="interval" value={interval} onChange={setInterval} placeholder="300" />
@@ -196,7 +216,7 @@ export function GroupEditModal({
                 rules.map((r, i) => (
                   <li key={`${r.type}-${r.value}-${i}`} className="flex items-center gap-2 py-2">
                     <span className="min-w-0 flex-1 truncate font-mono text-xs">
-                      {buildRuleLine(r.type, r.value, name.trim() || draft.group.name)}
+                      {r.raw ?? buildRuleLine(r.type, r.value, name.trim() || draft.group.name)}
                     </span>
                     <button
                       type="button"
@@ -248,8 +268,8 @@ function trimmedSubtitle(draft: GroupEditDraft): string {
   return draft.isNew ? draft.group.name || "…" : draft.group.name;
 }
 
-export function rulesToDraft(rules: ParsedRule[]): { type: string; value: string }[] {
+export function rulesToDraft(rules: ParsedRule[]): GroupRuleDraft[] {
   return rules
     .filter((r) => r.type && r.type !== "COMPLEX" && r.type !== "MATCH")
-    .map((r) => ({ type: r.type, value: r.payload }));
+    .map((r) => ({ type: r.type, value: r.payload, raw: r.raw }));
 }

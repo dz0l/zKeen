@@ -1,4 +1,5 @@
 import { ApiError, apiJson, clashJson, parseClashFromYaml, saveClashConnection, type ApiResponse, type ClashConnection } from "./api";
+import { withSelectionSnapshots } from "./opJournal";
 
 export interface ControlInfo {
   cores: string[];
@@ -104,16 +105,26 @@ function normalizeMihomoConfigPath(path: string): string {
   return path;
 }
 
+/** Atomic save (server keeps one `<file>.zkeen.bak`); `validate` runs `mihomo -t` on this exact content first. */
 export async function saveMihomoConfig(
   path: string,
   content: string,
   validate = false,
-): Promise<void> {
+): Promise<{ backup?: string }> {
   const file = normalizeMihomoConfigPath(path);
   const query = validate ? "?validate=mihomo" : "";
-  await apiJson(`/api/configs${query}`, {
+  const res = await apiJson<{ backup?: string }>(`/api/configs${query}`, {
     method: "PUT",
     body: JSON.stringify({ file, content }),
+  });
+  return { backup: res.backup };
+}
+
+/** Read-only check with the core: the working file is not touched. */
+export async function validateMihomoConfig(path: string, content: string): Promise<void> {
+  await apiJson("/api/configs/validate?core=mihomo", {
+    method: "POST",
+    body: JSON.stringify({ file: normalizeMihomoConfigPath(path), content }),
   });
 }
 
@@ -226,8 +237,19 @@ async function hardRestartMihomo(conn: ClashConnection): Promise<void> {
   await waitForClashApi(conn, 60, 500);
 }
 
-/** zashboard-style: ensure mihomo is up, reload config, refresh proxy-provider */
 export async function applyMihomoConfigChanges(
+  clash: ClashConnection,
+  opts?: { hardRestart?: boolean },
+): Promise<ClashConnection> {
+  return withSelectionSnapshots(
+    opts?.hardRestart ? "apply-config-restart" : "apply-config",
+    clash,
+    () => applyConfigToCore(clash, opts),
+    (conn) => conn,
+  );
+}
+
+async function applyConfigToCore(
   clash: ClashConnection,
   opts?: { hardRestart?: boolean },
 ): Promise<ClashConnection> {

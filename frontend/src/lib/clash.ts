@@ -1,3 +1,5 @@
+import { parseProxyGroups } from "./mihomoYaml";
+
 export interface ClashProxyItem {
   type: string;
   name: string;
@@ -245,8 +247,8 @@ export function filterGroupMembers(all: string[] | undefined, groupNames: Set<st
   });
 }
 
-/** Groups skipped by "All to" / bulk select (policy + adblock). */
-export const BULK_SKIP_GROUPS = new Set(["PROXY", "DIRECT", "Adblock"]);
+/** Service groups never touched by "All to" (builtin DIRECT, ad blocking). */
+export const BULK_SKIP_GROUPS = new Set(["DIRECT", "Adblock"]);
 
 export function isBulkSkipGroup(name: string): boolean {
   return BULK_SKIP_GROUPS.has(name);
@@ -254,14 +256,8 @@ export function isBulkSkipGroup(name: string): boolean {
 
 export function parseGroupIcons(yaml: string): Record<string, string> {
   const icons: Record<string, string> = {};
-  if (!yaml.includes("proxy-groups:")) return icons;
-
-  for (const block of yaml.split(/\n  - name:/).slice(1)) {
-    const name = block.match(/^ ['"]?([^'"\n]+)/)?.[1]?.trim();
-    const icon = block.match(/\n    icon: ['"]?([^'"\n]+)/)?.[1]?.trim();
-    if (name && icon) {
-      icons[name] = icon;
-    }
+  for (const g of parseProxyGroups(yaml)) {
+    if (g.icon) icons[g.name] = g.icon;
   }
   return icons;
 }
@@ -286,11 +282,25 @@ export function formatTrafficTotal(raw?: ClashConnectionsResponse | null): strin
   return formatBytes(total);
 }
 
+const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB"];
+
+/** Base-1024 sizes (labels KB/MB/GB/TB as before); rounding never shows "1024.0" of a unit. */
 export function formatBytes(bytes?: number): string {
-  if (bytes === undefined || Number.isNaN(bytes)) return "—";
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes === undefined || !Number.isFinite(bytes)) return "—";
+  if (bytes < 1024) return `${Math.max(0, Math.round(bytes))} B`;
+  let unit = 0;
+  let value = bytes;
+  while (value >= 1024 && unit < BYTE_UNITS.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  // KB keeps the old integer style; bigger units get one decimal.
+  const digits = unit === 1 ? 0 : 1;
+  if (Number(value.toFixed(digits)) >= 1024 && unit < BYTE_UNITS.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value.toFixed(unit === 1 ? 0 : 1)} ${BYTE_UNITS[unit]}`;
 }
 
 export function formatDurationSec(sec: number): string {

@@ -5,7 +5,21 @@ use axum::response::{IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Prefix of per-request validation files in MIHOMO_CONF_DIR (hidden from the config list).
+const VALIDATE_FILE_PREFIX: &str = ".zkeen-validate";
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn unique_suffix() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{}-{}", std::process::id(), nanos, TEMP_SEQ.fetch_add(1, Ordering::Relaxed))
+}
 
 #[derive(Serialize)]
 struct ConfigItem {
@@ -39,6 +53,13 @@ async fn collect_configs(paths: &[String], is_mihomo: bool) -> Vec<ConfigItem> {
                 Ok(mut entries) => {
                     while let Ok(Some(entry)) = entries.next_entry().await {
                         let entry_path = entry.path();
+                        let hidden_temp = entry_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.starts_with(VALIDATE_FILE_PREFIX));
+                        if hidden_temp {
+                            continue;
+                        }
                         let matches = if is_mihomo {
                             entry_path.extension().map_or(false, |e| e == "yaml" || e == "yml")
                         } else {
@@ -167,13 +188,100 @@ fn check_access(file: &str, state: &AppState) -> Result<bool, &'static str> {
     Ok(file.ends_with(".lst"))
 }
 
+/// Files handed to the core validator: the candidate content plus (xray) the rest of the conf dir.
+async fn collect_validate_files(core_type: &str, file: &str, content: &str) -> Vec<ConfigReq> {
+    let mut validate_files = Vec::new();
+    if core_type == "mihomo" {
+        validate_files.push(ConfigReq {
+            file: file.to_string(),
+            content: content.to_string(),
+        });
+    } else if core_type == "xray" {
+        if let Ok(mut entries) = tokio::fs::read_dir(XRAY_CONF_DIR).await {
+            let mut found_current = false;
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.extension().map_or(false, |e| e == "json") {
+                    let path_str = path.to_string_lossy().into_owned();
+                    let file_content = if path_str == file {
+                        found_current = true;
+                        content.to_string()
+                    } else {
+                        tokio::fs::read_to_string(&path).await.unwrap_or_default()
+                    };
+                    validate_files.push(ConfigReq {
+                        file: path_str,
+                        content: file_content,
+                    });
+                }
+            }
+            if !found_current {
+                validate_files.push(ConfigReq {
+                    file: file.to_string(),
+                    content: content.to_string(),
+                });
+            }
+        } else {
+            validate_files.push(ConfigReq {
+                file: file.to_string(),
+                content: content.to_string(),
+            });
+        }
+    }
+    validate_files
+}
+
+async fn run_validation(core_type: &str, file: &str, content: &str) -> Result<(), String> {
+    let files = collect_validate_files(core_type, file, content).await;
+    validate_core(core_type, &files).await.map_err(|err_msg| {
+        log("ERROR", err_msg.clone());
+        let detail = truncate_validation_error(&err_msg);
+        if detail.is_empty() {
+            "Validation failed".into()
+        } else {
+            format!("Validation failed: {detail}")
+        }
+    })
+}
+
+/// Keep one rolling copy of the previous file, then replace it via temp + fsync + rename.
+fn write_config_atomic(file: &str, content: &str) -> Result<Option<String>, String> {
+    let backup = if Path::new(file).exists() {
+        let backup = format!("{file}.zkeen.bak");
+        fs::copy(file, &backup).map_err(|e| format!("Backup error: {e}"))?;
+        Some(backup)
+    } else {
+        None
+    };
+    let tmp = format!("{file}.zkeen-tmp-{}", unique_suffix());
+    let written = fs::File::create(&tmp).and_then(|mut f| {
+        f.write_all(content.as_bytes())?;
+        f.sync_all()
+    });
+    if let Err(e) = written {
+        _ = fs::remove_file(&tmp);
+        return Err(format!("Write error: {e}"));
+    }
+    if let Err(e) = fs::rename(&tmp, file) {
+        _ = fs::remove_file(&tmp);
+        return Err(format!("Replace error: {e}"));
+    }
+    Ok(backup)
+}
+
+#[derive(Serialize)]
+struct SaveData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup: Option<String>,
+}
+
 pub async fn put_config(
     State(state): State<AppState>, Query(params): Query<HashMap<String, String>>, Json(req): Json<ConfigReq>,
 ) -> impl IntoResponse {
     let is_lst = match check_access(&req.file, &state) {
         Ok(val) => val,
         Err(e) => {
-            return Json(ApiResponse::<()> {
+            return Json(ApiResponse::<SaveData> {
                 success: false,
                 error: Some(e.into()),
                 data: None,
@@ -187,72 +295,63 @@ pub async fn put_config(
     };
 
     if let Some(core_type) = params.get("validate") {
-        let mut validate_files = Vec::new();
-        if core_type == "mihomo" {
-            validate_files.push(ConfigReq {
-                file: req.file.clone(),
-                content: content.clone(),
-            });
-        } else if core_type == "xray" {
-            if let Ok(mut entries) = tokio::fs::read_dir(XRAY_CONF_DIR).await {
-                let mut found_current = false;
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let path = entry.path();
-                    if path.extension().map_or(false, |e| e == "json") {
-                        let path_str = path.to_string_lossy().into_owned();
-                        let file_content = if path_str == req.file {
-                            found_current = true;
-                            content.clone()
-                        } else {
-                            tokio::fs::read_to_string(&path).await.unwrap_or_default()
-                        };
-                        validate_files.push(ConfigReq {
-                            file: path_str,
-                            content: file_content,
-                        });
-                    }
-                }
-                if !found_current {
-                    validate_files.push(ConfigReq {
-                        file: req.file.clone(),
-                        content: content.clone(),
-                    });
-                }
-            } else {
-                validate_files.push(ConfigReq {
-                    file: req.file.clone(),
-                    content: content.clone(),
-                });
-            }
-        }
-
-        if let Err(err_msg) = validate_core(core_type, &validate_files).await {
-            log("ERROR", err_msg.clone());
-            let detail = truncate_validation_error(&err_msg);
-            return Json(ApiResponse::<()> {
+        if let Err(e) = run_validation(core_type, &req.file, &content).await {
+            return Json(ApiResponse::<SaveData> {
                 success: false,
-                error: Some(if detail.is_empty() {
-                    "Validation failed".into()
-                } else {
-                    format!("Validation failed: {detail}")
-                }),
+                error: Some(e),
                 data: None,
             });
         }
     }
 
-    if fs::write(&req.file, &content).is_err() {
+    match write_config_atomic(&req.file, &content) {
+        Ok(backup) => Json(ApiResponse {
+            success: true,
+            error: None,
+            data: Some(SaveData { backup }),
+        }),
+        Err(e) => {
+            log("ERROR", format!("Не удалось сохранить {}: {e}", req.file));
+            Json(ApiResponse::<SaveData> {
+                success: false,
+                error: Some(e),
+                data: None,
+            })
+        }
+    }
+}
+
+/// Validate candidate content with the core without touching the working file.
+pub async fn validate_config(
+    State(state): State<AppState>, Query(params): Query<HashMap<String, String>>, Json(req): Json<ConfigReq>,
+) -> impl IntoResponse {
+    if let Err(e) = check_access(&req.file, &state) {
         return Json(ApiResponse::<()> {
             success: false,
-            error: Some("Write error".into()),
+            error: Some(e.into()),
             data: None,
         });
     }
-    Json(ApiResponse::<()> {
-        success: true,
-        error: None,
-        data: None,
-    })
+    let core_type = params.get("core").map(String::as_str).unwrap_or("mihomo");
+    if core_type != "mihomo" && core_type != "xray" {
+        return Json(ApiResponse::<()> {
+            success: false,
+            error: Some("Unknown core".into()),
+            data: None,
+        });
+    }
+    match run_validation(core_type, &req.file, &req.content).await {
+        Ok(()) => Json(ApiResponse::<()> {
+            success: true,
+            error: None,
+            data: None,
+        }),
+        Err(e) => Json(ApiResponse::<()> {
+            success: false,
+            error: Some(e),
+            data: None,
+        }),
+    }
 }
 
 pub async fn post_config(State(state): State<AppState>, Json(req): Json<ConfigReq>) -> impl IntoResponse {
@@ -362,7 +461,8 @@ async fn validate_core(core: &str, files: &[ConfigReq]) -> Result<(), String> {
             .map(|f| f.content.as_str())
             .unwrap_or(&files[0].content);
 
-        let validate_path = Path::new(MIHOMO_CONF_DIR).join(".zkeen-validate.yaml");
+        let validate_path =
+            Path::new(MIHOMO_CONF_DIR).join(format!("{VALIDATE_FILE_PREFIX}-{}.yaml", unique_suffix()));
         tokio::fs::create_dir_all(MIHOMO_CONF_DIR)
             .await
             .map_err(|e| e.to_string())?;

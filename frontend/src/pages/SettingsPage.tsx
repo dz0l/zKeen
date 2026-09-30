@@ -10,8 +10,10 @@ import {
   ensureZkeenMihomoConfig,
   fetchMihomoConfig,
   isZkeenReadyConfig,
+  waitForClashApi,
 } from "../lib/config";
 import { waitForPanelAndHardReload } from "../lib/panelReload";
+import { withSelectionSnapshots } from "../lib/opJournal";
 
 function stripV(v?: string): string {
   if (!v) return "—";
@@ -120,10 +122,19 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
     setRestarting(key);
     setCheckError("");
     try {
-      await apiJson("/api/control", {
-        method: "POST",
-        body: JSON.stringify({ action, core: "mihomo" }),
-      });
+      const control = () =>
+        apiJson("/api/control", {
+          method: "POST",
+          body: JSON.stringify({ action, core: "mihomo" }),
+        });
+      if (key === "mihomo") {
+        await withSelectionSnapshots(`restart-${key}`, clash, async () => {
+          await control();
+          await waitForClashApi(clash, 40, 500).catch(() => {});
+        });
+      } else {
+        await control();
+      }
       if (action === "restartPanel") {
         setCheckError(t("settings.reloadingPanel"));
         await waitForPanelAndHardReload({ initialDelayMs: 800 });

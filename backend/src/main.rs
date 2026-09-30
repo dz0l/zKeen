@@ -452,6 +452,7 @@ async fn main() {
             "/api/configs/bootstrap",
             post(configs::bootstrap_mihomo_config),
         )
+        .route("/api/configs/validate", post(configs::validate_config))
         .route(
             "/api/configs",
             get(configs::get_configs)

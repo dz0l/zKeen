@@ -916,33 +916,45 @@ start_service() {
     fi
 }
 
-# Remove install/update leftovers. Keeps unrelated files in /opt/tmp intact.
-# Do NOT delete /opt/etc/mihomo/cache.db — Mihomo store-selected (group server picks) lives there.
+# Remove PID-suffixed installer files (NAME.<pid>[.ext]) whose process is gone.
+# Files of a running installer (or of an unrelated process reusing the PID) are kept.
+remove_dead_pid_files() {
+    for _f in "$@"; do
+        [ -e "$_f" ] || continue
+        _pid=$(printf '%s\n' "$_f" | sed -n 's/.*\.\([0-9][0-9]*\)\(\.[a-z]*\)\{0,1\}$/\1/p')
+        [ -n "$_pid" ] || continue
+        [ "$_pid" = "$$" ] && continue
+        kill -0 "$_pid" 2>/dev/null && continue
+        rm -rf "$_f" 2>/dev/null || true
+    done
+}
+
+# Remove only this installer's temp files (suffix $$) and leftovers of dead installer runs.
+# Unrelated files in /opt/tmp, panel updater dirs (zkeen-update-*) and
+# /opt/etc/mihomo/cache.db (Mihomo store-selected) are never touched.
 cleanup_tmp() {
     log_step "Cleaning temporary files..."
-    # XKeen / Mihomo / zKeen UI download leftovers
     rm -f \
-        /opt/tmp/xkeen.tar.gz \
-        /opt/tmp/xkeen.tar \
-        /opt/tmp/xkeen.tar.gz.* \
-        /opt/tmp/xkeen.tar.* \
-        /opt/tmp/mihomo.gz \
-        /opt/tmp/mihomo.gz.* \
-        /opt/tmp/zkeen-ui \
-        /opt/tmp/zkeen-ui.* \
-        /opt/tmp/zkeen-ui_* \
-        /opt/tmp/bin.tmp \
-        /opt/tmp/download.tmp \
-        /opt/tmp/yq.tmp \
-        /opt/tmp/yq.bin \
-        /opt/tmp/mihomo-config.default.* \
-        /opt/sbin/xkeen.tar.gz \
-        /opt/sbin/mihomo.new.* \
+        "/opt/tmp/xkeen.tar.$$" \
+        "/opt/tmp/xkeen.tar.gz.$$" \
+        "/opt/tmp/mihomo.gz.$$" \
+        "/opt/tmp/zkeen-releases.$$.json" \
+        "/opt/tmp/mihomo-config.default.$$" \
+        "/opt/tmp/${BINARY_NAME}.tmp.$$" \
+        "/opt/sbin/mihomo.new.$$" \
+        "${MIHOMO_CONFIG}.new.$$" \
         2>/dev/null || true
-    # PID-suffixed temp binaries from this installer
-    rm -f /opt/tmp/"${BINARY_NAME}".tmp.* 2>/dev/null || true
-    # Stale stage dirs from interrupted XKeen install
-    rm -rf /opt/sbin/.xkeen-install.* 2>/dev/null || true
+    rm -rf "/opt/sbin/.xkeen-install.$$" 2>/dev/null || true
+    remove_dead_pid_files \
+        /opt/tmp/xkeen.tar.[0-9]* \
+        /opt/tmp/xkeen.tar.gz.[0-9]* \
+        /opt/tmp/mihomo.gz.[0-9]* \
+        /opt/tmp/zkeen-releases.[0-9]*.json \
+        /opt/tmp/mihomo-config.default.[0-9]* \
+        /opt/tmp/"${BINARY_NAME}".tmp.[0-9]* \
+        /opt/tmp/zkeen-ui-install.[0-9]*.sh \
+        /opt/sbin/mihomo.new.[0-9]* \
+        /opt/sbin/.xkeen-install.[0-9]*
     log_info "Temporary files cleaned"
 }
 

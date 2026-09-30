@@ -4,15 +4,29 @@ import { useApp } from "../lib/store";
 import { useT } from "../lib/i18n";
 import { useMihomoConfig } from "../lib/useMihomoConfig";
 import { useApiError } from "../lib/errors";
+import { useSession } from "../lib/session";
+import { applyMihomoConfigChanges, validateMihomoConfig } from "../lib/config";
+
+/** Result of the last validation, bound to the exact text that was checked. */
+interface CheckResult {
+  text: string;
+  ok: boolean;
+}
 
 export function ConfigPage({ embedded = false }: { embedded?: boolean } = {}) {
   const { mode } = useApp();
   const t = useT();
   const apiErr = useApiError();
+  const { clash, setClash } = useSession();
   const cfg = useMihomoConfig();
-  const [validated, setValidated] = useState<boolean | null>(null);
+  const [check, setCheck] = useState<CheckResult | null>(null);
   const [actionError, setActionError] = useState("");
+  const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null);
+  const [rollbackYaml, setRollbackYaml] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+
+  // Any edit or import changes the text and therefore drops the old result.
+  const validated = check && check.text === cfg.yaml ? check.ok : null;
 
   if (cfg.loading) {
     return (
@@ -34,31 +48,57 @@ export function ConfigPage({ embedded = false }: { embedded?: boolean } = {}) {
   }
 
   async function handleValidate() {
+    const snapshot = cfg.yaml;
     setSaving(true);
     setActionError("");
+    setNotice(null);
     try {
-      await cfg.save(true);
-      setValidated(true);
+      await validateMihomoConfig(cfg.configPath, snapshot);
+      setCheck({ text: snapshot, ok: true });
     } catch (err) {
-      setValidated(false);
+      setCheck({ text: snapshot, ok: false });
       setActionError(apiErr(err, "config.validateError"));
     } finally {
       setSaving(false);
     }
   }
 
-  async function handleSave(validate: boolean) {
+  /** Safe mode: the server validates this exact snapshot before the atomic write. */
+  async function saveAndApply(snapshot: string, previous: string | null) {
+    const safe = mode === "safe";
+    if (safe && !window.confirm(t("groups.confirmApply"))) return;
     setSaving(true);
     setActionError("");
+    setNotice(null);
     try {
-      await cfg.save(validate);
-      setValidated(validate ? true : null);
+      const { backup } = await cfg.save(snapshot, safe);
+      if (safe) setCheck({ text: snapshot, ok: true });
+      try {
+        setClash(await applyMihomoConfigChanges(clash));
+        setRollbackYaml(null);
+        setNotice({ ok: true, text: t("config.savedApplied") });
+      } catch (err) {
+        setRollbackYaml(previous && previous !== snapshot ? previous : null);
+        setNotice({
+          ok: false,
+          text: t("config.savedNotApplied", {
+            error: apiErr(err, "config.applyError"),
+            backup: backup ?? "—",
+          }),
+        });
+      }
     } catch (err) {
       setActionError(apiErr(err, "config.saveError"));
-      if (validate) setValidated(false);
     } finally {
       setSaving(false);
     }
+  }
+
+  async function handleRollback() {
+    if (rollbackYaml === null) return;
+    const previous = rollbackYaml;
+    cfg.setYaml(previous);
+    await saveAndApply(previous, null);
   }
 
   return (
@@ -66,6 +106,23 @@ export function ConfigPage({ embedded = false }: { embedded?: boolean } = {}) {
       {actionError && (
         <div className="rounded-xl border border-zk-coral/25 bg-zk-coral/10 px-3 py-2 text-xs text-zk-coral">
           {actionError}
+        </div>
+      )}
+
+      {notice && (
+        <div
+          className={`flex flex-wrap items-center gap-3 rounded-xl border px-3 py-2 text-xs ${
+            notice.ok
+              ? "border-zk-accent/25 bg-zk-accent/10 text-zk-accent"
+              : "border-zk-amber/30 bg-zk-amber/10 text-zk-amber"
+          }`}
+        >
+          <span className="min-w-0 flex-1 break-words">{notice.text}</span>
+          {!notice.ok && rollbackYaml !== null && (
+            <Button size="sm" variant="secondary" disabled={saving} onClick={() => void handleRollback()}>
+              {t("config.rollback")}
+            </Button>
+          )}
         </div>
       )}
 
@@ -77,13 +134,13 @@ export function ConfigPage({ embedded = false }: { embedded?: boolean } = {}) {
               {cfg.configPath || t("config.subtitle")}
             </p>
           </div>
-          <ImportExportButtons yaml={cfg.yaml} setYaml={cfg.setYaml} />
+          <ImportExportButtons yaml={cfg.yaml} setYaml={cfg.setYaml} disabled={saving} />
         </div>
       )}
 
       {embedded && (
         <div className="flex justify-end">
-          <ImportExportButtons yaml={cfg.yaml} setYaml={cfg.setYaml} />
+          <ImportExportButtons yaml={cfg.yaml} setYaml={cfg.setYaml} disabled={saving} />
         </div>
       )}
 
@@ -91,17 +148,24 @@ export function ConfigPage({ embedded = false }: { embedded?: boolean } = {}) {
         yaml={cfg.yaml}
         setYaml={cfg.setYaml}
         validated={validated}
-        setValidated={setValidated}
         mode={mode}
         saving={saving}
         onValidate={handleValidate}
-        onSave={() => handleSave(false)}
+        onSave={() => void saveAndApply(cfg.yaml, cfg.savedYaml)}
       />
     </div>
   );
 }
 
-function ImportExportButtons({ yaml, setYaml }: { yaml: string; setYaml: (v: string) => void }) {
+function ImportExportButtons({
+  yaml,
+  setYaml,
+  disabled,
+}: {
+  yaml: string;
+  setYaml: (v: string) => void;
+  disabled: boolean;
+}) {
   const t = useT();
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -132,7 +196,7 @@ function ImportExportButtons({ yaml, setYaml }: { yaml: string; setYaml: (v: str
       <Button size="sm" variant="ghost" onClick={handleExport}>
         {t("config.export")}
       </Button>
-      <Button size="sm" variant="ghost" onClick={() => fileRef.current?.click()}>
+      <Button size="sm" variant="ghost" disabled={disabled} onClick={() => fileRef.current?.click()}>
         {t("config.import")}
       </Button>
       <input
@@ -150,7 +214,6 @@ function EditorTab({
   yaml,
   setYaml,
   validated,
-  setValidated,
   mode,
   saving,
   onValidate,
@@ -159,7 +222,6 @@ function EditorTab({
   yaml: string;
   setYaml: (v: string) => void;
   validated: boolean | null;
-  setValidated: (v: boolean | null) => void;
   mode: string;
   saving: boolean;
   onValidate: () => void;
@@ -180,10 +242,8 @@ function EditorTab({
       />
       <textarea
         value={yaml}
-        onChange={(e) => {
-          setYaml(e.target.value);
-          setValidated(null);
-        }}
+        readOnly={saving}
+        onChange={(e) => setYaml(e.target.value)}
         spellCheck={false}
         className="scrollbar-thin min-h-[320px] w-full resize-y border-0 bg-zk-bg/50 px-4 py-3 font-mono text-[13px] leading-relaxed text-zk-text outline-none sm:min-h-[420px] sm:px-5"
       />

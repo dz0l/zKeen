@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Badge, Button, Card, CardHeader, Input, Select } from "../components/ui";
-import { GroupEditModal, rulesToDraft, type GroupEditDraft } from "../components/GroupEditModal";
+import {
+  GroupEditModal,
+  rulesToDraft,
+  type GroupEditDraft,
+  type GroupEditResult,
+} from "../components/GroupEditModal";
 import { useApp } from "../lib/store";
 import { useT } from "../lib/i18n";
 import { useSession } from "../lib/session";
@@ -11,14 +16,16 @@ import {
   saveMihomoConfig,
 } from "../lib/config";
 import {
-  buildRuleLine,
   defaultNewGroup,
   deleteProxyGroup,
   ensurePolicyGroups,
   listUserProxyGroups,
   normalizePolicyDomain,
   normalizePolicyIp,
+  parseProxyGroups,
   parseUserPolicies,
+  renameGroupReferences,
+  renameRuleTarget,
   replaceUserPolicies,
   rulesForGroup,
   setGroupRules,
@@ -34,6 +41,15 @@ type Tab = "groups" | "policies";
 
 const DEFAULT_PROXY_GROUP = "PROXY";
 const DEFAULT_DIRECT_GROUP = "STRAIGHT";
+const POLICY_MARKER = "# zkeen:policies";
+
+/** Legacy policy layout (no marker block / invalid SRC-IP) that needs the one-time migration. */
+function needsPolicyMigration(yaml: string): boolean {
+  return (
+    /(?:^|\n)\s*-\s*SRC-IP,/.test(yaml) ||
+    (!yaml.includes(POLICY_MARKER) && parseUserPolicies(yaml).some((p) => p.kind === "ip"))
+  );
+}
 
 function GroupIcon({ name, icon }: { name: string; icon?: string }) {
   if (icon) {
@@ -168,22 +184,7 @@ export function GroupsPoliciesPage({
     try {
       const data = await fetchMihomoConfig();
       if (!data) throw new Error(t("config.notFound"));
-      let content = data.content;
-      const needsHeal =
-        /(?:^|\n)\s*-\s*SRC-IP,/.test(content) ||
-        (parseUserPolicies(content).some((p) => p.kind === "ip") &&
-          !content.includes("# zkeen:policies"));
-      if (needsHeal) {
-        const all = parseUserPolicies(content);
-        content = replaceUserPolicies(ensurePolicyGroups(content), all);
-        try {
-          await saveMihomoConfig(data.path, content, true);
-          const conn = await applyMihomoConfigChanges(clash);
-          setClash(conn);
-        } catch {
-          /* rewritten yaml still shown */
-        }
-      }
+      const content = data.content;
       setYaml(content);
       setConfigPath(data.path);
       setPolicyDrafts(parseUserPolicies(content));
@@ -200,6 +201,7 @@ export function GroupsPoliciesPage({
   }, [load]);
 
   const groups = useMemo(() => listUserProxyGroups(yaml), [yaml]);
+  const migrationNeeded = useMemo(() => needsPolicyMigration(yaml), [yaml]);
 
   const groupOptions = useMemo(
     () => groups.map((g) => ({ value: g.name, label: g.name })),
@@ -258,17 +260,23 @@ export function GroupsPoliciesPage({
     setNewName("");
   };
 
-  const handleSaveDraft = async (d: GroupEditDraft) => {
+  const handleSaveDraft = async ({ patch, rules, isNew }: GroupEditResult) => {
     try {
-      const oldName = draft?.group.name;
-      let next = yaml;
-      if (!d.isNew && oldName && oldName !== d.group.name) {
-        next = deleteProxyGroup(next, oldName);
+      const oldName = isNew ? undefined : draft?.group.name;
+      const renamed = !!oldName && oldName !== patch.name;
+      if (renamed && parseProxyGroups(yaml).some((g) => g.name === patch.name)) {
+        throw new Error(t("groups.nameExists"));
       }
-      next = upsertProxyGroup(next, d.group);
-      const payloads = d.rules.map((r) => buildRuleLine(r.type, r.value, d.group.name));
-      next = setGroupRules(next, d.group.name, payloads);
-      await persist(next);
+      let next = upsertProxyGroup(yaml, patch, { originalName: oldName });
+      let ruleDrafts = rules;
+      if (renamed) {
+        next = renameGroupReferences(next, oldName, patch.name);
+        ruleDrafts = rules.map((r) =>
+          r.raw ? { ...r, raw: renameRuleTarget(r.raw, oldName, patch.name) } : r,
+        );
+      }
+      next = setGroupRules(next, patch.name, ruleDrafts);
+      if (next !== yaml) await persist(next);
       setDraft(null);
     } catch (err) {
       setError(apiErr(err, "groups.saveError"));
@@ -277,9 +285,23 @@ export function GroupsPoliciesPage({
   };
 
   const handleDeleteGroup = async (name: string) => {
-    const next = deleteProxyGroup(yaml, name);
-    await persist(next);
-    setDraft(null);
+    try {
+      await persist(deleteProxyGroup(yaml, name));
+      setDraft(null);
+    } catch (err) {
+      setError(apiErr(err, "groups.saveError"));
+    }
+  };
+
+  const handleMigratePolicies = async () => {
+    setError("");
+    try {
+      await persist(replaceUserPolicies(ensurePolicyGroups(yaml), parseUserPolicies(yaml)));
+      setPolicyDrafts(parseUserPolicies(yaml));
+      setPoliciesDirty(false);
+    } catch (err) {
+      setError(apiErr(err, "groups.saveError"));
+    }
   };
 
   const addPolicyDraft = (kind: UserPolicyKind, rawValue: string, target: string) => {
@@ -349,6 +371,20 @@ export function GroupsPoliciesPage({
       {!embedded && (
         <div>
           <h1 className="text-xl font-bold tracking-tight sm:text-2xl">{t("groups.title")}</h1>
+        </div>
+      )}
+
+      {migrationNeeded && (
+        <div className="flex flex-wrap items-center gap-3 rounded-xl border border-zk-amber/30 bg-zk-amber/10 px-3 py-2">
+          <p className="min-w-0 flex-1 text-xs text-zk-amber">{t("policies.migrateHint")}</p>
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={saving}
+            onClick={() => void handleMigratePolicies()}
+          >
+            {t("policies.migrate")}
+          </Button>
         </div>
       )}
 

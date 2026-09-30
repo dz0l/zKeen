@@ -37,7 +37,7 @@ const translations: Translations = {
     "status.running": "Работает",
     "status.stopped": "Остановлен",
     "status.uptime": "Аптайм",
-    "status.traffic": "Трафик",
+    "status.traffic": "Трафик (всего)",
     "status.connections": "Соединения",
     "status.active": "активных",
     "status.memory": "Память",
@@ -137,6 +137,11 @@ const translations: Translations = {
     "proxies.geoNever": "Ещё не обновляли вручную",
     "proxies.testError": "Не удалось протестировать серверы",
     "proxies.providerEmpty": "Нет серверов. Укажите URL подписки выше и нажмите «Обновить».",
+    "proxies.bulkApplied": "{server}: применено к {count} групп",
+    "proxies.bulkFailed": "Не удалось переключить: {groups}",
+    "proxies.bulkMissing": "Нет этого сервера в группах: {groups}",
+    "proxies.journalExport": "Журнал",
+    "proxies.journalHint": "Скачать журнал действий (выбор серверов, apply, рестарт) — хранится только в браузере",
 
     // Config
     "config.title": "Config",
@@ -223,6 +228,7 @@ const translations: Translations = {
     "groups.applyCancelled": "Применение отменено",
     "groups.nameExists": "Группа с таким именем уже есть",
     "groups.nameRequired": "Укажите имя группы",
+    "groups.intervalInvalid": "interval должен быть числом (секунды)",
     "groups.saveError": "Не удалось сохранить группу",
 
     // Policies
@@ -252,6 +258,9 @@ const translations: Translations = {
     "policies.group": "Группа",
     "policies.rule": "rule",
     "policies.empty": "Нет политик",
+    "policies.migrateHint":
+      "Политики хранятся в старом формате (без блока панели). Перенесите их один раз — остальные правила не изменятся.",
+    "policies.migrate": "Перенести",
 
     // Settings
     "settings.title": "Настройки",
@@ -349,6 +358,9 @@ const translations: Translations = {
     "api.invalidTimezone": "Неверный часовой пояс",
     "api.pingUrlEmpty": "URL пинг-теста не может быть пустым",
     "api.pingTimeoutInvalid": "Таймаут пинг-теста должен быть больше 0",
+    "api.unsupportedYamlLayout":
+      "Секция {section} в config.yaml записана в нестандартной форме — панель не будет её переписывать. Измените её в редакторе YAML.",
+    "api.updateInProgress": "Уже выполняется другое обновление — дождитесь его завершения",
     "api.defaultTemplateEmpty":
       "Шаблон config пуст. Обновите zkeen-ui или положите mihomo-config.default.yaml в /opt/etc/mihomo/",
     "api.panelInitMissing": "Не найден init-скрипт панели S99zkeen-ui",
@@ -387,6 +399,10 @@ const translations: Translations = {
     "config.notFound": "config.yaml не найден в /opt/etc/mihomo/. Переустановите zKeen UI или скопируйте шаблон вручную.",
     "config.validateError": "Ошибка проверки конфига",
     "config.saveError": "Ошибка сохранения конфига",
+    "config.savedApplied": "Сохранено и применено к Mihomo",
+    "config.savedNotApplied": "Сохранено на диск, но не применено к Mihomo: {error}. Копия прежнего файла: {backup}",
+    "config.applyError": "ошибка применения",
+    "config.rollback": "Вернуть прежний конфиг",
     "config.refreshError": "Не удалось обновить провайдер",
     "config.quickMockNote": "Остальные быстрые настройки — скоро. Пока используйте YAML-редактор (Expert).",
     "config.quickMovedProvider": "Настройки провайдера перенесены в Proxy → Провайдер.",
@@ -423,7 +439,7 @@ const translations: Translations = {
     "status.running": "Running",
     "status.stopped": "Stopped",
     "status.uptime": "Uptime",
-    "status.traffic": "Traffic",
+    "status.traffic": "Traffic (total)",
     "status.connections": "Connections",
     "status.active": "active",
     "status.memory": "Memory",
@@ -523,6 +539,11 @@ const translations: Translations = {
     "proxies.geoNever": "Not updated manually yet",
     "proxies.testError": "Failed to test servers",
     "proxies.providerEmpty": "No servers. Set subscription URL above and press Refresh.",
+    "proxies.bulkApplied": "{server}: applied to {count} groups",
+    "proxies.bulkFailed": "Failed to switch: {groups}",
+    "proxies.bulkMissing": "Server not available in: {groups}",
+    "proxies.journalExport": "Journal",
+    "proxies.journalHint": "Download the action journal (server selection, apply, restart) — kept in this browser only",
 
     // Config
     "config.title": "Config",
@@ -609,6 +630,7 @@ const translations: Translations = {
     "groups.applyCancelled": "Apply cancelled",
     "groups.nameExists": "A group with this name already exists",
     "groups.nameRequired": "Group name is required",
+    "groups.intervalInvalid": "interval must be a number (seconds)",
     "groups.saveError": "Failed to save group",
 
     // Policies
@@ -638,6 +660,9 @@ const translations: Translations = {
     "policies.group": "Group",
     "policies.rule": "rule",
     "policies.empty": "No policies",
+    "policies.migrateHint":
+      "Policies use the legacy layout (no panel block). Migrate them once; other rules stay unchanged.",
+    "policies.migrate": "Migrate",
 
     // Settings
     "settings.title": "Settings",
@@ -732,6 +757,9 @@ const translations: Translations = {
     "api.invalidTimezone": "Invalid timezone",
     "api.pingUrlEmpty": "Ping test URL cannot be empty",
     "api.pingTimeoutInvalid": "Ping test timeout must be greater than 0",
+    "api.unsupportedYamlLayout":
+      "The {section} section of config.yaml uses an unsupported layout — the panel will not rewrite it. Edit it in the YAML editor.",
+    "api.updateInProgress": "Another update is already running — wait for it to finish",
     "api.defaultTemplateEmpty":
       "Default config template is empty. Update zkeen-ui or place mihomo-config.default.yaml in /opt/etc/mihomo/",
     "api.panelInitMissing": "Panel init script S99zkeen-ui not found",
@@ -762,6 +790,10 @@ const translations: Translations = {
     "config.notFound": "config.yaml not found in /opt/etc/mihomo/. Re-run install or copy the default template.",
     "config.validateError": "Config validation failed",
     "config.saveError": "Failed to save config",
+    "config.savedApplied": "Saved and applied to Mihomo",
+    "config.savedNotApplied": "Saved to disk but not applied to Mihomo: {error}. Previous file copy: {backup}",
+    "config.applyError": "apply failed",
+    "config.rollback": "Restore previous config",
     "config.refreshError": "Failed to refresh provider",
     "config.quickMockNote": "Other quick settings coming soon. Use YAML editor (Expert) for now.",
     "config.quickMovedProvider": "Provider settings moved to Proxy → Provider.",

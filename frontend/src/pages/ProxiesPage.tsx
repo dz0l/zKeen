@@ -3,7 +3,14 @@ import { Badge, Button, Card, CardHeader, Input, Select } from "../components/ui
 import { IconChevron } from "../components/icons";
 import { useT, useI18n } from "../lib/i18n";
 import { useSession } from "../lib/session";
-import { ApiError, clashJson } from "../lib/api";
+import { ApiError, clashJson, type ClashConnection } from "../lib/api";
+import {
+  exportJournal,
+  journal,
+  journalError,
+  newOpId,
+  withSelectionSnapshots,
+} from "../lib/opJournal";
 import { useApiError } from "../lib/errors";
 import {
   DEFAULT_PROVIDER,
@@ -88,6 +95,26 @@ function mapGroups(
   return groups;
 }
 
+function putProxySelection(conn: ClashConnection, group: string, node: string): Promise<unknown> {
+  return clashJson(
+    `proxies/${encodeURIComponent(group)}`,
+    conn,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: node }),
+    },
+    10000,
+  );
+}
+
+interface BulkReport {
+  server: string;
+  applied: number;
+  failed: string[];
+  missing: string[];
+}
+
 function selectedMap(data: ClashProxiesResponse): Record<string, string> {
   const map: Record<string, string> = {};
   for (const item of Object.values(data.proxies)) {
@@ -116,6 +143,7 @@ export function ProxiesPage() {
   const [offline, setOffline] = useState(false);
   const [starting, setStarting] = useState(false);
   const [busy, setBusy] = useState("");
+  const [bulkReport, setBulkReport] = useState<BulkReport | null>(null);
   const [testing, setTesting] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [geoUpdating, setGeoUpdating] = useState(false);
@@ -233,75 +261,101 @@ export function ProxiesPage() {
     return groups.filter((g) => g.name.toLowerCase().includes(q));
   }, [groups, search]);
 
+  // One selection/config operation at a time: a slower older PUT must not
+  // overwrite a newer choice (ZK-31). The UI is disabled while `busy` is set.
+  const opLock = useRef(false);
+  const runExclusive = useCallback(async (busyKey: string, fn: () => Promise<void>) => {
+    if (opLock.current) return;
+    opLock.current = true;
+    setBusy(busyKey);
+    try {
+      await fn();
+    } finally {
+      opLock.current = false;
+      setBusy("");
+    }
+  }, []);
+
+  /** Re-read what the core actually selected (the source of truth after any PUT). */
+  const refreshSelections = useCallback(async () => {
+    try {
+      const data = await clashJson<ClashProxiesResponse>("proxies", clashRef.current, undefined, 10000);
+      setSelected(selectedMap(data));
+    } catch {
+      /* keep the optimistic state; the next load will correct it */
+    }
+  }, []);
+
   const applyToAll = useCallback(
-    async (server: string) => {
-      setBulkServer(server);
-      setBusy("__all__");
-      setError("");
-      const conn = clashRef.current;
-      try {
-        const targets = groups.filter(
-          (g) => !isBulkSkipGroup(g.name) && g.nodes.some((n) => n.name === server),
-        );
+    (server: string) =>
+      runExclusive("__all__", async () => {
+        setBulkServer(server);
+        setBulkReport(null);
+        setError("");
+        const conn = clashRef.current;
+        const opId = newOpId();
+        const eligible = groups.filter((g) => !isBulkSkipGroup(g.name));
+        const targets = eligible.filter((g) => g.nodes.some((n) => n.name === server));
+        const missing = eligible.filter((g) => !targets.includes(g)).map((g) => g.name);
         if (!targets.length) {
-          throw new ApiError(400, t("proxies.noGroupsForServer"));
+          journal({ id: opId, op: "bulk", to: server, result: "skipped", detail: "no target groups" });
+          setError(t("proxies.noGroupsForServer"));
+          return;
         }
 
-        const next: Record<string, string> = { ...selected };
+        const failed: string[] = [];
         // Parallel batches to avoid very long waits with many groups
         const chunkSize = 8;
         for (let i = 0; i < targets.length; i += chunkSize) {
           const chunk = targets.slice(i, i + chunkSize);
-          await Promise.all(
-            chunk.map(async (g) => {
-              await clashJson(
-                `proxies/${encodeURIComponent(g.name)}`,
-                conn,
-                {
-                  method: "PUT",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ name: server }),
-                },
-                10000,
-              );
-              next[g.name] = server;
-            }),
+          const results = await Promise.allSettled(
+            chunk.map((g) => putProxySelection(conn, g.name, server)),
           );
+          results.forEach((r, k) => {
+            const group = chunk[k].name;
+            if (r.status === "rejected") failed.push(group);
+            journal({
+              id: opId,
+              op: "bulk",
+              group,
+              from: selected[group],
+              to: server,
+              result: r.status === "fulfilled" ? "ok" : "error",
+              detail: r.status === "rejected" ? journalError(r.reason) : undefined,
+            });
+          });
         }
-        setSelected({ ...next });
-      } catch (err) {
-        setError(apiErr(err, "proxies.switchError"));
-        await loadProxies();
-      } finally {
-        setBusy("");
-      }
-    },
-    [groups, selected, t, loadProxies],
+        await refreshSelections();
+        setBulkReport({ server, applied: targets.length - failed.length, failed, missing });
+      }),
+    [groups, selected, t, runExclusive, refreshSelections],
   );
 
   const selectProxy = useCallback(
-    async (groupName: string, nodeName: string) => {
-      setBusy(groupName);
-      setError("");
-      try {
-        await clashJson(
-          `proxies/${encodeURIComponent(groupName)}`,
-          clashRef.current,
-          {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name: nodeName }),
-          },
-          10000,
-        );
-        setSelected((s) => ({ ...s, [groupName]: nodeName }));
-      } catch (err) {
-        setError(apiErr(err, "proxies.switchError"));
-      } finally {
-        setBusy("");
-      }
-    },
-    [t],
+    (groupName: string, nodeName: string) =>
+      runExclusive(groupName, async () => {
+        setError("");
+        const opId = newOpId();
+        const from = selected[groupName];
+        try {
+          await putProxySelection(clashRef.current, groupName, nodeName);
+          setSelected((s) => ({ ...s, [groupName]: nodeName }));
+          journal({ id: opId, op: "select", group: groupName, from, to: nodeName, result: "ok" });
+        } catch (err) {
+          journal({
+            id: opId,
+            op: "select",
+            group: groupName,
+            from,
+            to: nodeName,
+            result: "error",
+            detail: journalError(err),
+          });
+          setError(apiErr(err, "proxies.switchError"));
+        }
+        await refreshSelections();
+      }),
+    [selected, t, runExclusive, refreshSelections],
   );
 
   const testDelay = useCallback(
@@ -337,7 +391,7 @@ export function ProxiesPage() {
 
   const serverNames = useMemo(() => providerProxies.map((p) => p.name), [providerProxies]);
 
-  const applySubscription = useCallback(async () => {
+  const applySubscription = useCallback(() => runExclusive("__config__", async () => {
     setSubSaving(true);
     setError("");
     try {
@@ -363,7 +417,7 @@ export function ProxiesPage() {
     } finally {
       setSubSaving(false);
     }
-  }, [cfg, setClash, refreshSession, loadProxies, apiErr, subUrl, subHwid, subUa, t]);
+  }), [cfg, setClash, refreshSession, loadProxies, apiErr, subUrl, subHwid, subUa, t, runExclusive]);
 
   const testAllServers = useCallback(async () => {
     setTesting(true);
@@ -407,18 +461,20 @@ export function ProxiesPage() {
     }
   }, [serverNames, testDelay, t]);
 
-  const refreshProvider = useCallback(async () => {
+  const refreshProvider = useCallback(() => runExclusive("__config__", async () => {
     setRefreshing(true);
     setError("");
     try {
-      await refreshProxyProvider(DEFAULT_PROVIDER, clashRef.current);
+      await withSelectionSnapshots("refresh-provider", clashRef.current, () =>
+        refreshProxyProvider(DEFAULT_PROVIDER, clashRef.current),
+      );
       await loadProxies();
     } catch (err) {
       setError(apiErr(err, "proxies.refreshError"));
     } finally {
       setRefreshing(false);
     }
-  }, [loadProxies, t]);
+  }), [loadProxies, t, runExclusive]);
 
   const refreshGeo = useCallback(async () => {
     setGeoUpdating(true);
@@ -443,24 +499,27 @@ export function ProxiesPage() {
   }, [t]);
 
   const applyCoreMode = useCallback(
-    async (value: string) => {
-      setModeSaving(true);
-      setError("");
-      try {
-        const loaded = await fetchMihomoConfig();
-        if (!loaded) throw new ApiError(404, t("config.notFound"));
-        const updated = setTopLevelScalar(loaded.content, "mode", value);
-        await saveMihomoConfig(loaded.path, updated, false);
-        const conn = await applyMihomoConfigChanges(clashRef.current);
-        setClash(conn);
-        setCoreMode(value);
-      } catch (err) {
-        setError(apiErr(err, "proxies.modeError"));
-      } finally {
-        setModeSaving(false);
-      }
-    },
-    [setClash, t],
+    (value: string) =>
+      runExclusive("__mode__", async () => {
+        setModeSaving(true);
+        setError("");
+        try {
+          const loaded = await fetchMihomoConfig();
+          if (!loaded) throw new ApiError(404, t("config.notFound"));
+          const updated = setTopLevelScalar(loaded.content, "mode", value);
+          await saveMihomoConfig(loaded.path, updated, false);
+          journal({ id: newOpId(), op: "mode", from: coreMode, to: value, result: "ok" });
+          const conn = await applyMihomoConfigChanges(clashRef.current);
+          setClash(conn);
+          setCoreMode(value);
+        } catch (err) {
+          setError(apiErr(err, "proxies.modeError"));
+        } finally {
+          setModeSaving(false);
+        }
+        await refreshSelections();
+      }),
+    [setClash, t, runExclusive, refreshSelections, coreMode],
   );
 
   if (loading) {
@@ -488,9 +547,14 @@ export function ProxiesPage() {
         <div>
           <h1 className="text-xl font-bold tracking-tight sm:text-2xl">{t("proxies.title")}</h1>
         </div>
-        <Button size="sm" variant="ghost" onClick={loadProxies} disabled={!!busy || refreshing}>
-          ⟳
-        </Button>
+        <div className="flex gap-1.5">
+          <Button size="sm" variant="ghost" onClick={exportJournal} title={t("proxies.journalHint")}>
+            {t("proxies.journalExport")}
+          </Button>
+          <Button size="sm" variant="ghost" onClick={loadProxies} disabled={!!busy || refreshing}>
+            ⟳
+          </Button>
+        </div>
       </div>
 
       <div className="flex rounded-xl border border-zk-border-soft bg-zk-bg-elevated p-1">
@@ -661,7 +725,8 @@ export function ProxiesPage() {
                 label={t("proxies.allTo")}
                 options={bulkServers.map((n) => ({ value: n, label: n }))}
                 value={bulkServer}
-                onChange={applyToAll}
+                disabled={!!busy}
+                onChange={(v) => void applyToAll(v)}
               />
               <div className="flex min-w-0 flex-1 items-end gap-2">
                 <Select
@@ -669,6 +734,7 @@ export function ProxiesPage() {
                   className="min-w-0 flex-1"
                   label={t("proxies.modeTitle")}
                   value={coreMode}
+                  disabled={!!busy}
                   onChange={(v) => void applyCoreMode(v)}
                   options={[
                     { value: "rule", label: "rule" },
@@ -679,6 +745,23 @@ export function ProxiesPage() {
                 {modeSaving && <span className="shrink-0 pb-2 text-xs text-zk-muted">{t("app.loading")}</span>}
               </div>
             </div>
+            {bulkReport && (
+              <div className="space-y-0.5 border-t border-zk-border-soft px-3 py-2 text-[11px] sm:px-4">
+                <p className="text-zk-muted">
+                  {t("proxies.bulkApplied", { server: bulkReport.server, count: bulkReport.applied })}
+                </p>
+                {bulkReport.failed.length > 0 && (
+                  <p className="text-zk-coral">
+                    {t("proxies.bulkFailed", { groups: bulkReport.failed.join(", ") })}
+                  </p>
+                )}
+                {bulkReport.missing.length > 0 && (
+                  <p className="text-zk-dim">
+                    {t("proxies.bulkMissing", { groups: bulkReport.missing.join(", ") })}
+                  </p>
+                )}
+              </div>
+            )}
           </Card>
 
           <input
@@ -695,6 +778,7 @@ export function ProxiesPage() {
               const current = selected[group.name];
               const currentDelay = current ? delays[current] : undefined;
               const isGroupBusy = busy === group.name || busy === "__all__";
+              const locked = !!busy;
               return (
                 <Card key={group.name} className="overflow-hidden">
                   <button
@@ -749,8 +833,8 @@ export function ProxiesPage() {
                             <button
                               key={node.name}
                               type="button"
-                              disabled={isGroupBusy}
-                              onClick={() => selectProxy(group.name, node.name)}
+                              disabled={locked}
+                              onClick={() => void selectProxy(group.name, node.name)}
                               className={`flex items-center justify-between rounded-xl px-3 py-2 text-sm transition-colors ${
                                 isActive
                                   ? "bg-zk-accent/10 border border-zk-accent/25 text-zk-accent"

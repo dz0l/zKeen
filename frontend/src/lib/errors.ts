@@ -38,6 +38,8 @@ const CODE_KEYS: Record<string, string> = {
   invalid_timezone: "api.invalidTimezone",
   ping_url_empty: "api.pingUrlEmpty",
   ping_timeout_invalid: "api.pingTimeoutInvalid",
+  unsupported_yaml_layout: "api.unsupportedYamlLayout",
+  update_in_progress: "api.updateInProgress",
 };
 
 /** Legacy Russian backend strings → codes (compat during rollout) */
@@ -73,6 +75,9 @@ function resolveCode(raw: string): { code: string; params?: Record<string, strin
     /^(restart_failed|start_failed|save_failed|install_failed|unpack_failed)(?::|$)/,
   );
   if (withPrefix) return { code: withPrefix[1] };
+
+  const layout = raw.match(/^unsupported_yaml_layout:(.+)$/);
+  if (layout) return { code: "unsupported_yaml_layout", params: { section: layout[1] } };
 
   if (/^Слишком много попыток/.test(raw)) {
     const sec = raw.match(/(\d+)/)?.[1] || "60";

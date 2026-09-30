@@ -2,7 +2,7 @@ use crate::types::MIHOMO_CONF_DIR;
 use crate::logger::log;
 use crate::types::*;
 use axum::extract::State;
-use axum::http::{HeaderMap, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -12,13 +12,40 @@ use std::io::{Cursor, Read, Seek, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 const GITHUB_API: &str = "https://api.github.com/repos";
 const GITHUB_RELEASE: &str = "https://github.com";
+
+const OPT_TMP: &str = "/opt/tmp";
+/// Each update stages its files in its own `/opt/tmp/zkeen-update-<uuid>/`.
+const OP_DIR_PREFIX: &str = "zkeen-update-";
+/// Leftovers of a killed run are removed only after this age.
+const STALE_AFTER: Duration = Duration::from_secs(3600);
+
+static UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Held for the whole update; a concurrent request gets 409 instead of sharing staging files.
+struct UpdateGuard;
+
+impl UpdateGuard {
+    fn acquire() -> Option<Self> {
+        UPDATE_RUNNING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| UpdateGuard)
+    }
+}
+
+impl Drop for UpdateGuard {
+    fn drop(&mut self) {
+        UPDATE_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
 
 #[derive(Deserialize)]
 struct GhAsset {
@@ -304,10 +331,14 @@ fn tag_from_release_html(body: &str) -> Option<String> {
     None
 }
 
-fn response(success: bool, error: Option<String>) -> (HeaderMap, Json<Value>) {
+fn response(success: bool, error: Option<String>) -> (StatusCode, HeaderMap, Json<Value>) {
+    response_with(StatusCode::OK, success, error)
+}
+
+fn response_with(status: StatusCode, success: bool, error: Option<String>) -> (StatusCode, HeaderMap, Json<Value>) {
     let mut h = HeaderMap::new();
     h.insert(header::CONNECTION, "close".parse().unwrap());
-    (h, Json(json!({ "success": success, "error": error })))
+    (status, h, Json(json!({ "success": success, "error": error })))
 }
 
 async fn download(
@@ -445,45 +476,62 @@ async fn save(dl: DownloadResult, out_path: PathBuf) -> std::io::Result<()> {
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
 }
 
-/// Remove known install/update leftovers under `/opt/tmp` (and archive copies in `/opt/sbin`).
-/// Does not wipe the whole tmp dir — other tools may store files there.
-/// Never touches `/opt/etc/mihomo/cache.db` (Mihomo `store-selected` for group picks).
-async fn cleanup_opt_tmp() {
-    let prefixes = [
-        "xkeen.tar",
-        "mihomo.gz",
-        "zkeen-ui",
-        "bin.tmp",
-        "download.tmp",
-        "yq.tmp",
-        "yq.bin",
-        "mihomo-config.default",
-        "mihomo_v",
-        "mihomo_",
-        "xray_v",
-        "xray_",
-        "zkeen-ui_",
-        "convert_",
-    ];
-    if let Ok(mut entries) = fs::read_dir("/opt/tmp").await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let remove = prefixes.iter().any(|p| name.starts_with(p))
-                || name.ends_with(".tmp")
-                || name.contains(".tmp.");
-            if remove {
-                let path = entry.path();
-                if path.is_dir() {
-                    _ = fs::remove_dir_all(&path).await;
-                } else {
-                    _ = fs::remove_file(&path).await;
-                }
-            }
+/// Names this updater itself leaves behind: operation dirs and the fixed staging
+fn is_own_leftover(name: &str) -> bool {
+    if name.starts_with(OP_DIR_PREFIX) {
+        return true;
+    }
+    if matches!(name, "bin.tmp" | "download.tmp" | "yq.tmp" | "yq.bin" | "mihomo_Prerelease-Alpha") {
+        return true;
+    }
+    ["zkeen-ui_v", "mihomo_v", "xray_v"].iter().any(|p| {
+        name.strip_prefix(p)
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+    })
+}
+
+fn is_stale(meta: &std::fs::Metadata) -> bool {
+    meta.modified()
+        .ok()
+        .and_then(|m| SystemTime::now().duration_since(m).ok())
+        .is_some_and(|age| age > STALE_AFTER)
+}
+
+/// Remove our own leftovers of interrupted runs. Other files in `/opt/tmp` are never touched;
+/// `/opt/etc/mihomo/cache.db` (store-selected) is outside this directory.
+async fn sweep_stale_leftovers(current: &Path) {
+    let Ok(mut entries) = fs::read_dir(OPT_TMP).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path == current || !is_own_leftover(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        if !is_stale(&meta) {
+            continue;
+        }
+        let removed = if meta.is_dir() {
+            fs::remove_dir_all(&path).await
+        } else {
+            fs::remove_file(&path).await
+        };
+        match removed {
+            Ok(()) => log("INFO", format!("Удалены остатки прерванного обновления: {}", path.display())),
+            Err(e) => log("WARN", format!("Не удалось удалить {}: {}", path.display(), e)),
         }
     }
-    _ = fs::remove_file("/opt/sbin/xkeen.tar.gz").await;
-    log("INFO", "Временные файлы обновления очищены".into());
+}
+
+async fn remove_op_dir(dir: &Path) {
+    match fs::remove_dir_all(dir).await {
+        Ok(()) => log("INFO", "Временные файлы обновления очищены".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log("WARN", format!("Не удалось удалить {}: {}", dir.display(), e)),
+    }
 }
 
 async fn install_jq() -> Result<(), String> {
@@ -547,6 +595,22 @@ async fn install_yq(client: &reqwest::Client, proxies: &[String], tmp_dir: &Path
 }
 
 pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateReq>) -> impl IntoResponse {
+    let Some(_guard) = UpdateGuard::acquire() else {
+        log("WARN", "Обновление уже выполняется — повторный запрос отклонён".into());
+        return response_with(StatusCode::CONFLICT, false, Some("update_in_progress".into()));
+    };
+    let op_dir = Path::new(OPT_TMP).join(format!("{OP_DIR_PREFIX}{}", uuid::Uuid::new_v4().simple()));
+    if let Err(e) = fs::create_dir_all(&op_dir).await {
+        log("ERROR", format!("Не удалось создать {}: {}", op_dir.display(), e));
+        return response(false, Some("save_failed".into()));
+    }
+    sweep_stale_leftovers(&op_dir).await;
+    let res = run_update(&state, req, &op_dir).await;
+    remove_op_dir(&op_dir).await;
+    res
+}
+
+async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (StatusCode, HeaderMap, Json<Value>) {
     let Some(repo) = get_repo(&req.core) else {
         return response(false, Some("unknown_core".into()));
     };
@@ -569,8 +633,6 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
         ),
     );
 
-    let tmp_dir = Path::new("/opt/tmp");
-    _ = fs::create_dir_all(tmp_dir).await;
     let proxies = state.settings.read().unwrap().updater.github_proxy.clone();
     let arch = std::env::consts::ARCH;
 
@@ -621,8 +683,6 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
 
         if let Err(e) = integrity_check {
             _ = std::fs::remove_file(&source);
-            _ = fs::remove_file(tmp_dir.join("bin.tmp")).await;
-            cleanup_opt_tmp().await;
             return response(false, Some(e));
         }
 
@@ -640,7 +700,8 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
         }
         _ = tokio::task::spawn_blocking(rustix::fs::sync).await;
 
-        cleanup_opt_tmp().await;
+        // The restart below may stop this process before post_update cleans up.
+        remove_op_dir(tmp_dir).await;
         log("INFO", format!("Обновление zKeen UI до {} завершено", ver));
 
         if Path::new(S99ZKEEN_UI).exists() {
@@ -738,9 +799,8 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
         Ok(())
     }
 
-    let tmp_name = format!("{}_{}", core_name, ver);
+    let bin = tmp_dir.join(format!("{}_{}", core_name, ver));
     let unpack = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        let bin = tmp_dir.join(&tmp_name);
         match dl_res {
             DownloadResult::RAM(d) => unpack(Cursor::new(d), &bin, &core_name, is_zip)?,
             DownloadResult::Disk(p) => {
@@ -786,7 +846,7 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
         log("WARN", "Атомарная замена не удалась, фолбек на копирование...".into());
         if run {
             log("INFO", "Остановка XKeen...".into());
-            _ = crate::controller::run_init_command(&state, &["stop"]).await;
+            _ = crate::controller::run_init_command(state, &["stop"]).await;
         }
         if let Err(e) = fs::copy(&source, &target).await {
             return response(false, Some("install_failed".to_string()));
@@ -795,7 +855,7 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
         _ = fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).await;
         if run {
             log("INFO", "Запуск XKeen...".into());
-            _ = crate::controller::run_init_command(&state, &["start", "on"]).await;
+            _ = crate::controller::run_init_command(state, &["start", "on"]).await;
         }
     }
 
@@ -810,6 +870,5 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
     }
     *state.update_checker.last_core_toast.write().unwrap() = None;
 
-    cleanup_opt_tmp().await;
     response(true, None)
 }
