@@ -1,3 +1,5 @@
+import { readTopLevelScalar } from "./mihomoYaml";
+
 export class ApiError extends Error {
   status: number;
 
@@ -66,24 +68,24 @@ export function saveClashConnection(conn: ClashConnection) {
   localStorage.setItem(CLASH_KEY, JSON.stringify(conn));
 }
 
-export function parseClashFromYaml(yaml: string): Partial<ClashConnection> {
-  const result: Partial<ClashConnection> = {};
-  const ec = yaml.match(/^external-controller:\s*['"]?([^'"\n#]+)/m)?.[1]?.trim();
-  if (ec) {
-    if (ec.startsWith("/")) {
-      const parts = ec.split("/");
-      result.unix = parts[parts.length - 1] || "";
-    } else if (ec.includes(":")) {
-      result.port = ec.split(":").pop() || "9090";
-    } else {
-      result.port = ec;
-    }
-  }
-  const secret = yaml.match(/^secret:\s*['"]?([^'"\n#]+)/m)?.[1]?.trim();
-  if (secret && secret !== '""' && secret !== "''") {
-    result.secret = secret.replace(/^['"]|['"]$/g, "");
-  }
-  return result;
+function socketName(path: string): string {
+  return path.split("/").pop() || "";
+}
+
+/**
+ * Controller address from config.yaml: TCP `external-controller` when set, otherwise
+ * `external-controller-unix` (socket inside the Mihomo directory). Every field is
+ * returned, so a removed secret or transport does not survive from an older value.
+ * `null` when the config enables no controller.
+ */
+export function parseClashFromYaml(yaml: string): ClashConnection | null {
+  const ec = readTopLevelScalar(yaml, "external-controller")?.trim() ?? "";
+  const unix = readTopLevelScalar(yaml, "external-controller-unix")?.trim() ?? "";
+  const secret = readTopLevelScalar(yaml, "secret") ?? "";
+  if (ec.startsWith("/")) return { port: "", secret, unix: socketName(ec) };
+  if (ec) return { port: ec.includes(":") ? ec.split(":").pop() || "9090" : ec, secret, unix: "" };
+  if (unix) return { port: "", secret, unix: socketName(unix) };
+  return null;
 }
 
 export function clashHeaders(conn: ClashConnection): HeadersInit {

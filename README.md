@@ -2,104 +2,67 @@
 
 [English](README.EN.md)
 
-Панель управления **XKeen** / **Mihomo** для устройств с Entware (основной сценарий - Keenetic).
+Веб-панель для **XKeen** и **Mihomo** на роутерах Keenetic с Entware. Подписка, выбор серверов, правила и обновления настраиваются в браузере, без правки файлов по SSH.
+
+![Меню zKeen UI](screenshots/zkeenmenu.gif)
+
+## Возможности
+
+- **Подписка.** Ссылка, HWID и User-Agent задаются в панели. Остальные настройки провайдера в конфиге при этом не трогаются.
+- **Серверы.** Выбор сервера для каждой группы, переключение всех групп на один сервер, проверка задержки, обновление подписки и GEO-баз.
+- **Группы и правила.** Создание, переименование и удаление групп вместе с их правилами. Ссылки на группу в других правилах обновляются автоматически.
+- **Политики.** Отдельные устройства (по IP) и домены можно направить через прокси или напрямую.
+- **Редактор конфига.** Проверка ядром перед сохранением, резервная копия прежнего файла. Если Mihomo не принял новый конфиг, панель сама возвращает прежний.
+- **Мониторинг.** Состояние ядра, трафик, активные соединения и логи Mihomo.
+- **Обновления.** zKeen UI и Mihomo обновляются из панели. Для тех, кто хочет пробовать новое раньше, есть beta-канал.
+
+Режим **Safe** подтверждает и проверяет каждое изменение. Режим **Expert** открывает дополнительные настройки и правку конфига без обязательной проверки.
 
 ## Требования
 
-- Основной сценарий: Keenetic с Entware 
+- Keenetic с установленным Entware и доступом по SSH.
+- Процессор **aarch64** (ARM64) или **mipsel**.
+- Пакеты `curl` и `ca-certificates`:
 
 ```sh
 opkg update
 opkg install curl ca-certificates
 ```
 
-## Установка (stable)
+## Установка
 
-по SSH:
+Подключитесь к роутеру по SSH и выполните:
 
 ```sh
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/dz0l/zKeen/main/install.sh)"
 ```
 
-Скрипт установит **zkeen-ui**, при необходимости - **XKeen** и **Mihomo**.
+Скрипт поставит zKeen UI, а если их ещё нет, то XKeen и Mihomo.
 
-Панель: `http://<IP_или_хост>:7220`
+После установки панель открывается по адресу `http://<IP роутера>:7220`. При первом входе панель попросит ссылку на подписку.
 
-Если вы запускаете через Keenetic и используете policy routing: после установки добавьте устройства в **политику XKeen** в веб-интерфейсе Keenetic.
+Если на Keenetic используется маршрутизация по политикам, добавьте нужные устройства в политику **XKeen** в веб-интерфейсе роутера.
 
-## Beta (тестовые сборки)
+## Beta-версии
 
-**beta** (GitHub Pre-release). Stable (**Latest**).
+Beta-сборки публикуются как Pre-release на странице [Releases](https://github.com/dz0l/zKeen/releases). В них раньше появляются новые функции, но возможны ошибки, поэтому перед переходом стоит сохранить копию `/opt/etc/mihomo/config.yaml` (кнопка «Экспорт» в редакторе конфига).
 
-```sh
-# перейти на beta
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/dz0l/zKeen/main/install.sh)" -- beta
-```
+Канал переключается в панели: **Настройки → Обновления → Beta-версии zkeen-ui** (виден в режиме Expert).
 
-**Канал запоминается** в `/opt/etc/xkeen/zkeen-ui.channel`. Дальнейшие обновления без смены канала остаются на beta:
+## Если панель не открывается
 
 ```sh
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/dz0l/zKeen/main/install.sh)" -- --update
+zkeen status           # работает ли сервис
+zkeen restart          # перезапустить панель
+zkeen reset-password   # сбросить пароль панели
 ```
 
-Вернуться на stable:
-
-```sh
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/dz0l/zKeen/main/install.sh)" -- --stable
-# или сразу обновить до Latest:
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/dz0l/zKeen/main/install.sh)" -- --update --stable
-```
-
-Проверка:
-
-```sh
-cat /opt/etc/xkeen/zkeen-ui.channel   # beta | stable
-zkeen -v
-```
-
-для тестеров:
-
-- Beta может содержать незавершённые изменения; перед тестом желателен бэкап `/opt/etc/mihomo/config.yaml`.
-- Обновление из панели (**Настройки -> Обновления**) ориентируется на stable (Latest). Для beta используйте команды по SSH.
-- Список pre-release: [Releases](https://github.com/dz0l/zKeen/releases)
-
-
-
-## Скриншоты
-
-![Меню zKeen UI](screenshots/zkeenmenu.gif)
-
-
-## Обновление
-
-В панели (stable): **Настройки -> Обновления -> zkeen-ui**
-
-Или по SSH (учитывает сохранённый канал `stable` / `beta`):
-
-```sh
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/dz0l/zKeen/main/install.sh)" -- --update
-```
-
-
+Порт по умолчанию 7220. Если он был изменён в настройках, используйте новый.
 
 ## Удаление
 
 ```sh
-/opt/etc/init.d/S99zkeen-ui stop
-rm -f /opt/sbin/zkeen-ui /opt/sbin/zkeen /opt/etc/init.d/S99zkeen-ui
-rm -f /opt/etc/xkeen/zkeen-ui.json
-rm -f /opt/etc/xkeen/zkeen-ui.channel
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/dz0l/zKeen/main/install.sh)" -- --uninstall
 ```
 
-Конфиги Mihomo (`/opt/etc/mihomo`) и XKeen скрипт не удаляет.
-
-## Команды
-
-```sh
-zkeen -v                 # версия
-zkeen -p 8080            # порт (по умолчанию 7220)
-zkeen status             # статус сервиса
-zkeen ?                  # справка (как -h / --help)
-/opt/etc/init.d/S99zkeen-ui start|stop|restart|status
-zkeen reset-password     # сброс пароля панели
-```
+Скрипт удалит zKeen UI и спросит, удалять ли его настройки. Mihomo, XKeen и конфиги в `/opt/etc/mihomo` остаются на месте.

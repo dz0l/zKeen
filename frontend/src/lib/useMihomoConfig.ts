@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useApiError } from "./errors";
 import { useT } from "./i18n";
+import type { ClashConnection } from "./api";
 import {
+  commitMihomoConfig,
+  ConfigApplyError,
   fetchMihomoConfig,
   getSubscriptionHwid,
   getSubscriptionUrl,
   getSubscriptionUserAgent,
-  saveMihomoConfig,
   updateSubscriptionProvider,
 } from "./config";
 
@@ -54,16 +56,32 @@ export function useMihomoConfig() {
     setDirty(true);
   }, []);
 
-  /** Save exactly `content` (a snapshot taken by the caller); edits made meanwhile stay dirty. */
-  const save = useCallback(
-    async (content: string, validate: boolean) => {
+  /**
+   * Save and apply exactly `content` (a snapshot taken by the caller); edits made meanwhile
+   * stay dirty. If apply fails, the previous file is written back (see commitMihomoConfig).
+   */
+  const commit = useCallback(
+    async (clash: ClashConnection, content: string, validate: boolean) => {
       if (!configPath) throw new Error("config not found");
-      const res = await saveMihomoConfig(configPath, content, validate);
-      setSavedYaml(content);
-      setDirty(yamlRef.current !== content);
-      return res;
+      const markSaved = (text: string) => {
+        setSavedYaml(text);
+        setDirty(yamlRef.current !== text);
+      };
+      try {
+        const res = await commitMihomoConfig(clash, {
+          path: configPath,
+          content,
+          previous: savedYaml,
+          validate,
+        });
+        markSaved(content);
+        return res;
+      } catch (err) {
+        if (err instanceof ConfigApplyError && !err.rolledBack) markSaved(content);
+        throw err;
+      }
     },
-    [configPath],
+    [configPath, savedYaml],
   );
 
   const subscriptionUrl = getSubscriptionUrl(yaml);
@@ -94,7 +112,7 @@ export function useMihomoConfig() {
     dirty,
     savedYaml,
     load,
-    save,
+    commit,
     subscriptionUrl,
     subscriptionHwid,
     subscriptionUserAgent,

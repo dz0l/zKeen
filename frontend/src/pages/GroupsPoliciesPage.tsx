@@ -10,15 +10,12 @@ import { useApp } from "../lib/store";
 import { useT } from "../lib/i18n";
 import { useSession } from "../lib/session";
 import { useApiError } from "../lib/errors";
-import {
-  applyMihomoConfigChanges,
-  fetchMihomoConfig,
-  saveMihomoConfig,
-} from "../lib/config";
+import { commitMihomoConfig, fetchMihomoConfig } from "../lib/config";
 import {
   defaultNewGroup,
   deleteProxyGroup,
   ensurePolicyGroups,
+  groupDependencies,
   listUserProxyGroups,
   normalizePolicyDomain,
   normalizePolicyIp,
@@ -228,9 +225,13 @@ export function GroupsPoliciesPage({
     setSaving(true);
     setError("");
     try {
-      await saveMihomoConfig(configPath || "/opt/etc/mihomo/config.yaml", nextYaml, true);
-      const conn = await applyMihomoConfigChanges(clash);
-      setClash(conn);
+      const res = await commitMihomoConfig(clash, {
+        path: configPath,
+        content: nextYaml,
+        previous: yaml,
+        validate: true,
+      });
+      setClash(res.clash);
       setYaml(nextYaml);
     } finally {
       setSaving(false);
@@ -286,7 +287,21 @@ export function GroupsPoliciesPage({
 
   const handleDeleteGroup = async (name: string) => {
     try {
-      await persist(deleteProxyGroup(yaml, name));
+      const next = deleteProxyGroup(yaml, name);
+      const deps = groupDependencies(yaml, name);
+      if (
+        (deps.groups.length || deps.rules.length) &&
+        !window.confirm(
+          t("groups.deleteDeps", {
+            name,
+            groups: deps.groups.join(", ") || "—",
+            rules: deps.rules.length,
+          }),
+        )
+      ) {
+        return;
+      }
+      await persist(next);
       setDraft(null);
     } catch (err) {
       setError(apiErr(err, "groups.saveError"));

@@ -42,6 +42,14 @@ export class YamlLayoutError extends Error {
   }
 }
 
+/** A group edit would leave a reference the panel cannot fix; nothing is written. */
+export class GroupInUseError extends Error {
+  constructor(reason: "match" | "sub-rules" | "empty", detail: string) {
+    super(`group_in_use:${reason}:${detail}`);
+    this.name = "GroupInUseError";
+  }
+}
+
 export const RULE_TYPES = [
   "DOMAIN-SUFFIX",
   "DOMAIN",
@@ -230,6 +238,16 @@ function findSection(lines: string[], key: string): Section | null {
     return { header: i, start: i + 1, end, inline: stripComment(m[1] ?? "").trim() };
   }
   return null;
+}
+
+/**
+ * Value of a top-level scalar key (`secret: "a#b"  # note` → `a#b`);
+ * `undefined` when the key is absent, `""` when it is empty or null.
+ */
+export function readTopLevelScalar(yaml: string, key: string): string | undefined {
+  const sec = findSection(toLines(yaml), key);
+  if (!sec) return undefined;
+  return /^(~|null)$/i.test(sec.inline) ? "" : unquote(sec.inline);
 }
 
 interface SeqItem {
@@ -677,8 +695,58 @@ export function upsertProxyGroup(
   });
 }
 
-/** Remove a group item, its GLOBAL entry and simple rules targeting it; other lines stay untouched. */
+export interface GroupDependencies {
+  /** Groups (except GLOBAL) that list the group in `proxies`. */
+  groups: string[];
+  /** Rules targeting the group: simple, AND/OR/NOT, policy block and MATCH. */
+  rules: string[];
+  match: boolean;
+  /** Referenced inside `sub-rules:` (not edited by the panel). */
+  subRules: boolean;
+  /** Groups that would be left with neither `proxies` nor `use` after removal. */
+  emptied: string[];
+}
+
+function subRulesReference(lines: string[], name: string): boolean {
+  const sec = findSection(lines, "sub-rules");
+  if (!sec) return false;
+  for (let i = sec.start; i < sec.end; i++) {
+    const m = lines[i].match(/^ *-\s+(.*)$/);
+    if (m && parseRuleRaw(scalar(m[1])).target === name) return true;
+  }
+  return false;
+}
+
+export function groupDependencies(yaml: string, name: string): GroupDependencies {
+  const lines = toLines(yaml);
+  const groups: string[] = [];
+  const emptied: string[] = [];
+  for (const g of parseProxyGroups(yaml)) {
+    if (g.name === name || g.name === "GLOBAL" || !g.proxies?.includes(name)) continue;
+    groups.push(g.name);
+    const includesAll = /^\s*include-all(-proxies|-providers)?\s*:\s*true\b/m.test(g.rawBody ?? "");
+    if (g.proxies.every((p) => p === name) && !g.use?.length && !includesAll) emptied.push(g.name);
+  }
+  const rules = (viewRules(lines, false)?.rules ?? []).filter((r) => r.target === name);
+  return {
+    groups,
+    rules: rules.map((r) => r.raw),
+    match: rules.some((r) => r.type === "MATCH"),
+    subRules: subRulesReference(lines, name),
+    emptied,
+  };
+}
+
+/**
+ * Remove a group with every reference to it: `proxies` entries of other groups and
+ * rules targeting it (simple and AND/OR/NOT). Refuses without writing when a
+ * reference cannot be dropped: MATCH, `sub-rules`, or a group that would become empty.
+ */
 export function deleteProxyGroup(yaml: string, name: string): string {
+  const deps = groupDependencies(yaml, name);
+  if (deps.match) throw new GroupInUseError("match", name);
+  if (deps.subRules) throw new GroupInUseError("sub-rules", name);
+  if (deps.emptied.length) throw new GroupInUseError("empty", deps.emptied.join(", "));
   return withLf(yaml, (text) => {
     let lines = text.split("\n");
     const v = viewGroups(lines, true);
@@ -690,15 +758,19 @@ export function deleteProxyGroup(yaml: string, name: string): string {
       if (at > 0 && at < lines.length && isBlank(lines[at - 1]) && isBlank(lines[at])) {
         lines = splice(lines, at, at + 1, []);
       }
-      lines = listRemove(lines, "GLOBAL", "proxies", name);
+      for (const g of ["GLOBAL", ...deps.groups]) lines = listRemove(lines, g, "proxies", name);
     }
-    return removeRuleLines(lines, (r) => r.target === name && r.type !== "COMPLEX").join("\n");
+    return removeRuleLines(lines, (r) => r.target === name).join("\n");
   });
 }
 
-/** Rename references to a group: `proxies` lists of all groups and simple rule targets (incl. MATCH). */
+/**
+ * Rename references to a group: `proxies` lists of all groups and rule targets
+ * (simple, AND/OR/NOT, MATCH). Refuses when `sub-rules` reference it.
+ */
 export function renameGroupReferences(yaml: string, from: string, to: string): string {
   if (from === to) return yaml;
+  if (subRulesReference(toLines(yaml), from)) throw new GroupInUseError("sub-rules", from);
   return withLf(yaml, (text) => {
     let lines = text.split("\n");
     const v = viewGroups(lines, true);
@@ -748,6 +820,186 @@ export function ensurePolicyGroups(yaml: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Proxy-providers (subscription url / User-Agent / x-hwid)
+
+interface MapEntry {
+  key: string;
+  line: number;
+  /** Exclusive; trailing blanks and outer comments excluded. */
+  end: number;
+  indent: number;
+  value: string;
+}
+
+/** Keys of a block mapping in [start, end) at their common indent. */
+function mapEntries(lines: string[], start: number, end: number): MapEntry[] {
+  let ind = -1;
+  const out: MapEntry[] = [];
+  for (let i = start; i < end; i++) {
+    const l = lines[i];
+    if (isBlank(l) || isComment(l)) continue;
+    const d = indentOf(l);
+    if (ind < 0) ind = d;
+    if (d !== ind) continue;
+    const km = l.slice(d).match(KEY_RE);
+    if (km) out.push({ key: unquote(km[1]), line: i, end: -1, indent: d, value: km[2] ?? "" });
+  }
+  out.forEach((e, k) => {
+    let stop = k + 1 < out.length ? out[k + 1].line : end;
+    while (
+      stop > e.line + 1 &&
+      (isBlank(lines[stop - 1]) || (isComment(lines[stop - 1]) && indentOf(lines[stop - 1]) <= e.indent))
+    ) {
+      stop--;
+    }
+    e.end = stop;
+  });
+  return out;
+}
+
+function isFlowValue(e: MapEntry): boolean {
+  return stripComment(e.value).trim() !== "";
+}
+
+interface ProviderView {
+  entry: MapEntry;
+  fields: MapEntry[];
+  duplicates: MapEntry[];
+}
+
+function viewProvider(lines: string[], provider: string, strict: boolean): ProviderView | null {
+  const sec = findSection(lines, "proxy-providers");
+  if (!sec) return null;
+  if (sec.inline && sec.inline !== "{}") {
+    if (strict) throw new YamlLayoutError("proxy-providers");
+    return null;
+  }
+  const same = mapEntries(lines, sec.start, sec.end).filter((e) => e.key === provider);
+  if (!same.length) return null;
+  const entry = same[0];
+  if (isFlowValue(entry)) {
+    if (strict) throw new YamlLayoutError("proxy-providers");
+    return null;
+  }
+  return { entry, fields: mapEntries(lines, entry.line + 1, entry.end), duplicates: same.slice(1) };
+}
+
+function findKey(entries: MapEntry[], key: string): MapEntry | undefined {
+  const k = key.toLowerCase();
+  return entries.find((e) => e.key.toLowerCase() === k);
+}
+
+/** First value of a header: `- v` list, `[v]` flow list or a plain scalar. */
+function headerValue(lines: string[], e: MapEntry): string {
+  const inline = stripComment(e.value).trim();
+  if (inline.startsWith("[")) return splitFlowList(inline.slice(1, inline.lastIndexOf("]")))[0] ?? "";
+  if (inline) return unquote(inline);
+  for (let i = e.line + 1; i < e.end; i++) {
+    const m = lines[i].match(/^ *-\s+(.*)$/);
+    if (m) return scalar(m[1]);
+  }
+  return "";
+}
+
+export interface SubscriptionFields {
+  url: string;
+  hwid: string;
+  userAgent: string;
+}
+
+/** Direct `url`/header keys of a proxy-provider, independent of key order; `null` when absent. */
+export function readSubscriptionProvider(yaml: string, provider: string): SubscriptionFields | null {
+  const lines = toLines(yaml);
+  const v = viewProvider(lines, provider, false);
+  if (!v) return null;
+  const url = findKey(v.fields, "url");
+  const header = findKey(v.fields, "header");
+  const sub = header && !isFlowValue(header) ? mapEntries(lines, header.line + 1, header.end) : [];
+  const ua = findKey(sub, "User-Agent");
+  const hwid = findKey(sub, "x-hwid");
+  return {
+    url: url ? scalar(url.value) : "",
+    userAgent: ua ? headerValue(lines, ua) : "",
+    hwid: hwid ? headerValue(lines, hwid) : "",
+  };
+}
+
+function setHeaderKey(lines: string[], provider: string, key: string, value: string | null): string[] {
+  const v = viewProvider(lines, provider, true)!;
+  const pad = v.fields[0]?.indent ?? v.entry.indent + 2;
+  const header = findKey(v.fields, "header");
+  const item = (keyIndent: number, listIndent: number, name: string, val: string) => [
+    `${" ".repeat(keyIndent)}${name}:`,
+    `${" ".repeat(keyIndent + listIndent)}- ${doubleQuoted(val)}`,
+  ];
+  if (!header) {
+    if (value === null) return lines;
+    const hc = findKey(v.fields, "health-check");
+    const at = hc ? hc.line : v.entry.end;
+    return splice(lines, at, at, [`${" ".repeat(pad)}header:`, ...item(pad + 2, 2, key, value)]);
+  }
+  if (isFlowValue(header)) throw new YamlLayoutError("proxy-providers");
+  const sub = mapEntries(lines, header.line + 1, header.end);
+  const cur = findKey(sub, key);
+  if (value === null) {
+    if (!cur) return lines;
+    if (sub.length === 1) return splice(lines, header.line, header.end, []);
+    return splice(lines, cur.line, cur.end, []);
+  }
+  if (!cur) {
+    const ind = sub[0]?.indent ?? header.indent + 2;
+    return splice(lines, header.end, header.end, item(ind, 2, key, value));
+  }
+  if (headerValue(lines, cur) === value) return lines;
+  let listIndent = 2;
+  for (let i = cur.line + 1; i < cur.end; i++) {
+    const m = lines[i].match(/^( *)-\s/);
+    if (m) {
+      listIndent = m[1].length - cur.indent;
+      break;
+    }
+  }
+  return splice(lines, cur.line, cur.end, item(cur.indent, listIndent, cur.key, value));
+}
+
+/**
+ * Change only `url`, `header.User-Agent` and `header.x-hwid` of an existing provider;
+ * filter, override, path, interval, other headers and health-check stay as they are.
+ * `hwid: ""` removes the header key. Returns `null` when the provider is absent.
+ */
+export function editSubscriptionProvider(
+  yaml: string,
+  provider: string,
+  patch: Partial<SubscriptionFields>,
+): string | null {
+  const probe = toLines(yaml);
+  if (!viewProvider(probe, provider, true)) return null;
+  return withLf(yaml, (text) => {
+    let lines = text.split("\n");
+    const first = viewProvider(lines, provider, true)!;
+    for (const d of [...first.duplicates].reverse()) lines = splice(lines, d.line, d.end, []);
+
+    if (patch.url !== undefined) {
+      const v = viewProvider(lines, provider, true)!;
+      const f = findKey(v.fields, "url");
+      if (!f || scalar(f.value) !== patch.url) {
+        const pad = f?.indent ?? v.fields[0]?.indent ?? v.entry.indent + 2;
+        const line = `${" ".repeat(pad)}url: ${doubleQuoted(patch.url)}`;
+        if (f) lines = splice(lines, f.line, f.end, [line]);
+        else {
+          const type = findKey(v.fields, "type");
+          const at = type ? type.end : v.entry.line + 1;
+          lines = splice(lines, at, at, [line]);
+        }
+      }
+    }
+    if (patch.userAgent !== undefined) lines = setHeaderKey(lines, provider, "User-Agent", patch.userAgent);
+    if (patch.hwid !== undefined) lines = setHeaderKey(lines, provider, "x-hwid", patch.hwid || null);
+    return lines.join("\n");
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Rules
 
 const POLICY_BLOCK_START = "# zkeen:policies";
@@ -777,8 +1029,33 @@ function ruleTargetIndex(parts: string[]): number {
   return i;
 }
 
+/**
+ * Index of the comma before the target of `AND|OR|NOT,((…),(…)),TARGET[,params]`, else -1.
+ * SUB-RULE targets a sub-rule name, not a group, and is not parsed.
+ */
+function logicTargetComma(raw: string): number {
+  const m = raw.match(/^(AND|OR|NOT),/);
+  if (!m || raw[m[0].length] !== "(") return -1;
+  let depth = 0;
+  for (let i = m[0].length; i < raw.length; i++) {
+    if (raw[i] === "(") depth++;
+    else if (raw[i] === ")" && --depth === 0) return raw[i + 1] === "," ? i + 1 : -1;
+  }
+  return -1;
+}
+
 function parseRuleRaw(raw: string): ParsedRule {
-  if (isComplexRule(raw)) return { raw, type: "COMPLEX", payload: raw, target: "", extra: "" };
+  if (isComplexRule(raw)) {
+    const at = logicTargetComma(raw);
+    const tail = at >= 0 ? raw.slice(at + 1).split(",") : [];
+    return {
+      raw,
+      type: "COMPLEX",
+      payload: at >= 0 ? raw.slice(0, at) : raw,
+      target: tail[0]?.trim() ?? "",
+      extra: tail.slice(1).join(","),
+    };
+  }
   const parts = raw.split(",");
   const type = parts[0]?.trim() || "";
   const ti = ruleTargetIndex(parts);
@@ -791,9 +1068,16 @@ function parseRuleRaw(raw: string): ParsedRule {
   };
 }
 
-/** Replace the outbound of a simple rule; other fields (payload, no-resolve, …) stay as is. */
+/** Replace the outbound of a rule; other fields (payload, no-resolve, …) stay as is. */
 export function renameRuleTarget(raw: string, from: string, to: string): string {
-  if (isComplexRule(raw)) return raw;
+  if (isComplexRule(raw)) {
+    const at = logicTargetComma(raw);
+    if (at < 0) return raw;
+    const tail = raw.slice(at + 1).split(",");
+    if (tail[0].trim() !== from) return raw;
+    tail[0] = formatRuleTarget(to);
+    return raw.slice(0, at + 1) + tail.join(",");
+  }
   const parts = raw.split(",");
   const ti = ruleTargetIndex(parts);
   if (parts[ti]?.trim() !== from) return raw;

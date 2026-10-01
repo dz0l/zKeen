@@ -14,6 +14,7 @@ import {
   saveClashConnection,
   type ClashConnection,
 } from "./api";
+import { pickMainConfig } from "./config";
 
 export interface LoginInfo {
   enabled: boolean;
@@ -52,6 +53,8 @@ export interface VersionEntry {
   latest?: string;
   outdated?: boolean;
   link?: string;
+  /** zkeen-ui only: update channel shared with `zkeen --update`. */
+  channel?: "stable" | "beta";
 }
 
 export interface VersionInfo {
@@ -80,14 +83,12 @@ const SessionContext = createContext<SessionState | null>(null);
 async function detectClashFromConfig(): Promise<ClashConnection | null> {
   try {
     const res = await apiJson<{ configs: { file: string; content: string }[] }>("/api/configs?core=mihomo");
-    const main =
-      res.configs?.find((c) => /(^|\/)config\.ya?ml$/i.test(c.file)) ?? res.configs?.[0];
+    const main = pickMainConfig(res.configs ?? []);
     if (!main) return null;
     const parsed = parseClashFromYaml(main.content);
-    if (!parsed.port && !parsed.unix) return null;
-    const merged: ClashConnection = { port: "9090", secret: "", unix: "", ...parsed };
-    saveClashConnection(merged);
-    return merged;
+    if (!parsed) return null;
+    saveClashConnection(parsed);
+    return parsed;
   } catch {
     return null;
   }

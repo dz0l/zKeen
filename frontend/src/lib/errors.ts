@@ -1,5 +1,6 @@
 import { useCallback } from "react";
 import { ApiError } from "./api";
+import { ConfigApplyError } from "./config";
 import { useI18n, type Locale } from "./i18n";
 
 const CYRILLIC = /[А-Яа-яЁё]/;
@@ -40,6 +41,10 @@ const CODE_KEYS: Record<string, string> = {
   ping_timeout_invalid: "api.pingTimeoutInvalid",
   unsupported_yaml_layout: "api.unsupportedYamlLayout",
   update_in_progress: "api.updateInProgress",
+  no_beta_release: "settings.noBetaRelease",
+  "group_in_use:match": "groups.inUseMatch",
+  "group_in_use:sub-rules": "groups.inUseSubRules",
+  "group_in_use:empty": "groups.inUseEmpty",
 };
 
 /** Legacy Russian backend strings → codes (compat during rollout) */
@@ -79,6 +84,9 @@ function resolveCode(raw: string): { code: string; params?: Record<string, strin
   const layout = raw.match(/^unsupported_yaml_layout:(.+)$/);
   if (layout) return { code: "unsupported_yaml_layout", params: { section: layout[1] } };
 
+  const inUse = raw.match(/^group_in_use:(match|sub-rules|empty):(.*)$/);
+  if (inUse) return { code: `group_in_use:${inUse[1]}`, params: { name: inUse[2] } };
+
   if (/^Слишком много попыток/.test(raw)) {
     const sec = raw.match(/(\d+)/)?.[1] || "60";
     return { code: "too_many_attempts", params: { sec } };
@@ -103,6 +111,15 @@ export function displayApiError(
   fallbackKey: string,
   locale: Locale,
 ): string {
+  if (err instanceof ConfigApplyError) {
+    const reason = displayApiError(err.applyError, t, "config.applyError", locale);
+    if (err.rolledBack) return t("config.applyRolledBack", { error: reason });
+    if (err.rollbackError === undefined) return reason;
+    return t("config.applyRollbackFailed", {
+      error: reason,
+      rollback: displayApiError(err.rollbackError, t, "config.applyError", locale),
+    });
+  }
   let raw = "";
   if (err instanceof ApiError) raw = err.message.trim();
   else if (err instanceof Error) raw = err.message.trim();

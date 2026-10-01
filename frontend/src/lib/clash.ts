@@ -21,7 +21,7 @@ const PROXY_TYPE_SHORT: Record<string, string> = {
   tuic: "tuic",
 };
 
-/** zashboard-style label: vless/xudp, hy2/udp, trojan/tcp … */
+/** Connection label: vless/xudp, hy2/udp, trojan/tcp … */
 export function formatProxyTypeLabel(item: ClashProxyItem): string {
   const rawType = (item.type || "unknown").toLowerCase();
   const typeShort = PROXY_TYPE_SHORT[rawType] || rawType;

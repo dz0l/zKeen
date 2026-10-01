@@ -1,8 +1,12 @@
+use crate::logger::log;
 use crate::types::{AppState, VERSION};
 use crate::updater::{self, get_repo};
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
+use serde::Deserialize;
 use serde_json::json;
+use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -81,6 +85,7 @@ async fn build_version_payload(state: &AppState) -> serde_json::Value {
             "outdated": ui,
             "show_toast": check(ui, &state.update_checker.last_ui_toast),
             "link": link,
+            "channel": updater::ui_update_channel(),
         }));
     }
 
@@ -143,21 +148,14 @@ pub fn start_update_checker(state: AppState) {
             };
 
             if check_ui {
-                let cur = VERSION.trim_start_matches('v');
-                if let Some((latest, tag)) =
-                    updater::fetch_latest_version(&state.http_client, "self", &proxies, Some(cur)).await
-                {
-                    *state.update_checker.ui_outdated.write().unwrap() = compare_versions(&latest, cur);
-                    *state.update_checker.ui_latest_tag.write().unwrap() = Some(tag);
-                    *state.update_checker.last_ui_check.write().unwrap() = Some(Instant::now());
-                }
+                let _ = refresh_ui_latest(&state, &proxies).await;
             }
 
             if check_core {
                 let core = state.core.read().unwrap().name.clone();
                 let cur_opt = get_local_core_version(&core).await;
                 let cur_str = cur_opt.as_deref().map(|v| v.trim_start_matches('v'));
-                if let Some((latest, tag)) = updater::fetch_latest_version(&state.http_client, &core, &proxies, cur_str).await
+                if let Ok((latest, tag)) = updater::fetch_latest_version(&state.http_client, &core, &proxies, cur_str).await
                 {
                     if let Some(cur) = cur_str {
                         if !cur.is_empty() {
@@ -172,45 +170,119 @@ pub fn start_update_checker(state: AppState) {
     });
 }
 
+/// Check zkeen-ui in the selected channel; `Err` carries the API error code.
+async fn refresh_ui_latest(state: &AppState, proxies: &[String]) -> Result<(), &'static str> {
+    let cur = VERSION.trim_start_matches('v');
+    let res = updater::fetch_latest_version(&state.http_client, "self", proxies, Some(cur)).await;
+    let checker = &state.update_checker;
+    match res {
+        Ok((latest, tag)) => {
+            *checker.ui_outdated.write().unwrap() = compare_versions(&latest, cur);
+            *checker.ui_latest_tag.write().unwrap() = Some(tag);
+            *checker.last_ui_check.write().unwrap() = Some(Instant::now());
+            Ok(())
+        }
+        Err(code) => {
+            if code == "no_beta_release" {
+                *checker.ui_outdated.write().unwrap() = false;
+                *checker.ui_latest_tag.write().unwrap() = None;
+                *checker.last_ui_check.write().unwrap() = Some(Instant::now());
+            }
+            Err(code)
+        }
+    }
+}
+
 fn compare_versions(latest: &str, current: &str) -> bool {
     if current.to_lowercase().contains("alpha") || latest.to_lowercase().contains("alpha") {
         return latest != current;
     }
+    cmp_versions(latest, current) == Ordering::Greater
+}
 
-    let parse = |v: &str| {
-        v.split('-')
-            .next()
-            .unwrap_or(v)
-            .split('.')
-            .filter_map(|s| s.parse::<u32>().ok())
-            .collect::<Vec<_>>()
+/// `1.2.3-beta.2` → ([1, 2, 3], ["beta", "2"]); build metadata after `+` is ignored.
+fn parse_version(v: &str) -> (Vec<u64>, Option<Vec<&str>>) {
+    let v = v.trim().trim_start_matches('v');
+    let v = v.split('+').next().unwrap_or(v);
+    let (core, pre) = match v.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (v, None),
     };
-    parse(latest) > parse(current)
+    let nums = core.split('.').map(|s| s.parse::<u64>().unwrap_or(0)).collect();
+    (nums, pre.map(|p| p.split('.').collect()))
+}
+
+/// SemVer order: `0.1.5-beta.9 < 0.1.5-beta.10 < 0.1.5 < 0.1.6-beta.1`.
+fn cmp_versions(a: &str, b: &str) -> Ordering {
+    let (an, ap) = parse_version(a);
+    let (bn, bp) = parse_version(b);
+    for i in 0..an.len().max(bn.len()) {
+        let o = an.get(i).copied().unwrap_or(0).cmp(&bn.get(i).copied().unwrap_or(0));
+        if o != Ordering::Equal {
+            return o;
+        }
+    }
+    match (ap, bp) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(x), Some(y)) => {
+            for (p, q) in x.iter().zip(y.iter()) {
+                let o = match (p.parse::<u64>(), q.parse::<u64>()) {
+                    (Ok(m), Ok(n)) => m.cmp(&n),
+                    (Ok(_), Err(_)) => Ordering::Less,
+                    (Err(_), Ok(_)) => Ordering::Greater,
+                    _ => p.cmp(q),
+                };
+                if o != Ordering::Equal {
+                    return o;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ChannelReq {
+    channel: String,
+}
+
+/// Switch the zkeen-ui update channel (`stable` | `beta`); the next check uses it.
+pub async fn set_channel_handler(
+    State(state): State<AppState>, Json(req): Json<ChannelReq>,
+) -> impl IntoResponse {
+    let channel = req.channel.trim().to_ascii_lowercase();
+    if channel != "beta" && channel != "stable" {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "success": false, "error": "invalid_channel" })));
+    }
+    if let Err(e) = updater::set_ui_update_channel(&channel) {
+        log("ERROR", format!("Не удалось сохранить канал обновлений: {}", e));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "success": false, "error": "save_failed" })),
+        );
+    }
+    *state.update_checker.ui_outdated.write().unwrap() = false;
+    *state.update_checker.ui_latest_tag.write().unwrap() = None;
+    *state.update_checker.last_ui_check.write().unwrap() = None;
+    log("INFO", format!("Канал обновлений zKeen UI: {}", channel));
+    (StatusCode::OK, Json(json!({ "success": true, "channel": channel })))
 }
 
 /// Force-refresh GitHub latest tags for UI and current core, then return `/api/version` payload.
 pub async fn check_updates_handler(State(state): State<AppState>) -> impl IntoResponse {
     let proxies = state.settings.read().unwrap().updater.github_proxy.clone();
-    let mut ui_ok = false;
     let mut core_ok = false;
 
-    {
-        let cur = VERSION.trim_start_matches('v');
-        if let Some((latest, tag)) =
-            updater::fetch_latest_version(&state.http_client, "self", &proxies, Some(cur)).await
-        {
-            *state.update_checker.ui_outdated.write().unwrap() = compare_versions(&latest, cur);
-            *state.update_checker.ui_latest_tag.write().unwrap() = Some(tag);
-            *state.update_checker.last_ui_check.write().unwrap() = Some(Instant::now());
-            ui_ok = true;
-        }
-    }
+    let ui_res = refresh_ui_latest(&state, &proxies).await;
+    let ui_ok = ui_res.is_ok();
 
     {
         let core = state.core.read().unwrap().name.clone();
         let cur_opt = get_local_core_version(&core).await;
         let cur_str = cur_opt.as_deref().map(|v| v.trim_start_matches('v'));
-        if let Some((latest, tag)) =
+        if let Ok((latest, tag)) =
             updater::fetch_latest_version(&state.http_client, &core, &proxies, cur_str).await
         {
             if let Some(cur) = cur_str {
@@ -228,8 +300,8 @@ pub async fn check_updates_handler(State(state): State<AppState>) -> impl IntoRe
     if let Some(obj) = res.as_object_mut() {
         obj.insert("check_ok".into(), json!(ui_ok));
         obj.insert("core_check_ok".into(), json!(core_ok));
-        if !ui_ok {
-            obj.insert("check_error".into(), json!("github_unreachable"));
+        if let Err(code) = ui_res {
+            obj.insert("check_error".into(), json!(code));
         }
         obj.insert("success".into(), json!(true));
     }

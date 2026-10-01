@@ -44,6 +44,7 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
   const apiErr = useApiError();
   const { clash, setClash, versions, setVersions, logout, loginInfo, refreshSession } = useSession();
   const [checking, setChecking] = useState(false);
+  const [channelBusy, setChannelBusy] = useState(false);
   const [checkError, setCheckError] = useState("");
   const [updating, setUpdating] = useState("");
   const [restarting, setRestarting] = useState("");
@@ -87,6 +88,22 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
       setCheckError(apiErr(err, "settings.checkError"));
     } finally {
       setChecking(false);
+    }
+  }
+
+  async function setBetaChannel(beta: boolean) {
+    setChannelBusy(true);
+    setCheckError("");
+    try {
+      await apiJson("/api/version/channel", {
+        method: "POST",
+        body: JSON.stringify({ channel: beta ? "beta" : "stable" }),
+      });
+      await checkUpdates();
+    } catch (err) {
+      setCheckError(apiErr(err, "settings.channelError"));
+    } finally {
+      setChannelBusy(false);
     }
   }
 
@@ -376,12 +393,26 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
               {checkError}
             </p>
           )}
+          {mode === "expert" && (
+            <div className="flex items-center justify-between gap-3 rounded-xl border border-zk-border-soft bg-zk-bg-elevated/60 px-4 py-3">
+              <div className="min-w-0">
+                <p className="text-sm font-semibold">{t("settings.betaChannel")}</p>
+                <p className="mt-0.5 text-xs text-zk-muted">{t("settings.betaChannelHint")}</p>
+              </div>
+              <Switch
+                checked={ui?.channel === "beta"}
+                disabled={channelBusy || checking || !ui}
+                label={t("settings.betaChannel")}
+                onChange={(on) => void setBetaChannel(on)}
+              />
+            </div>
+          )}
           <div className="space-y-2">
             <UpdateRow
               name="zkeen-ui"
               version={stripV(ui?.version)}
               latest={displayLatest(ui)}
-              outdated={!!ui?.outdated || (stripV(ui?.version) !== displayLatest(ui) && displayLatest(ui) !== "—")}
+              outdated={!!ui?.outdated}
               updating={updating === "self"}
               restarting={restarting === "zkeen-ui"}
               onUpdate={() => void runUpdate("self", displayLatest(ui))}
@@ -426,6 +457,38 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
         </div>
       </Card>
     </div>
+  );
+}
+
+function Switch({
+  checked,
+  disabled,
+  label,
+  onChange,
+}: {
+  checked: boolean;
+  disabled?: boolean;
+  label: string;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      disabled={disabled}
+      onClick={() => onChange(!checked)}
+      className={`relative h-6 w-11 shrink-0 rounded-full border transition-colors disabled:opacity-40 ${
+        checked ? "border-zk-accent/60 bg-zk-accent/40" : "border-zk-border-soft bg-zk-surface-hover"
+      }`}
+    >
+      <span
+        className={`absolute top-0.5 h-4 w-4 rounded-full bg-zk-text transition-all ${
+          checked ? "left-[22px]" : "left-0.5"
+        }`}
+      />
+    </button>
   );
 }
 

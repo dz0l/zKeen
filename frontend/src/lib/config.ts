@@ -1,5 +1,6 @@
 import { ApiError, apiJson, clashJson, parseClashFromYaml, saveClashConnection, type ApiResponse, type ClashConnection } from "./api";
 import { withSelectionSnapshots } from "./opJournal";
+import { editSubscriptionProvider, readSubscriptionProvider, readTopLevelScalar } from "./mihomoYaml";
 
 export interface ControlInfo {
   cores: string[];
@@ -81,7 +82,7 @@ export async function ensureZkeenMihomoConfig(force = false): Promise<boolean> {
 }
 
 export function getTopLevelScalar(yaml: string, key: string): string {
-  return yaml.match(new RegExp(`^${key}:\\s*['"]?([^'"\n#]+)`, "m"))?.[1]?.trim() ?? "";
+  return readTopLevelScalar(yaml, key) ?? "";
 }
 
 export function setTopLevelScalar(yaml: string, key: string, value: string): string {
@@ -98,24 +99,19 @@ export async function fetchMihomoConfig(): Promise<{ path: string; content: stri
   return { path: item.file, content: item.content };
 }
 
-function normalizeMihomoConfigPath(path: string): string {
-  if (/config\.ya?ml$/i.test(path)) {
-    return DEFAULT_CONFIG_PATH;
-  }
-  return path;
-}
-
-/** Atomic save (server keeps one `<file>.zkeen.bak`); `validate` runs `mihomo -t` on this exact content first. */
+/**
+ * Atomic save of exactly `path` as returned by the server (server keeps one `<file>.zkeen.bak`);
+ * `validate` runs `mihomo -t` on this exact content first.
+ */
 export async function saveMihomoConfig(
   path: string,
   content: string,
   validate = false,
 ): Promise<{ backup?: string }> {
-  const file = normalizeMihomoConfigPath(path);
   const query = validate ? "?validate=mihomo" : "";
   const res = await apiJson<{ backup?: string }>(`/api/configs${query}`, {
     method: "PUT",
-    body: JSON.stringify({ file, content }),
+    body: JSON.stringify({ file: path, content }),
   });
   return { backup: res.backup };
 }
@@ -124,28 +120,62 @@ export async function saveMihomoConfig(
 export async function validateMihomoConfig(path: string, content: string): Promise<void> {
   await apiJson("/api/configs/validate?core=mihomo", {
     method: "POST",
-    body: JSON.stringify({ file: normalizeMihomoConfigPath(path), content }),
+    body: JSON.stringify({ file: path, content }),
   });
 }
 
-function mergeClashConnection(
+/** Apply failed after the new file was written; `rolledBack` tells whether `previous` is on disk and applied again. */
+export class ConfigApplyError extends Error {
+  readonly applyError: unknown;
+  readonly rolledBack: boolean;
+  readonly rollbackError?: unknown;
+
+  constructor(applyError: unknown, rolledBack: boolean, rollbackError?: unknown) {
+    super(applyError instanceof Error ? applyError.message : String(applyError));
+    this.name = "ConfigApplyError";
+    this.applyError = applyError;
+    this.rolledBack = rolledBack;
+    this.rollbackError = rollbackError;
+  }
+}
+
+/**
+ * Save `content`, apply it, and when apply fails write `previous` back and apply it again,
+ * so a config the core rejected does not stay as the working file.
+ */
+export async function commitMihomoConfig(
   clash: ClashConnection,
-  parsed: Partial<ClashConnection>,
-): ClashConnection {
-  return {
-    port: parsed.port || clash.port || "9090",
-    secret: parsed.secret ?? clash.secret ?? "",
-    unix: parsed.unix ?? clash.unix ?? "",
-  };
+  opts: {
+    path: string;
+    content: string;
+    previous: string;
+    validate: boolean;
+    hardRestart?: boolean;
+  },
+): Promise<{ clash: ClashConnection; backup?: string }> {
+  const { backup } = await saveMihomoConfig(opts.path, opts.content, opts.validate);
+  try {
+    return { clash: await applyMihomoConfigChanges(clash, { hardRestart: opts.hardRestart }), backup };
+  } catch (applyErr) {
+    if (opts.previous === opts.content) throw new ConfigApplyError(applyErr, false);
+    try {
+      await saveMihomoConfig(opts.path, opts.previous, false);
+      await applyMihomoConfigChanges(clash, { hardRestart: opts.hardRestart });
+    } catch (rollbackErr) {
+      throw new ConfigApplyError(applyErr, false, rollbackErr);
+    }
+    throw new ConfigApplyError(applyErr, true);
+  }
 }
 
 async function resolveClashConnection(clash: ClashConnection): Promise<ClashConnection> {
   const loaded = await fetchMihomoConfig();
   if (!loaded) return clash;
+  // The config is the source of truth: an absent secret/unix clears the stored value.
   const parsed = parseClashFromYaml(loaded.content);
-  const merged = mergeClashConnection(clash, parsed);
-  saveClashConnection(merged);
-  return merged;
+  if (!parsed) return clash;
+  saveClashConnection(parsed);
+  return parsed;
 }
 
 export async function waitForClashApi(
@@ -171,7 +201,7 @@ export async function waitForClashApi(
     : new ApiError(502, `Mihomo API not reachable (${where})`);
 }
 
-/** Switch to mihomo and wait until Clash API responds (zashboard talks to a running core). */
+/** Switch to mihomo and wait until Clash API responds (the UI talks to a running core). */
 export async function ensureMihomoRunning(clash: ClashConnection): Promise<ClashConnection> {
   const conn = await resolveClashConnection(clash);
   const control = await apiJson<ControlInfo & { success: boolean }>("/api/control");
@@ -309,82 +339,6 @@ export async function updateGeoDatabases(clash: ClashConnection): Promise<void> 
   }
 }
 
-/** Top-level keys that end a proxy-providers subsection. */
-const PROVIDER_SECTION_STOP = /^(proxies|proxy-groups|rules|dns|geox-url|sniffer|tun|profile):/;
-
-function isProviderHeaderLine(raw: string, provider: string): boolean {
-  const header = `  ${provider}:`;
-  return raw === header || raw.startsWith(`${header} `) || raw.startsWith(`${header}\t`);
-}
-
-/**
- * Line range [startLine, endLine) for one proxy-provider block (includes the `  name:` line).
- * Line-based — avoids /m+$ regex bugs that only strip the header and leave orphan fields.
- */
-function findProviderBlockLineRange(
-  lines: string[],
-  provider: string,
-): { startLine: number; endLine: number } | null {
-  let startLine = -1;
-  for (let i = 0; i < lines.length; i++) {
-    const raw = lines[i].replace(/\r$/, "");
-    if (isProviderHeaderLine(raw, provider)) {
-      startLine = i;
-      break;
-    }
-  }
-  if (startLine < 0) return null;
-
-  let endLine = lines.length;
-  for (let i = startLine + 1; i < lines.length; i++) {
-    const line = lines[i].replace(/\r$/, "");
-    // Next provider at same indent: `  other:`
-    if (/^  [a-zA-Z][\w-]*:/.test(line) && !line.startsWith("    ")) {
-      endLine = i;
-      break;
-    }
-    // Next top-level section
-    if (PROVIDER_SECTION_STOP.test(line)) {
-      endLine = i;
-      break;
-    }
-  }
-  return { startLine, endLine };
-}
-
-function findProviderBlockRange(
-  yaml: string,
-  provider: string,
-): { start: number; end: number } | null {
-  const lines = yaml.split("\n");
-  const range = findProviderBlockLineRange(lines, provider);
-  if (!range) return null;
-  let start = 0;
-  for (let i = 0; i < range.startLine; i++) start += lines[i].length + 1;
-  let end = start;
-  for (let i = range.startLine; i < range.endLine; i++) end += lines[i].length + 1;
-  return { start, end };
-}
-
-function providerSection(yaml: string, provider: string): string {
-  const range = findProviderBlockRange(yaml, provider);
-  if (!range) return "";
-  return yaml.slice(range.start, range.end);
-}
-
-function removeProviderBlocks(yaml: string, provider: string): string {
-  const lines = yaml.split("\n");
-  // Remove every occurrence (corrupted configs may have duplicates).
-  // Important: do NOT eat the newline after `proxy-providers:` — that glued
-  // `proxy-providers:` + `proxies: []` into one invalid line.
-  for (;;) {
-    const range = findProviderBlockLineRange(lines, provider);
-    if (!range) break;
-    lines.splice(range.startLine, range.endLine - range.startLine);
-  }
-  return lines.join("\n");
-}
-
 function escapeYamlDoubleQuoted(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
@@ -426,54 +380,47 @@ function buildProviderBlock(
 `;
 }
 
+/** Provider's own `url` (not health-check.url), read regardless of key order. */
 export function getSubscriptionUrl(yaml: string, provider = DEFAULT_PROVIDER): string {
-  if (!yaml.includes("proxy-providers:")) return "";
-  const section = providerSection(yaml, provider);
-  if (!section) return "";
-  // Only the provider url — stop at health-check (its url is a probe, not the subscription).
-  for (const line of section.split("\n")) {
-    const raw = line.replace(/\r$/, "");
-    if (/^\s+health-check\s*:/.test(raw)) break;
-    if (!/^\s+url:/.test(raw)) continue;
-    const val = raw.replace(/^\s+url:\s*/, "").replace(/^['"]|['"]$/g, "").trim();
-    if (!val) continue;
-    return val;
-  }
-  return "";
+  return readSubscriptionProvider(yaml, provider)?.url ?? "";
 }
 
 export function getSubscriptionHwid(yaml: string, provider = DEFAULT_PROVIDER): string {
-  if (!yaml.includes("proxy-providers:")) return "";
-  const section = providerSection(yaml, provider);
-  if (!section) return "";
-  return section.match(/x-hwid:\s*\n\s*-\s*['"]?([^'"\n#]*)['"]?/)?.[1]?.trim() ?? "";
+  return readSubscriptionProvider(yaml, provider)?.hwid ?? "";
 }
 
 export function getSubscriptionUserAgent(yaml: string, provider = DEFAULT_PROVIDER): string {
-  if (!yaml.includes("proxy-providers:")) return DEFAULT_SUBSCRIPTION_USER_AGENT;
-  const section = providerSection(yaml, provider);
-  if (!section) return DEFAULT_SUBSCRIPTION_USER_AGENT;
-  const match = section.match(/User-Agent:\s*\n\s*-\s*['"]?([^'"\n#]*)['"]?/i);
-  return match?.[1]?.trim() || DEFAULT_SUBSCRIPTION_USER_AGENT;
+  return readSubscriptionProvider(yaml, provider)?.userAgent || DEFAULT_SUBSCRIPTION_USER_AGENT;
 }
 
+/**
+ * Edit url / User-Agent / x-hwid in place; all other provider settings are kept.
+ * A missing provider is created from the default block.
+ */
 export function updateSubscriptionProvider(
   yaml: string,
   patch: { url?: string; hwid?: string; userAgent?: string },
   provider = DEFAULT_PROVIDER,
 ): string {
-  const currentUrl = getSubscriptionUrl(yaml, provider);
-  const currentHwid = getSubscriptionHwid(yaml, provider);
-  const currentUa = getSubscriptionUserAgent(yaml, provider);
-  const url =
-    patch.url !== undefined ? normalizeSubscriptionUrlInput(patch.url) : currentUrl;
-  const hwid = patch.hwid !== undefined ? patch.hwid.trim() : currentHwid;
-  const userAgent =
-    patch.userAgent !== undefined ? patch.userAgent.trim() : currentUa;
+  const fields = {
+    // Empty URL is allowed in YAML (user is typing / clearing the field).
+    url: patch.url !== undefined ? normalizeSubscriptionUrlInput(patch.url) : undefined,
+    hwid: patch.hwid !== undefined ? patch.hwid.trim() : undefined,
+    userAgent:
+      patch.userAgent !== undefined
+        ? patch.userAgent.trim() || DEFAULT_SUBSCRIPTION_USER_AGENT
+        : undefined,
+  };
+  const edited = editSubscriptionProvider(yaml, provider, fields);
+  if (edited !== null) return edited;
 
-  // Allow empty URL in YAML (user is typing / clearing the field).
-  const block = buildProviderBlock(provider, url, hwid, userAgent);
-  const cleaned = removeProviderBlocks(yaml, provider);
+  const block = buildProviderBlock(
+    provider,
+    fields.url ?? "",
+    fields.hwid ?? "",
+    fields.userAgent ?? DEFAULT_SUBSCRIPTION_USER_AGENT,
+  );
+  const cleaned = yaml;
   const lines = cleaned.split("\n");
   const blockLines = block.replace(/\n$/, "").split("\n");
 
@@ -533,9 +480,12 @@ export async function applySubscriptionUrl(
     );
   }
   const updated = updateSubscriptionProvider(loaded.content, { url, hwid, userAgent });
-  await saveMihomoConfig(loaded.path, updated, true);
-  return {
-    path: normalizeMihomoConfigPath(loaded.path),
-    clash: await applyMihomoConfigChanges(clash, { hardRestart: bootstrapped }),
-  };
+  const res = await commitMihomoConfig(clash, {
+    path: loaded.path,
+    content: updated,
+    previous: loaded.content,
+    validate: true,
+    hardRestart: bootstrapped,
+  });
+  return { path: loaded.path, clash: res.clash };
 }

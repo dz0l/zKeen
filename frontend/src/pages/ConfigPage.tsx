@@ -5,7 +5,7 @@ import { useT } from "../lib/i18n";
 import { useMihomoConfig } from "../lib/useMihomoConfig";
 import { useApiError } from "../lib/errors";
 import { useSession } from "../lib/session";
-import { applyMihomoConfigChanges, validateMihomoConfig } from "../lib/config";
+import { ConfigApplyError, validateMihomoConfig } from "../lib/config";
 
 /** Result of the last validation, bound to the exact text that was checked. */
 interface CheckResult {
@@ -22,7 +22,6 @@ export function ConfigPage({ embedded = false }: { embedded?: boolean } = {}) {
   const [check, setCheck] = useState<CheckResult | null>(null);
   const [actionError, setActionError] = useState("");
   const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null);
-  const [rollbackYaml, setRollbackYaml] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
   // Any edit or import changes the text and therefore drops the old result.
@@ -63,42 +62,30 @@ export function ConfigPage({ embedded = false }: { embedded?: boolean } = {}) {
     }
   }
 
-  /** Safe mode: the server validates this exact snapshot before the atomic write. */
-  async function saveAndApply(snapshot: string, previous: string | null) {
+  /**
+   * Safe mode: the server validates this exact snapshot before the atomic write.
+   * A config the core does not accept is replaced by the previous file automatically.
+   */
+  async function saveAndApply(snapshot: string) {
     const safe = mode === "safe";
     if (safe && !window.confirm(t("groups.confirmApply"))) return;
     setSaving(true);
     setActionError("");
     setNotice(null);
     try {
-      const { backup } = await cfg.save(snapshot, safe);
+      const res = await cfg.commit(clash, snapshot, safe);
       if (safe) setCheck({ text: snapshot, ok: true });
-      try {
-        setClash(await applyMihomoConfigChanges(clash));
-        setRollbackYaml(null);
-        setNotice({ ok: true, text: t("config.savedApplied") });
-      } catch (err) {
-        setRollbackYaml(previous && previous !== snapshot ? previous : null);
-        setNotice({
-          ok: false,
-          text: t("config.savedNotApplied", {
-            error: apiErr(err, "config.applyError"),
-            backup: backup ?? "—",
-          }),
-        });
-      }
+      setClash(res.clash);
+      setNotice({ ok: true, text: t("config.savedApplied") });
     } catch (err) {
-      setActionError(apiErr(err, "config.saveError"));
+      if (err instanceof ConfigApplyError) {
+        setNotice({ ok: false, text: apiErr(err, "config.applyError") });
+      } else {
+        setActionError(apiErr(err, "config.saveError"));
+      }
     } finally {
       setSaving(false);
     }
-  }
-
-  async function handleRollback() {
-    if (rollbackYaml === null) return;
-    const previous = rollbackYaml;
-    cfg.setYaml(previous);
-    await saveAndApply(previous, null);
   }
 
   return (
@@ -118,11 +105,6 @@ export function ConfigPage({ embedded = false }: { embedded?: boolean } = {}) {
           }`}
         >
           <span className="min-w-0 flex-1 break-words">{notice.text}</span>
-          {!notice.ok && rollbackYaml !== null && (
-            <Button size="sm" variant="secondary" disabled={saving} onClick={() => void handleRollback()}>
-              {t("config.rollback")}
-            </Button>
-          )}
         </div>
       )}
 
@@ -151,7 +133,8 @@ export function ConfigPage({ embedded = false }: { embedded?: boolean } = {}) {
         mode={mode}
         saving={saving}
         onValidate={handleValidate}
-        onSave={() => void saveAndApply(cfg.yaml, cfg.savedYaml)}
+        configPath={cfg.configPath}
+        onSave={() => void saveAndApply(cfg.yaml)}
       />
     </div>
   );
@@ -216,6 +199,7 @@ function EditorTab({
   validated,
   mode,
   saving,
+  configPath,
   onValidate,
   onSave,
 }: {
@@ -224,6 +208,7 @@ function EditorTab({
   validated: boolean | null;
   mode: string;
   saving: boolean;
+  configPath: string;
   onValidate: () => void;
   onSave: () => void;
 }) {
@@ -231,8 +216,8 @@ function EditorTab({
   return (
     <Card className="overflow-hidden">
       <CardHeader
-        title="config.yaml"
-        subtitle="/opt/etc/mihomo/config.yaml"
+        title={configPath.split("/").pop() || "config.yaml"}
+        subtitle={configPath}
         action={
           <div className="flex gap-2">
             {validated === true && <Badge variant="success">{t("config.valid")}</Badge>}

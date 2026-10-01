@@ -20,9 +20,8 @@ import {
   healthCheckProxyProvider,
   isClashConnectionError,
   refreshProxyProvider,
-  saveMihomoConfig,
   setTopLevelScalar,
-  applyMihomoConfigChanges,
+  commitMihomoConfig,
   ensureZkeenMihomoConfig,
   updateGeoDatabases,
   updateSubscriptionProvider,
@@ -405,11 +404,16 @@ export function ProxiesPage() {
         hwid: subHwid,
         userAgent: subUa,
       });
-      await saveMihomoConfig(loaded.path, updated, true);
+      const res = await commitMihomoConfig(clashRef.current, {
+        path: loaded.path,
+        content: updated,
+        previous: loaded.content,
+        validate: true,
+        hardRestart: bootstrapped,
+      });
       await cfg.load();
       setSubDirty(false);
-      const conn = await applyMihomoConfigChanges(clashRef.current, { hardRestart: bootstrapped });
-      setClash(conn);
+      setClash(res.clash);
       await refreshSession();
       await loadProxies();
     } catch (err) {
@@ -507,10 +511,14 @@ export function ProxiesPage() {
           const loaded = await fetchMihomoConfig();
           if (!loaded) throw new ApiError(404, t("config.notFound"));
           const updated = setTopLevelScalar(loaded.content, "mode", value);
-          await saveMihomoConfig(loaded.path, updated, false);
+          const res = await commitMihomoConfig(clashRef.current, {
+            path: loaded.path,
+            content: updated,
+            previous: loaded.content,
+            validate: false,
+          });
           journal({ id: newOpId(), op: "mode", from: coreMode, to: value, result: "ok" });
-          const conn = await applyMihomoConfigChanges(clashRef.current);
-          setClash(conn);
+          setClash(res.clash);
           setCoreMode(value);
         } catch (err) {
           setError(apiErr(err, "proxies.modeError"));

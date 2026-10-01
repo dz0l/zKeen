@@ -119,17 +119,16 @@ fn github_http_clients<'a>(direct: &'a reqwest::Client) -> Vec<reqwest::Client> 
     out
 }
 
+/// Latest release of the requested channel: `(version, tag)`.
+/// Errors: `no_beta_release` (beta channel, GitHub reachable, no pre-release) or `github_unreachable`.
 pub async fn fetch_latest_version(
     client: &reqwest::Client, core: &str, proxies: &[String], current_ver: Option<&str>,
-) -> Option<(String, String)> {
-    let repo = get_repo(core)?;
+) -> Result<(String, String), &'static str> {
+    let repo = get_repo(core).ok_or("unknown_core")?;
     let is_alpha = current_ver.map_or(false, |v| v.contains("alpha"));
     let mihomo_alpha = is_alpha && core == "mihomo";
-    let prefer_prerelease = core == "self"
-        && (current_ver.map_or(false, |v| {
-            let l = v.to_ascii_lowercase();
-            l.contains("beta") || l.contains("-rc") || l.contains("alpha")
-        }) || ui_update_channel() == "beta");
+    // Beta channel looks at pre-releases only, stable at regular releases only.
+    let prefer_prerelease = core == "self" && ui_update_channel() == "beta";
     let has_mihomo = build_mihomo_proxy_client().is_some();
 
     for (i, c) in github_http_clients(client).into_iter().enumerate() {
@@ -143,33 +142,56 @@ pub async fn fetch_latest_version(
             vec![proxies]
         };
         for mirrors in mirror_pass {
-            if let Some(v) =
-                fetch_latest_from_api(&c, repo, mirrors, mihomo_alpha, prefer_prerelease).await
-            {
-                if via_mihomo {
-                    log("INFO", "Версия получена через Mihomo mixed-port".into());
+            match fetch_latest_from_api(&c, repo, mirrors, mihomo_alpha, prefer_prerelease).await {
+                Lookup::Found(v) => {
+                    if via_mihomo {
+                        log("INFO", "Версия получена через Mihomo mixed-port".into());
+                    }
+                    return Ok(v);
                 }
-                return Some(v);
+                Lookup::NoBeta => {
+                    log("INFO", "Beta-версий zKeen UI на GitHub нет".into());
+                    return Err("no_beta_release");
+                }
+                Lookup::Failed => {}
             }
             if !prefer_prerelease {
                 if let Some(v) = fetch_latest_from_redirect(&c, repo, mirrors).await {
                     if via_mihomo {
                         log("INFO", "Версия получена через Mihomo mixed-port (redirect)".into());
                     }
-                    return Some(v);
+                    return Ok(v);
                 }
             }
         }
     }
-    None
+    Err("github_unreachable")
 }
 
-fn ui_update_channel() -> String {
-    std::fs::read_to_string("/opt/etc/xkeen/zkeen-ui.channel")
-        .ok()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| s == "beta" || s == "stable")
-        .unwrap_or_else(|| "stable".into())
+/// Panel update channel, shared with `install.sh` (`zkeen --update`).
+const UI_CHANNEL_FILE: &str = "/opt/etc/xkeen/zkeen-ui.channel";
+
+/// Without the channel file a pre-release build stays on beta, a stable build on stable.
+pub fn ui_update_channel() -> &'static str {
+    match std::fs::read_to_string(UI_CHANNEL_FILE).map(|s| s.trim().to_ascii_lowercase()) {
+        Ok(s) if s == "beta" => "beta",
+        Ok(s) if s == "stable" => "stable",
+        _ if VERSION.contains('-') => "beta",
+        _ => "stable",
+    }
+}
+
+pub fn set_ui_update_channel(channel: &str) -> std::io::Result<()> {
+    let tmp = format!("{UI_CHANNEL_FILE}.tmp");
+    std::fs::write(&tmp, format!("{channel}\n"))?;
+    std::fs::rename(&tmp, UI_CHANNEL_FILE)
+}
+
+enum Lookup {
+    Found((String, String)),
+    /// The release list was read, but it has no pre-release.
+    NoBeta,
+    Failed,
 }
 
 fn github_url_candidates(url: &str, proxies: &[String]) -> Vec<String> {
@@ -190,12 +212,12 @@ async fn fetch_latest_from_api(
     proxies: &[String],
     mihomo_alpha: bool,
     prefer_prerelease: bool,
-) -> Option<(String, String)> {
+) -> Lookup {
     if !prefer_prerelease {
         let latest_url = format!("{}/{}/releases/latest", GITHUB_API, repo);
         for u in github_url_candidates(&latest_url, proxies) {
             if let Some(v) = parse_single_release_json(client, &u).await {
-                return Some(v);
+                return Lookup::Found(v);
             }
         }
     }
@@ -230,25 +252,28 @@ async fn fetch_latest_from_api(
                 for asset in &r.assets {
                     if let Some(idx) = asset.name.find("alpha-") {
                         let hash = asset.name[idx..].trim_end_matches(".gz").trim_end_matches(".zip");
-                        return Some((hash.to_string(), "Prerelease-Alpha".into()));
+                        return Lookup::Found((hash.to_string(), "Prerelease-Alpha".into()));
                     }
                 }
             }
         }
 
         if prefer_prerelease {
-            if let Some(r) = rels.iter().find(|r| r.prerelease && !r.tag_name.is_empty()) {
-                let tag = r.tag_name.clone();
-                return Some((tag.trim_start_matches('v').to_string(), tag));
-            }
+            return match rels.iter().find(|r| r.prerelease && !r.tag_name.is_empty()) {
+                Some(r) => {
+                    let tag = r.tag_name.clone();
+                    Lookup::Found((tag.trim_start_matches('v').to_string(), tag))
+                }
+                None => Lookup::NoBeta,
+            };
         }
 
         if let Some(r) = rels.into_iter().find(|r| !r.prerelease && !r.tag_name.is_empty()) {
             let tag = r.tag_name.clone();
-            return Some((tag.trim_start_matches('v').to_string(), tag));
+            return Lookup::Found((tag.trim_start_matches('v').to_string(), tag));
         }
     }
-    None
+    Lookup::Failed
 }
 
 async fn parse_single_release_json(client: &reqwest::Client, url: &str) -> Option<(String, String)> {

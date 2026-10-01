@@ -7,10 +7,9 @@ import { useSession } from "../lib/session";
 import { clashJson, clashWsUrl } from "../lib/api";
 import { useApiError } from "../lib/errors";
 import {
-  applyMihomoConfigChanges,
+  commitMihomoConfig,
   fetchMihomoConfig,
   getTopLevelScalar,
-  saveMihomoConfig,
   setTopLevelScalar,
 } from "../lib/config";
 import {
@@ -440,9 +439,13 @@ export function ConnectionsPage() {
       const loaded = await fetchMihomoConfig();
       if (!loaded) throw new Error(t("config.notFound"));
       const updated = setTopLevelScalar(loaded.content, "log-level", value);
-      await saveMihomoConfig(loaded.path, updated, false);
-      const conn = await applyMihomoConfigChanges(clash);
-      setClash(conn);
+      const res = await commitMihomoConfig(clash, {
+        path: loaded.path,
+        content: updated,
+        previous: loaded.content,
+        validate: false,
+      });
+      setClash(res.clash);
       setLogLevel(value);
       setLogLines([]);
     } catch (err) {
