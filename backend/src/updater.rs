@@ -764,7 +764,7 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
     sweep_stale_leftovers(&op_dir).await;
     let res = run_update(&state, req, &op_dir).await;
     {
-        let (_, _, Json(ref body)) = &res;
+        let (_, _, Json(body)) = &res;
         let ok = body.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
         let err = body
             .get("error")
@@ -822,7 +822,7 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
         set_stage("installing", "zkeen-ui");
 
         let source = tmp_dir.join(format!("zkeen-ui_{}", ver));
-        if let Err(e) = save(bin_d, source.clone()).await {
+        if let Err(_e) = save(bin_d, source.clone()).await {
             return response(false, Some("save_failed".to_string()));
         }
 
@@ -855,7 +855,7 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
         }
 
         let target = "/opt/sbin/zkeen-ui";
-        if let Err(e) = fs::rename(&source, target).await {
+        if let Err(_e) = fs::rename(&source, target).await {
             return response(false, Some("install_failed".to_string()));
         }
 
@@ -978,7 +978,7 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
     })
     .await;
 
-    if let Ok(Err(e)) | Err(e) = unpack.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) {
+    if let Ok(Err(_e)) | Err(_e) = unpack.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) {
         return response(false, Some("unpack_failed".to_string()));
     }
 
