@@ -29,6 +29,8 @@ opkg update
 opkg install curl ca-certificates
 ```
 
+
+
 ## Installation
 
 Connect to the router over SSH and run:
@@ -65,4 +67,4 @@ The default port is 7220. If you changed it in the settings, use the new one.
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/dz0l/zKeen/main/install.sh)" -- --uninstall
 ```
 
-The script removes zKeen UI and asks whether to delete its settings. Mihomo, XKeen and the configs in `/opt/etc/mihomo` stay in place.
+The script removes zKeen UI. Mihomo, XKeen and the configs in `/opt/etc/mihomo` stay in place.

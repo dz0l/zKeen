@@ -47,6 +47,7 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
   const [channelBusy, setChannelBusy] = useState(false);
   const [checkError, setCheckError] = useState("");
   const [updating, setUpdating] = useState("");
+  const [updateStage, setUpdateStage] = useState("");
   const [restarting, setRestarting] = useState("");
   const [resetting, setResetting] = useState(false);
   const [resetMsg, setResetMsg] = useState("");
@@ -110,7 +111,22 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
   async function runUpdate(core: string, version: string) {
     if (!version || version === "—") return;
     setUpdating(core);
+    setUpdateStage("starting");
     setCheckError("");
+    const poll = window.setInterval(() => {
+      void apiJson<{
+        stage?: string;
+        detail?: string;
+        error?: string | null;
+        running?: boolean;
+      }>("/api/update/status")
+        .then((st) => {
+          if (st.stage) setUpdateStage(st.stage);
+        })
+        .catch(() => {
+          /* status is best-effort while POST is in flight */
+        });
+    }, 1200);
     try {
       await apiJson("/api/update", {
         method: "POST",
@@ -128,9 +144,21 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
       }
       await checkUpdates();
     } catch (err) {
-      setCheckError(apiErr(err, "settings.updateError"));
+      let message = apiErr(err, "settings.updateError");
+      try {
+        const st = await apiJson<{ error?: string | null; stage?: string }>("/api/update/status");
+        if (st.error) {
+          message = displayApiError(st.error, t, "settings.updateError", locale);
+        }
+        if (st.stage) setUpdateStage(st.stage);
+      } catch {
+        /* keep message from POST */
+      }
+      setCheckError(message);
     } finally {
+      window.clearInterval(poll);
       setUpdating("");
+      setUpdateStage("");
     }
   }
 
@@ -414,6 +442,7 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
               latest={displayLatest(ui)}
               outdated={!!ui?.outdated}
               updating={updating === "self"}
+              updateStage={updating === "self" ? updateStage : ""}
               restarting={restarting === "zkeen-ui"}
               onUpdate={() => void runUpdate("self", displayLatest(ui))}
               onRestart={() => void runRestart("restartPanel", "zkeen-ui")}
@@ -427,6 +456,7 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
                 (stripV(mihomo?.version) !== displayLatest(mihomo) && displayLatest(mihomo) !== "—")
               }
               updating={updating === "mihomo"}
+              updateStage={updating === "mihomo" ? updateStage : ""}
               restarting={restarting === "mihomo"}
               onUpdate={() => void runUpdate("mihomo", displayLatest(mihomo))}
               onRestart={() => void runRestart("hardRestart", "mihomo")}
@@ -450,6 +480,7 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
                   (stripV(xray?.version) !== displayLatest(xray) && displayLatest(xray) !== "—")
                 }
                 updating={updating === "xray"}
+                updateStage={updating === "xray" ? updateStage : ""}
                 onUpdate={() => void runUpdate("xray", displayLatest(xray))}
               />
             )}
@@ -492,12 +523,36 @@ function Switch({
   );
 }
 
+function updateStageLabel(t: (key: string, params?: Record<string, string | number>) => string, stage: string): string {
+  switch (stage) {
+    case "starting":
+      return t("settings.updateStageStarting");
+    case "dependency":
+      return t("settings.updateStageDependency");
+    case "downloading":
+      return t("settings.updateStageDownloading");
+    case "unpacking":
+      return t("settings.updateStageUnpacking");
+    case "installing":
+      return t("settings.updateStageInstalling");
+    case "restarting":
+      return t("settings.updateStageRestarting");
+    case "failed":
+      return t("settings.updateStageFailed");
+    case "done":
+      return t("settings.updateStageDone");
+    default:
+      return t("app.loading");
+  }
+}
+
 function UpdateRow({
   name,
   version,
   latest,
   outdated,
   updating,
+  updateStage,
   restarting,
   restartOnly,
   onUpdate,
@@ -508,6 +563,7 @@ function UpdateRow({
   latest: string;
   outdated: boolean;
   updating?: boolean;
+  updateStage?: string;
   restarting?: boolean;
   restartOnly?: boolean;
   onUpdate?: () => void;
@@ -556,7 +612,11 @@ function UpdateRow({
             disabled={!hasUpdate || updating}
             onClick={onUpdate}
           >
-            {updating ? t("app.loading") : hasUpdate ? t("settings.update") : t("settings.upToDate")}
+            {updating
+              ? updateStageLabel(t, updateStage || "starting")
+              : hasUpdate
+                ? t("settings.update")
+                : t("settings.upToDate")}
           </Button>
         )}
       </div>

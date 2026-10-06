@@ -29,6 +29,8 @@ opkg update
 opkg install curl ca-certificates
 ```
 
+
+
 ## Установка
 
 Подключитесь к роутеру по SSH и выполните:
@@ -65,4 +67,4 @@ zkeen reset-password   # сбросить пароль панели
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/dz0l/zKeen/main/install.sh)" -- --uninstall
 ```
 
-Скрипт удалит zKeen UI и спросит, удалять ли его настройки. Mihomo, XKeen и конфиги в `/opt/etc/mihomo` остаются на месте.
+Скрипт удалит zKeen UI и спросит. Mihomo, XKeen и конфиги в `/opt/etc/mihomo` остаются на месте.

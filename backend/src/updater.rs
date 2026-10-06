@@ -13,7 +13,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -26,8 +27,73 @@ const OPT_TMP: &str = "/opt/tmp";
 const OP_DIR_PREFIX: &str = "zkeen-update-";
 /// Leftovers of a killed run are removed only after this age.
 const STALE_AFTER: Duration = Duration::from_secs(3600);
+/// Pause between body chunks before switching to the next source.
+const DOWNLOAD_IDLE_SECS: u64 = 30;
+/// Wall-clock budget for all download attempts of one file.
+const DOWNLOAD_BUDGET_SECS: u64 = 180;
 
 static UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Default)]
+struct OpStatus {
+    id: String,
+    core: String,
+    version: String,
+    stage: String,
+    detail: String,
+    error: Option<String>,
+    running: bool,
+}
+
+static OP_STATUS: LazyLock<Mutex<OpStatus>> = LazyLock::new(|| Mutex::new(OpStatus::default()));
+
+fn set_stage(stage: &str, detail: &str) {
+    if let Ok(mut s) = OP_STATUS.lock() {
+        s.stage = stage.to_string();
+        s.detail = detail.to_string();
+    }
+}
+
+fn begin_op(id: String, core: &str, version: &str) {
+    if let Ok(mut s) = OP_STATUS.lock() {
+        *s = OpStatus {
+            id,
+            core: core.to_string(),
+            version: version.to_string(),
+            stage: "starting".into(),
+            detail: String::new(),
+            error: None,
+            running: true,
+        };
+    }
+}
+
+fn finish_op(error: Option<String>) {
+    if let Ok(mut s) = OP_STATUS.lock() {
+        s.running = false;
+        s.error = error.clone();
+        s.stage = if error.is_some() {
+            "failed".into()
+        } else {
+            "done".into()
+        };
+    }
+}
+
+/// Last update operation (for UI after a long wait or a reopened phone tab).
+pub async fn get_update_status() -> Json<Value> {
+    let s = OP_STATUS.lock().map(|g| g.clone()).unwrap_or_default();
+    Json(json!({
+        "success": true,
+        "id": s.id,
+        "core": s.core,
+        "version": s.version,
+        "stage": s.stage,
+        "detail": s.detail,
+        "error": s.error,
+        "running": s.running,
+    }))
+}
 
 /// Held for the whole update; a concurrent request gets 409 instead of sharing staging files.
 struct UpdateGuard;
@@ -356,8 +422,38 @@ fn tag_from_release_html(body: &str) -> Option<String> {
     None
 }
 
+fn http_for_error(code: &str) -> StatusCode {
+    match code {
+        "update_in_progress" => StatusCode::CONFLICT,
+        "unknown_core" | "arch_unsupported" | "asset_not_found" => StatusCode::BAD_REQUEST,
+        "download_http_404"
+        | "download_http_403"
+        | "download_http_429"
+        | "download_http_error"
+        | "download_html"
+        | "download_timeout"
+        | "download_network"
+        | "download_empty"
+        | "download_write_failed"
+        | "download_budget"
+        | "update_failed"
+        | "github_unreachable"
+        | "opkg_update_failed"
+        | "jq_install_failed" => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 fn response(success: bool, error: Option<String>) -> (StatusCode, HeaderMap, Json<Value>) {
-    response_with(StatusCode::OK, success, error)
+    let status = if success {
+        StatusCode::OK
+    } else {
+        error
+            .as_deref()
+            .map(http_for_error)
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+    };
+    response_with(status, success, error)
 }
 
 fn response_with(status: StatusCode, success: bool, error: Option<String>) -> (StatusCode, HeaderMap, Json<Value>) {
@@ -366,14 +462,32 @@ fn response_with(status: StatusCode, success: bool, error: Option<String>) -> (S
     (status, h, Json(json!({ "success": success, "error": error })))
 }
 
+fn download_fail_code(kind: &str, status: Option<u16>) -> String {
+    match kind {
+        "http" => match status {
+            Some(404) => "download_http_404".into(),
+            Some(403) => "download_http_403".into(),
+            Some(429) => "download_http_429".into(),
+            _ => "download_http_error".into(),
+        },
+        "html" => "download_html".into(),
+        "idle" => "download_timeout".into(),
+        "network" => "download_network".into(),
+        "empty" => "download_empty".into(),
+        "write" => "download_write_failed".into(),
+        "budget" => "download_budget".into(),
+        _ => "update_failed".into(),
+    }
+}
+
 async fn download(
     client: &reqwest::Client, url: &str, proxies: &[String], tmp_path: &Path,
 ) -> Result<DownloadResult, String> {
-    async fn load(r: reqwest::Response, path: &Path, source: &str) -> Option<DownloadResult> {
+    async fn load(r: reqwest::Response, path: &Path, source: &str) -> Result<DownloadResult, String> {
         let size = r.content_length().unwrap_or(0) as usize;
         let (mut stream, is_disk) = (r.bytes_stream(), size > 50 * 1024 * 1024);
         let mut file = if is_disk {
-            Some(fs::File::create(path).await.ok()?)
+            Some(fs::File::create(path).await.map_err(|_| "download_write_failed".to_string())?)
         } else {
             None
         };
@@ -384,13 +498,13 @@ async fn download(
         };
 
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await {
+            match tokio::time::timeout(Duration::from_secs(DOWNLOAD_IDLE_SECS), stream.next()).await {
                 Ok(Some(Ok(chunk))) => {
                     if let Some(f) = &mut file {
-                        if f.write_all(&chunk).await.is_err() {
-                            log("WARN", format!("Ошибка записи на диск ({})", source));
-                            _ = fs::remove_file(path);
-                            return None;
+                        if let Err(e) = f.write_all(&chunk).await {
+                            log("WARN", format!("Ошибка записи на диск ({}): {}", source, e));
+                            _ = fs::remove_file(path).await;
+                            return Err("download_write_failed".into());
                         }
                     } else {
                         buf.extend_from_slice(&chunk);
@@ -399,7 +513,7 @@ async fn download(
                 Ok(None) => {
                     if !is_disk && buf.is_empty() {
                         log("WARN", format!("Загрузка вернула 0 байт ({})", source));
-                        return None;
+                        return Err("download_empty".into());
                     }
                     log(
                         "INFO",
@@ -409,7 +523,7 @@ async fn download(
                             (if is_disk { size } else { buf.len() }) as f64 / 1048576.0
                         ),
                     );
-                    return Some(if is_disk {
+                    return Ok(if is_disk {
                         DownloadResult::Disk(path.to_path_buf())
                     } else {
                         DownloadResult::RAM(buf)
@@ -417,18 +531,26 @@ async fn download(
                 }
                 Ok(Some(Err(e))) => {
                     log("WARN", format!("Соединение оборвалось ({}): {}", source, e));
-                    break;
+                    if is_disk {
+                        _ = fs::remove_file(path).await;
+                    }
+                    return Err("download_network".into());
                 }
                 Err(_) => {
-                    log("WARN", format!("Таймаут загрузки ({})", source));
-                    break;
+                    log(
+                        "WARN",
+                        format!(
+                            "Таймаут простоя {} с при загрузке ({})",
+                            DOWNLOAD_IDLE_SECS, source
+                        ),
+                    );
+                    if is_disk {
+                        _ = fs::remove_file(path).await;
+                    }
+                    return Err("download_timeout".into());
                 }
             }
         }
-        if is_disk {
-            _ = fs::remove_file(path).await;
-        }
-        None
     }
 
     let urls: Vec<String> = std::iter::once(url.to_string())
@@ -436,15 +558,34 @@ async fn download(
         .collect();
     let clients = github_http_clients(client);
     let mihomo_first = clients.len() > 1;
+    let budget = Instant::now();
+    let mut last_err = String::from("update_failed");
+
     for (ci, http) in clients.iter().enumerate() {
         let via_mihomo = mihomo_first && ci == 0;
         let via_label = if via_mihomo { "mihomo" } else { "direct" };
         for (i, u) in urls.iter().enumerate() {
+            if budget.elapsed() > Duration::from_secs(DOWNLOAD_BUDGET_SECS) {
+                log(
+                    "ERROR",
+                    format!(
+                        "Исчерпан бюджет загрузки {} с, последняя ошибка: {}",
+                        DOWNLOAD_BUDGET_SECS, last_err
+                    ),
+                );
+                return Err(if last_err == "update_failed" {
+                    download_fail_code("budget", None)
+                } else {
+                    last_err
+                });
+            }
+
             let (source, is_cdn) = if i == 0 {
                 (format!("напрямую/{via_label}"), false)
             } else {
                 (format!("CDN/{via_label}"), true)
             };
+            set_stage("downloading", &source);
             if is_cdn {
                 log(
                     "INFO",
@@ -471,19 +612,44 @@ async fn download(
                                 "URL вернул HTML".into()
                             },
                         );
+                        last_err = download_fail_code("html", None);
                         continue;
                     }
-                    if let Some(res) = load(r, tmp_path, &source).await {
-                        return Ok(res);
+                    match load(r, tmp_path, &source).await {
+                        Ok(res) => return Ok(res),
+                        Err(e) => {
+                            last_err = e.clone();
+                            // Disk full / write errors will not improve on the next mirror.
+                            if e == "download_write_failed" {
+                                log("ERROR", format!("Запись на диск не удалась ({})", source));
+                                return Err(e);
+                            }
+                        }
                     }
                 }
-                Ok(r) => log("WARN", format!("Ошибка загрузки: {}", r.status())),
-                Err(e) => log("WARN", format!("Ошибка загрузки: {}", e)),
+                Ok(r) => {
+                    let code = r.status().as_u16();
+                    log("WARN", format!("Ошибка загрузки: {}", r.status()));
+                    last_err = download_fail_code("http", Some(code));
+                    // Missing asset on the real GitHub URL — mirrors will not help.
+                    if !is_cdn && code == 404 {
+                        log("ERROR", "Asset не найден на GitHub (404), повторы отменены".into());
+                        return Err(last_err);
+                    }
+                    if code == 429 {
+                        log("WARN", "GitHub rate limit (429), дальнейшие попытки бессмысленны".into());
+                        return Err(last_err);
+                    }
+                }
+                Err(e) => {
+                    log("WARN", format!("Ошибка загрузки: {}", e));
+                    last_err = download_fail_code("network", None);
+                }
             }
         }
     }
-    log("ERROR", "Не удалось выполнить обновление".into());
-    Err("update_failed".into())
+    log("ERROR", format!("Не удалось выполнить обновление ({})", last_err));
+    Err(last_err)
 }
 async fn save(dl: DownloadResult, out_path: PathBuf) -> std::io::Result<()> {
     tokio::task::spawn_blocking(move || {
@@ -561,6 +727,7 @@ async fn remove_op_dir(dir: &Path) {
 
 async fn install_jq() -> Result<(), String> {
     log("INFO", "Установка jq через opkg...".into());
+    set_stage("dependency", "jq");
     let update = Command::new("opkg")
         .arg("update")
         .status()
@@ -581,56 +748,30 @@ async fn install_jq() -> Result<(), String> {
     Ok(())
 }
 
-async fn install_yq(client: &reqwest::Client, proxies: &[String], tmp_dir: &Path) -> Result<(), String> {
-    let arch = std::env::consts::ARCH;
-    let url = match arch {
-        "aarch64" => format!(
-            "{}/mikefarah/yq/releases/latest/download/yq_linux_arm64",
-            GITHUB_RELEASE
-        ),
-        "mips" if cfg!(target_endian = "little") => format!(
-            "{}/mikefarah/yq/releases/download/v4.52.2/yq_linux_mipsle",
-            GITHUB_RELEASE
-        ),
-        "mips" => format!(
-            "{}/mikefarah/yq/releases/download/v4.52.2/yq_linux_mips",
-            GITHUB_RELEASE
-        ),
-        _ => return Err("arch_unsupported".into()),
-    };
-
-    log("INFO", format!("Загрузка yq: {}", url));
-    let dl_res = download(client, &url, proxies, &tmp_dir.join("yq.tmp")).await?;
-    let target = "/opt/sbin/yq";
-    if let Err(e) = save(dl_res, tmp_dir.join("yq.bin")).await {
-        return Err("save_failed".to_string());
-    }
-
-    log("INFO", "Установка yq...".into());
-    let src = tmp_dir.join("yq.bin");
-    if fs::rename(&src, target).await.is_err() {
-        fs::copy(&src, target)
-            .await
-            .map_err(|e| "install_failed".to_string())?;
-        _ = fs::remove_file(&src).await;
-    }
-    _ = fs::set_permissions(target, std::fs::Permissions::from_mode(0o755)).await;
-    log("INFO", "Пакет yq установлен".into());
-    Ok(())
-}
-
 pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateReq>) -> impl IntoResponse {
     let Some(_guard) = UpdateGuard::acquire() else {
         log("WARN", "Обновление уже выполняется — повторный запрос отклонён".into());
         return response_with(StatusCode::CONFLICT, false, Some("update_in_progress".into()));
     };
-    let op_dir = Path::new(OPT_TMP).join(format!("{OP_DIR_PREFIX}{}", uuid::Uuid::new_v4().simple()));
+    let op_id = uuid::Uuid::new_v4().simple().to_string();
+    begin_op(op_id.clone(), &req.core, &req.version);
+    let op_dir = Path::new(OPT_TMP).join(format!("{OP_DIR_PREFIX}{op_id}"));
     if let Err(e) = fs::create_dir_all(&op_dir).await {
         log("ERROR", format!("Не удалось создать {}: {}", op_dir.display(), e));
+        finish_op(Some("save_failed".into()));
         return response(false, Some("save_failed".into()));
     }
     sweep_stale_leftovers(&op_dir).await;
     let res = run_update(&state, req, &op_dir).await;
+    {
+        let (_, _, Json(ref body)) = &res;
+        let ok = body.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+        let err = body
+            .get("error")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        finish_op(if ok { None } else { err.or(Some("update_failed".into())) });
+    }
     remove_op_dir(&op_dir).await;
     res
 }
@@ -670,6 +811,7 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
         };
 
         log("INFO", "Загрузка исполняемого файла...".into());
+        set_stage("downloading", "zkeen-ui");
         let bin_url = format!("{GITHUB_RELEASE}/{repo}/releases/download/{ver}/zkeen-ui-{arch_suffix}");
         let bin_d = match download(&state.http_client, &bin_url, &proxies, &tmp_dir.join("bin.tmp")).await {
             Ok(d) => d,
@@ -677,6 +819,7 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
         };
 
         log("INFO", "Установка обновления...".into());
+        set_stage("installing", "zkeen-ui");
 
         let source = tmp_dir.join(format!("zkeen-ui_{}", ver));
         if let Err(e) = save(bin_d, source.clone()).await {
@@ -795,22 +938,20 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
                 return response(false, Some(e));
             }
         }
-        "mihomo" if !Path::new("/opt/sbin/yq").exists() => {
-            log("WARN", "Пакет yq не найден".into());
-            if let Err(e) = install_yq(&state.http_client, &proxies, tmp_dir).await {
-                return response(false, Some(e));
-            }
-        }
+        // yq is not used by the Mihomo update path (gz unpack is done in-process).
+        // Installing it here previously masked download failures as a generic mihomo update error.
         _ => {}
     }
 
     log("INFO", format!("Загрузка: {}", url));
+    set_stage("downloading", &asset);
     let dl_res = match download(&state.http_client, &url, &proxies, &tmp_dir.join("download.tmp")).await {
         Ok(r) => r,
         Err(e) => return response(false, Some(e)),
     };
 
     log("INFO", "Установка обновления...".into());
+    set_stage("unpacking", &asset);
     let (core_name, is_zip) = (req.core.clone(), asset.ends_with(".zip"));
 
     fn unpack<R: Read + Seek>(rdr: R, out_path: &Path, core: &str, is_zip: bool) -> std::io::Result<()> {
@@ -841,6 +982,7 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
         return response(false, Some("unpack_failed".to_string()));
     }
 
+    set_stage("installing", &req.core);
     let target = format!("/opt/sbin/{}", req.core);
     if req.backup_core && Path::new(&target).exists() {
         let bk = format!(
@@ -862,6 +1004,7 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
         _ = fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).await;
         if run {
             log("INFO", format!("Перезапуск {}...", core_cap));
+            set_stage("restarting", &req.core);
             if let Err(e) = crate::controller::soft_restart(&req.core).await {
                 log("ERROR", format!("{}", e));
                 return response(false, Some(format!("{}", e)));
