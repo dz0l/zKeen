@@ -42,6 +42,11 @@ const CODE_KEYS: Record<string, string> = {
   unsupported_yaml_layout: "api.unsupportedYamlLayout",
   update_in_progress: "api.updateInProgress",
   no_beta_release: "settings.noBetaRelease",
+  backup_failed: "api.backupFailed",
+  init_failed: "api.initFailed",
+  stop_failed: "api.stopFailed",
+  rollback_failed: "api.rollbackFailed",
+  rollback_missing: "api.rollbackFailed",
   download_http_404: "api.downloadHttp404",
   download_http_403: "api.downloadHttp403",
   download_http_429: "api.downloadHttp429",
@@ -87,9 +92,12 @@ function resolveCode(raw: string): { code: string; params?: Record<string, strin
   if (withSec) return { code: "too_many_attempts", params: { sec: withSec[1] } };
 
   const withPrefix = raw.match(
-    /^(restart_failed|start_failed|save_failed|install_failed|unpack_failed)(?::|$)/,
+    /^(restart_failed|start_failed|save_failed|install_failed|unpack_failed|init_failed|stop_failed|backup_failed|rollback_failed|rollback_restart_failed)(?::|$)/,
   );
-  if (withPrefix) return { code: withPrefix[1] };
+  if (withPrefix) {
+    const code = withPrefix[1] === "rollback_restart_failed" ? "rollback_failed" : withPrefix[1];
+    return { code };
+  }
 
   const layout = raw.match(/^unsupported_yaml_layout:(.+)$/);
   if (layout) return { code: "unsupported_yaml_layout", params: { section: layout[1] } };

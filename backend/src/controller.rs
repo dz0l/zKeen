@@ -85,11 +85,36 @@ pub async fn run_init_command(state: &AppState, args: &[&str]) -> Result<(), Str
     } else {
         Command::new(&path).args(args).status().await
     };
-    if let Err(e) = result {
-        *state.init_file.write().unwrap() = None;
-        return Err(format!("{}: {}", path, e));
+    match result {
+        Err(e) => {
+            *state.init_file.write().unwrap() = None;
+            Err(format!("init_failed:{}:{}", path, e))
+        }
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => {
+            let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
+            log(
+                "ERROR",
+                format!("Init {} {:?} завершился с кодом {}", path, args, code),
+            );
+            Err(format!("init_failed:{}:exit:{}", path, code))
+        }
     }
-    Ok(())
+}
+
+/// Wait until `core` has a live PID (or fail). Used after start/restart and updates.
+pub async fn wait_core_running(core: &str, attempts: u32, delay_ms: u64) -> Result<(), String> {
+    for _ in 0..attempts {
+        let name = core.to_string();
+        let pids = tokio::task::spawn_blocking(move || get_pid(&name))
+            .await
+            .unwrap_or_default();
+        if !pids.is_empty() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    }
+    Err(format!("restart_failed:{}:no_pid", core))
 }
 
 fn get_core_info(name: &str) -> CoreInfo {
@@ -154,11 +179,14 @@ pub async fn soft_restart(core: &str) -> Result<(), String> {
         cmd.stdout(f.try_clone().unwrap()).stderr(f);
     }
 
-    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut child = cmd.spawn().map_err(|e| format!("restart_failed:{}:{}", core, e))?;
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     match child.try_wait() {
         Ok(Some(status)) if !status.success() => {
             return Err(format!("restart_failed:{}:{}", core, status));
+        }
+        Ok(Some(_)) => {
+            return Err(format!("restart_failed:{}:exited", core));
         }
         _ => {
             tokio::spawn(async move {
@@ -167,7 +195,7 @@ pub async fn soft_restart(core: &str) -> Result<(), String> {
         }
     }
 
-    Ok(())
+    wait_core_running(core, 20, 250).await
 }
 
 pub async fn get_control(State(state): State<AppState>) -> impl IntoResponse {
@@ -340,8 +368,22 @@ pub async fn post_control(State(state): State<AppState>, Json(req): Json<Control
                     data: None,
                 });
             }
+            if let Err(e) = wait_core_running(&req.core, 20, 250).await {
+                return Json(ApiResponse {
+                    success: false,
+                    error: Some(e),
+                    data: None,
+                });
+            }
         }
         "softRestart" => {
+            if req.core != "mihomo" && req.core != "xray" {
+                return Json(ApiResponse {
+                    success: false,
+                    error: Some("unknown_core".into()),
+                    data: None,
+                });
+            }
             if let Err(e) = soft_restart(&req.core).await {
                 return Json(ApiResponse {
                     success: false,
@@ -385,6 +427,27 @@ pub async fn post_control(State(state): State<AppState>, Json(req): Json<Control
                     error: Some(e),
                     data: None,
                 });
+            }
+            if action == "start" || action == "hardRestart" {
+                if let Err(e) = wait_core_running(&cur_name, 20, 250).await {
+                    return Json(ApiResponse {
+                        success: false,
+                        error: Some(e),
+                        data: None,
+                    });
+                }
+            } else if action == "stop" {
+                let name = cur_name.clone();
+                let still = tokio::task::spawn_blocking(move || get_pid(&name))
+                    .await
+                    .unwrap_or_default();
+                if !still.is_empty() {
+                    return Json(ApiResponse {
+                        success: false,
+                        error: Some(format!("stop_failed:{}:still_running", cur_name)),
+                        data: None,
+                    });
+                }
             }
         }
         "restartPanel" => {

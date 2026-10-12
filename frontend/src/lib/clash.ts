@@ -262,11 +262,14 @@ export function parseGroupIcons(yaml: string): Record<string, string> {
   return icons;
 }
 
+/** Positive RSS/in-use bytes only — Mihomo */
 export function parseMemoryBytes(raw?: ClashMemoryResponse | ClashConnectionsResponse | null): number | undefined {
   if (!raw) return undefined;
-  if ("inuse" in raw && typeof raw.inuse === "number") return raw.inuse;
-  if (typeof raw.memory === "number") return raw.memory;
-  return undefined;
+  let n: number | undefined;
+  if ("inuse" in raw && typeof raw.inuse === "number") n = raw.inuse;
+  else if (typeof raw.memory === "number") n = raw.memory;
+  if (n === undefined || !Number.isFinite(n) || n <= 0) return undefined;
+  return n;
 }
 
 export function parseConnectionCount(raw?: ClashConnectionsResponse | null): number {

@@ -2,13 +2,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Badge, Card, CardHeader, StatTile } from "../components/ui";
 import { useT } from "../lib/i18n";
 import { useSession, type ControlInfo } from "../lib/session";
-import { apiJson, clashJson } from "../lib/api";
+import { apiJson, clashJson, clashWsUrl } from "../lib/api";
 import {
   formatBytes,
   formatTrafficTotal,
   parseConnectionCount,
   parseMemoryBytes,
   type ClashConnectionsResponse,
+  type ClashMemoryResponse,
   type ClashVersionResponse,
 } from "../lib/clash";
 
@@ -23,6 +24,7 @@ export function StatusPage() {
   const [traffic, setTraffic] = useState("—");
   const clashRef = useRef(clash);
   clashRef.current = clash;
+  const memorySampleRef = useRef(0);
 
   // Prefer live /api/control; fall back to session snapshot until first poll.
   const ctrl = liveControl ?? control;
@@ -53,7 +55,8 @@ export function StatusPage() {
   const loadClashStats = useCallback(async () => {
     const conn = clashRef.current;
     try {
-      // Do NOT GET /memory — Mihomo streams it and hangs HTTP until timeout.
+      // Do NOT GET /memory over HTTP — Mihomo streams it and hangs until timeout.
+      // RSS comes from the WebSocket below; /connections memory is only a non-zero fallback.
       const [ver, trafficData] = await Promise.all([
         clashJson<ClashVersionResponse>("version", conn, undefined, 8000).catch(() => null),
         clashJson<ClashConnectionsResponse>("connections", conn, undefined, 8000).catch(() => null),
@@ -67,17 +70,24 @@ export function StatusPage() {
       }
 
       if (up) {
-        const memBytes = parseMemoryBytes(trafficData);
-        setMemory(memBytes !== undefined ? formatBytes(memBytes) : "—");
         setConnections(trafficData ? String(parseConnectionCount(trafficData)) : "—");
         setTraffic(formatTrafficTotal(trafficData));
+        if (memorySampleRef.current === 0) {
+          const fallback = parseMemoryBytes(trafficData);
+          if (fallback !== undefined) {
+            memorySampleRef.current = fallback;
+            setMemory(formatBytes(fallback));
+          }
+        }
       } else {
+        memorySampleRef.current = 0;
         setMemory("—");
         setConnections("—");
         setTraffic("—");
       }
     } catch {
       setClashUp(false);
+      memorySampleRef.current = 0;
       setMemory("—");
       setConnections("—");
       setTraffic("—");
@@ -93,6 +103,81 @@ export function StatusPage() {
     }, 5000);
     return () => clearInterval(id);
   }, [loadControl, loadClashStats, clash.port, clash.secret, clash.unix]);
+
+  // Live RSS via /memory WebSocket. First frame is always inuse:0 — skip until a real sample.
+  // Do not reset the retry budget on browser onopen: /clash-ws accepts before Mihomo is reached.
+  useEffect(() => {
+    if (!mihomoRunning) return;
+
+    const url = clashWsUrl("memory", clashRef.current);
+    let ws: WebSocket | null = null;
+    let closed = false;
+    let reconnectTimer: number | undefined;
+    let attempts = 0;
+    let gotSample = false;
+    const MAX_ATTEMPTS = 8;
+
+    const clearTimer = () => {
+      if (reconnectTimer === undefined) return;
+      window.clearTimeout(reconnectTimer);
+      reconnectTimer = undefined;
+    };
+
+    const clearStaleMemory = () => {
+      memorySampleRef.current = 0;
+      setMemory("—");
+    };
+
+    const applySample = (raw: ClashMemoryResponse) => {
+      const bytes = parseMemoryBytes(raw);
+      if (bytes === undefined) return;
+      gotSample = true;
+      attempts = 0;
+      memorySampleRef.current = bytes;
+      setMemory(formatBytes(bytes));
+    };
+
+    const connect = () => {
+      if (closed) return;
+      clearTimer();
+      try {
+        ws = new WebSocket(url);
+      } catch {
+        attempts += 1;
+        if (attempts > MAX_ATTEMPTS) {
+          clearStaleMemory();
+          return;
+        }
+        reconnectTimer = window.setTimeout(connect, Math.min(1000 * attempts, 8000));
+        return;
+      }
+      ws.onmessage = (ev) => {
+        try {
+          applySample(JSON.parse(String(ev.data)) as ClashMemoryResponse);
+        } catch {
+          /* ignore non-JSON */
+        }
+      };
+      ws.onclose = () => {
+        if (closed) return;
+        attempts += 1;
+        if (attempts > MAX_ATTEMPTS) {
+          clearStaleMemory();
+          return;
+        }
+        // Keep the last good reading while retrying; clear only after the budget is spent.
+        if (!gotSample) setMemory("—");
+        reconnectTimer = window.setTimeout(connect, Math.min(1000 * attempts, 8000));
+      };
+    };
+
+    connect();
+    return () => {
+      closed = true;
+      clearTimer();
+      ws?.close();
+    };
+  }, [clash.port, clash.secret, clash.unix, mihomoRunning]);
 
   const panelPort =
     typeof window !== "undefined" && window.location.port ? window.location.port : "7220";
@@ -126,7 +211,7 @@ export function StatusPage() {
             value={connections || "—"}
             hint={t("status.active")}
           />
-          <StatTile label={t("status.memory")} value={memory || "—"} />
+          <StatTile label={t("status.memoryRss")} value={memory || "—"} />
           <StatTile
             label={t("status.version")}
             value={clashVersion || versions?.mihomo?.version?.replace(/^v/i, "") || "—"}

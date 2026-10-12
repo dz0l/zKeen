@@ -41,6 +41,7 @@ const translations: Translations = {
     "status.connections": "Соединения",
     "status.active": "активных",
     "status.memory": "Память",
+    "status.memoryRss": "Память Mihomo (RSS)",
     "status.version": "Версия",
     "status.restart": "Перезапуск",
     "status.stop": "Стоп",
@@ -381,6 +382,10 @@ const translations: Translations = {
     "api.unsupportedYamlLayout":
       "Секция {section} в config.yaml записана в нестандартной форме — панель не будет её переписывать. Измените её в редакторе YAML.",
     "api.updateInProgress": "Уже выполняется другое обновление — дождитесь его завершения",
+    "api.backupFailed": "Не удалось сохранить копию текущего ядра перед обновлением",
+    "api.initFailed": "Init-скрипт XKeen завершился с ошибкой",
+    "api.stopFailed": "Не удалось остановить ядро",
+    "api.rollbackFailed": "Не удалось восстановить предыдущую версию ядра",
     "api.defaultTemplateEmpty":
       "Шаблон config пуст. Обновите zkeen-ui или положите mihomo-config.default.yaml в /opt/etc/mihomo/",
     "api.panelInitMissing": "Не найден init-скрипт панели S99zkeen-ui",
@@ -473,6 +478,7 @@ const translations: Translations = {
     "status.connections": "Connections",
     "status.active": "active",
     "status.memory": "Memory",
+    "status.memoryRss": "Mihomo memory (RSS)",
     "status.version": "Version",
     "status.restart": "Restart",
     "status.stop": "Stop",
@@ -810,6 +816,10 @@ const translations: Translations = {
     "api.unsupportedYamlLayout":
       "The {section} section of config.yaml uses an unsupported layout — the panel will not rewrite it. Edit it in the YAML editor.",
     "api.updateInProgress": "Another update is already running — wait for it to finish",
+    "api.backupFailed": "Could not save a copy of the current core before updating",
+    "api.initFailed": "XKeen init script exited with an error",
+    "api.stopFailed": "Failed to stop the core",
+    "api.rollbackFailed": "Failed to restore the previous core version",
     "api.defaultTemplateEmpty":
       "Default config template is empty. Update zkeen-ui or place mihomo-config.default.yaml in /opt/etc/mihomo/",
     "api.panelInitMissing": "Panel init script S99zkeen-ui not found",

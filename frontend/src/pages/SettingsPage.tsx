@@ -70,9 +70,9 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
       });
   }, []);
 
-  async function checkUpdates() {
+  async function checkUpdates(opts?: { soft?: boolean }) {
     setChecking(true);
-    setCheckError("");
+    if (!opts?.soft) setCheckError("");
     try {
       const res = await apiJson<
         VersionInfo & { success?: boolean; check_ok?: boolean; check_error?: string }
@@ -80,13 +80,13 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
         method: "POST",
       });
       setVersions(res);
-      if (res.check_ok === false) {
+      if (res.check_ok === false && !opts?.soft) {
         setCheckError(
           displayApiError(res.check_error || "", t, "settings.checkError", locale),
         );
       }
     } catch (err) {
-      setCheckError(apiErr(err, "settings.checkError"));
+      if (!opts?.soft) setCheckError(apiErr(err, "settings.checkError"));
     } finally {
       setChecking(false);
     }
@@ -142,7 +142,16 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
         await waitForPanelAndHardReload({ initialDelayMs: 1200 });
         return;
       }
-      await checkUpdates();
+      // After a core replace Mihomo is restarted; GitHub checks go via mixed-port.
+      // Wait for the API, then refresh quietly so a brief GitHub miss is not shown as update failure.
+      if (core === "mihomo") {
+        setUpdateStage("restarting");
+        await waitForClashApi(clash, 40, 500).catch(() => {});
+      }
+      await checkUpdates({ soft: true });
+      // One more attempt if the first check ran while the proxy was still coming up.
+      await new Promise((r) => setTimeout(r, 1500));
+      await checkUpdates({ soft: true });
     } catch (err) {
       let message = apiErr(err, "settings.updateError");
       try {

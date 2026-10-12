@@ -440,6 +440,17 @@ fn http_for_error(code: &str) -> StatusCode {
         | "github_unreachable"
         | "opkg_update_failed"
         | "jq_install_failed" => StatusCode::BAD_GATEWAY,
+        "backup_failed"
+        | "install_failed"
+        | "unpack_failed"
+        | "save_failed"
+        | "restart_failed"
+        | "rollback_failed"
+        | "rollback_missing" => StatusCode::INTERNAL_SERVER_ERROR,
+        e if e.starts_with("init_failed")
+          || e.starts_with("restart_failed")
+          || e.starts_with("rollback_")
+          || e.starts_with("stop_failed") => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -725,6 +736,24 @@ async fn remove_op_dir(dir: &Path) {
     }
 }
 
+/// Restore `/opt/sbin/<core>` from the single rollback file and optionally restart.
+async fn restore_core_rollback(rollback: &str, target: &str, core: &str, was_running: bool) -> Result<(), String> {
+    if !Path::new(rollback).exists() {
+        return Err("rollback_missing".into());
+    }
+    log("WARN", format!("Откат {} из {}", target, rollback));
+    fs::copy(rollback, target)
+        .await
+        .map_err(|e| format!("rollback_failed:{e}"))?;
+    _ = fs::set_permissions(target, std::fs::Permissions::from_mode(0o755)).await;
+    if was_running {
+        crate::controller::soft_restart(core)
+            .await
+            .map_err(|e| format!("rollback_restart_failed:{e}"))?;
+    }
+    Ok(())
+}
+
 async fn install_jq() -> Result<(), String> {
     log("INFO", "Установка jq через opkg...".into());
     set_stage("dependency", "jq");
@@ -984,47 +1013,97 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
 
     set_stage("installing", &req.core);
     let target = format!("/opt/sbin/{}", req.core);
-    if req.backup_core && Path::new(&target).exists() {
-        let bk = format!(
-            "/opt/sbin/core-backup/{}-{}",
-            req.core,
-            (chrono::Utc::now() + chrono::Duration::hours(state.settings.read().unwrap().log.timezone as i64))
-                .format("%Y%m%d-%H%M%S")
-        );
-        _ = fs::create_dir_all("/opt/sbin/core-backup").await;
-        log("INFO", format!("Создание бэкапа: {}", bk));
-        _ = fs::copy(&target, &bk).await;
-    }
+    // Single rollback file for this operation (REC-01). Deleted only after a healthy start.
+    let rollback = format!("/opt/sbin/{}.zkeen-rollback", req.core);
+    let source = tmp_dir.join(format!("{}_{}", req.core, ver));
+    let was_running = !crate::controller::get_pid(&req.core).is_empty();
 
-    let (run, source) = (
-        !crate::controller::get_pid(&req.core).is_empty(),
-        tmp_dir.join(format!("{}_{}", req.core, ver)),
-    );
-    if fs::rename(&source, &target).await.is_ok() {
-        _ = fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).await;
-        if run {
-            log("INFO", format!("Перезапуск {}...", core_cap));
-            set_stage("restarting", &req.core);
-            if let Err(e) = crate::controller::soft_restart(&req.core).await {
-                log("ERROR", format!("{}", e));
-                return response(false, Some(format!("{}", e)));
+    if Path::new(&target).exists() {
+        if let Err(e) = fs::copy(&target, &rollback).await {
+            log("ERROR", format!("Не удалось создать rollback-копию: {}", e));
+            return response(false, Some("backup_failed".into()));
+        }
+        log("INFO", format!("Rollback-копия: {}", rollback));
+        if req.backup_core {
+            let bk = format!(
+                "/opt/sbin/core-backup/{}-{}",
+                req.core,
+                (chrono::Utc::now()
+                    + chrono::Duration::hours(state.settings.read().unwrap().log.timezone as i64))
+                .format("%Y%m%d-%H%M%S")
+            );
+            _ = fs::create_dir_all("/opt/sbin/core-backup").await;
+            if let Err(e) = fs::copy(&target, &bk).await {
+                log("WARN", format!("Дополнительный бэкап {} не создан: {}", bk, e));
+            } else {
+                log("INFO", format!("Создание бэкапа: {}", bk));
             }
         }
+    }
+
+    let installed = if fs::rename(&source, &target).await.is_ok() {
+        _ = fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).await;
+        Ok(())
     } else {
         log("WARN", "Атомарная замена не удалась, фолбек на копирование...".into());
-        if run {
+        if was_running {
             log("INFO", "Остановка XKeen...".into());
-            _ = crate::controller::run_init_command(state, &["stop"]).await;
+            if let Err(e) = crate::controller::run_init_command(state, &["stop"]).await {
+                log("ERROR", format!("Остановка перед установкой не удалась: {}", e));
+                return response(false, Some(e));
+            }
         }
-        if let Err(e) = fs::copy(&source, &target).await {
-            log("ERROR", format!("Не удалось скопировать бинарник: {}", e));
-            return response(false, Some("install_failed".to_string()));
+        match fs::copy(&source, &target).await {
+            Ok(_) => {
+                _ = fs::remove_file(&source).await;
+                _ = fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).await;
+                Ok(())
+            }
+            Err(e) => {
+                log("ERROR", format!("Не удалось скопировать бинарник: {}", e));
+                if let Err(re) = restore_core_rollback(&rollback, &target, &req.core, was_running).await {
+                    log("ERROR", format!("Откат после install_failed: {}", re));
+                }
+                Err("install_failed".to_string())
+            }
         }
-        _ = fs::remove_file(&source).await;
-        _ = fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).await;
-        if run {
-            log("INFO", "Запуск XKeen...".into());
-            _ = crate::controller::run_init_command(state, &["start", "on"]).await;
+    };
+
+    if let Err(e) = installed {
+        return response(false, Some(e));
+    }
+
+    if was_running {
+        log("INFO", format!("Перезапуск {}...", core_cap));
+        set_stage("restarting", &req.core);
+        let restart_ok = match crate::controller::soft_restart(&req.core).await {
+            Ok(()) => true,
+            Err(e) => {
+                log("WARN", format!("soft_restart не удался ({}), пробуем init start", e));
+                match crate::controller::run_init_command(state, &["start", "on"]).await {
+                    Ok(()) => crate::controller::wait_core_running(&req.core, 20, 250)
+                        .await
+                        .is_ok(),
+                    Err(e2) => {
+                        log("ERROR", format!("init start после обновления: {}", e2));
+                        false
+                    }
+                }
+            }
+        };
+        if !restart_ok {
+            match restore_core_rollback(&rollback, &target, &req.core, true).await {
+                Ok(()) => return response(false, Some("restart_failed".into())),
+                Err(re) => return response(false, Some(format!("restart_failed:{re}"))),
+            }
+        }
+    }
+
+    // Health confirmed (or core was stopped before update) — drop the rollback file.
+    if Path::new(&rollback).exists() {
+        match fs::remove_file(&rollback).await {
+            Ok(()) => log("INFO", format!("Rollback-файл удалён: {}", rollback)),
+            Err(e) => log("WARN", format!("Не удалось удалить {}: {}", rollback, e)),
         }
     }
 
