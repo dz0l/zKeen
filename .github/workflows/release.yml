@@ -64,9 +64,13 @@ jobs:
       - name: Stage Mihomo default config
         run: mkdir -p backend/assets && cp install/mihomo-config.default.yaml backend/assets/
 
+      - name: Validate Cargo dependencies
+        working-directory: backend
+        run: cargo metadata --format-version 1 --locked --filter-platform ${{ matrix.target }} > /dev/null
+
       - name: Build release binary
         working-directory: backend
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --release --locked --target ${{ matrix.target }}
 
       - name: Prepare asset
         run: |

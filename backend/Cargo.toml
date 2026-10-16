@@ -1,6 +1,6 @@
 [package]
 name = "zkeen-ui"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 
 [dependencies]
@@ -50,7 +50,7 @@ tower-http = { version = "0.7", features = ["fs", "cors", "set-header"] }
 urlencoding = "2.1"
 uuid = { version = "1", features = ["v4"] }
 yaml-rust2 = { version = "0.11", default-features = false }
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [profile.release]
 opt-level = 3
