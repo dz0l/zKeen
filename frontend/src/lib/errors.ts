@@ -47,6 +47,13 @@ const CODE_KEYS: Record<string, string> = {
   stop_failed: "api.stopFailed",
   rollback_failed: "api.rollbackFailed",
   rollback_missing: "api.rollbackFailed",
+  download_too_large: "api.downloadTooLarge",
+  no_space: "api.noSpace",
+  space_check_failed: "api.spaceCheckFailed",
+  verify_failed: "api.verifyFailed",
+  chmod_failed: "api.chmodFailed",
+  unpack_too_large: "api.unpackTooLarge",
+  port_in_use: "api.portInUse",
   download_http_404: "api.downloadHttp404",
   download_http_403: "api.downloadHttp403",
   download_http_429: "api.downloadHttp429",
@@ -92,7 +99,7 @@ function resolveCode(raw: string): { code: string; params?: Record<string, strin
   if (withSec) return { code: "too_many_attempts", params: { sec: withSec[1] } };
 
   const withPrefix = raw.match(
-    /^(restart_failed|start_failed|save_failed|install_failed|unpack_failed|init_failed|stop_failed|backup_failed|rollback_failed|rollback_restart_failed)(?::|$)/,
+    /^(restart_failed|start_failed|save_failed|install_failed|unpack_failed|unpack_too_large|init_failed|stop_failed|backup_failed|rollback_failed|rollback_restart_failed|verify_failed|chmod_failed|port_bind_failed|no_space|space_check_failed|download_too_large)(?::|$)/,
   );
   if (withPrefix) {
     const code = withPrefix[1] === "rollback_restart_failed" ? "rollback_failed" : withPrefix[1];

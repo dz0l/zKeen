@@ -133,7 +133,8 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
         body: JSON.stringify({
           core,
           version,
-          backup_core: true,
+          // No permanent core-backup: only in-flight .zkeen-rollback on the router (REC-01).
+          backup_core: false,
           assets: [],
         }),
       });

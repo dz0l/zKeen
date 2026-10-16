@@ -1228,8 +1228,9 @@ export function normalizePolicyDomain(input: string): string {
   return d;
 }
 
+/* Stable id for a managed policy: kind + payload only (no target). */
 export function userPolicyId(p: UserPolicy): string {
-  return `${p.kind}:${p.value}:${p.target}`;
+  return `${p.kind}:${p.value}`;
 }
 
 function isHostSrcIpPolicy(type: string, payload: string): boolean {
@@ -1301,20 +1302,17 @@ export function parseUserPolicies(yaml: string): UserPolicyDraft[] {
 }
 
 function normalizePolicies(policies: UserPolicy[]): UserPolicy[] {
-  const unique: UserPolicy[] = [];
-  const seen = new Set<string>();
+  // Last write wins for the same kind+value (PROXY→STRAIGHT replaces target).
+  const byKey = new Map<string, UserPolicy>();
   for (const p of policies) {
     const normalized: UserPolicy =
       p.kind === "ip"
         ? { kind: "ip", value: normalizePolicyIp(p.value), target: p.target.trim() }
         : { kind: "domain", value: normalizePolicyDomain(p.value), target: p.target.trim() };
     if (!normalized.value || !normalized.target) continue;
-    const id = userPolicyId(normalized);
-    if (seen.has(id)) continue;
-    seen.add(id);
-    unique.push(normalized);
+    byKey.set(userPolicyId(normalized), normalized);
   }
-  return unique;
+  return [...byKey.values()];
 }
 
 /**
@@ -1329,8 +1327,8 @@ export function replaceUserPolicies(yaml: string, policies: UserPolicy[]): strin
     let v = viewRules(lines, true);
 
     if (v && hasPolicyBlock(v)) {
-      const pad = " ".repeat(indentOf(lines[v.blockStart]));
-      const ind = pad.length;
+      const ind = v.ind > 0 ? v.ind : 2;
+      const pad = " ".repeat(ind);
       const current = lines.slice(v.blockStart, v.blockEnd + 1).join("\n");
       const block = [
         `${pad}${POLICY_BLOCK_START}`,

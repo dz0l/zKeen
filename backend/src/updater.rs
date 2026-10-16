@@ -23,6 +23,7 @@ const GITHUB_API: &str = "https://api.github.com/repos";
 const GITHUB_RELEASE: &str = "https://github.com";
 
 const OPT_TMP: &str = "/opt/tmp";
+const OPT_SBIN: &str = "/opt/sbin";
 /// Each update stages its files in its own `/opt/tmp/zkeen-update-<uuid>/`.
 const OP_DIR_PREFIX: &str = "zkeen-update-";
 /// Leftovers of a killed run are removed only after this age.
@@ -31,6 +32,14 @@ const STALE_AFTER: Duration = Duration::from_secs(3600);
 const DOWNLOAD_IDLE_SECS: u64 = 30;
 /// Wall-clock budget for all download attempts of one file.
 const DOWNLOAD_BUDGET_SECS: u64 = 180;
+/// Keep downloads in RAM only up to this size; larger or unknown spill to disk.
+const MAX_RAM_DOWNLOAD: usize = 32 * 1024 * 1024;
+/// Hard cap for a single downloaded artifact (compressed).
+const MAX_DOWNLOAD_BYTES: u64 = 96 * 1024 * 1024;
+/// Hard cap for unpacked binary size.
+const MAX_UNPACKED_BYTES: u64 = 128 * 1024 * 1024;
+/// When Content-Length is unknown, assume a modest artifact (not the hard 96+128 caps).
+const UNKNOWN_DOWNLOAD_ASSUME: u64 = 32 * 1024 * 1024;
 
 static UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -436,13 +445,17 @@ fn http_for_error(code: &str) -> StatusCode {
         | "download_empty"
         | "download_write_failed"
         | "download_budget"
+        | "download_too_large"
         | "update_failed"
         | "github_unreachable"
         | "opkg_update_failed"
         | "jq_install_failed" => StatusCode::BAD_GATEWAY,
+        "no_space" => StatusCode::INSUFFICIENT_STORAGE,
+        "verify_failed" | "chmod_failed" => StatusCode::INTERNAL_SERVER_ERROR,
         "backup_failed"
         | "install_failed"
         | "unpack_failed"
+        | "unpack_too_large"
         | "save_failed"
         | "restart_failed"
         | "rollback_failed"
@@ -487,54 +500,182 @@ fn download_fail_code(kind: &str, status: Option<u16>) -> String {
         "empty" => "download_empty".into(),
         "write" => "download_write_failed".into(),
         "budget" => "download_budget".into(),
+        "too_large" => "download_too_large".into(),
+        "no_space" => "no_space".into(),
         _ => "update_failed".into(),
     }
 }
 
+fn current_core_bytes(core: &str) -> u64 {
+    std::fs::metadata(format!("{OPT_SBIN}/{core}"))
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+/// Peak disk need: download + estimated unpack + rollback copy of the current core (ZK-23).
+fn peak_update_need(download_bytes: u64, core_bytes: u64) -> u64 {
+    let dl = download_bytes.min(MAX_DOWNLOAD_BYTES).max(1);
+    // gzip often expands; stay within the unpack hard cap.
+    let unpack_est = dl.saturating_mul(2).min(MAX_UNPACKED_BYTES).max(dl);
+    dl.saturating_add(unpack_est).saturating_add(core_bytes)
+}
+
+fn ensure_free_space(paths: &[&str], need: u64) -> Result<(), String> {
+    for p in paths {
+        let path = Path::new(p);
+        if !path.exists() {
+            continue;
+        }
+        let st = rustix::fs::statvfs(path).map_err(|e| {
+            log("ERROR", format!("statvfs({}) не удался: {e}", path.display()));
+            String::from("space_check_failed")
+        })?;
+        let free = (st.f_bavail as u64).saturating_mul(st.f_frsize as u64);
+        if free < need {
+            log(
+                "ERROR",
+                format!(
+                    "Мало места на {}: {:.1} МБ свободно, нужно {:.1} МБ",
+                    p,
+                    free as f64 / 1048576.0,
+                    need as f64 / 1048576.0
+                ),
+            );
+            return Err("no_space".into());
+        }
+        log(
+            "INFO",
+            format!("Свободно на {}: {:.1} МБ (нужно ≥ {:.1} МБ)", p, free as f64 / 1048576.0, need as f64 / 1048576.0),
+        );
+    }
+    Ok(())
+}
+
+fn copy_limited<R: Read, W: Write>(rdr: &mut R, out: &mut W, limit: u64) -> std::io::Result<u64> {
+    let mut buf = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = rdr.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n as u64);
+        if total > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unpack_too_large",
+            ));
+        }
+        out.write_all(&buf[..n])?;
+    }
+    Ok(total)
+}
+
 async fn download(
-    client: &reqwest::Client, url: &str, proxies: &[String], tmp_path: &Path,
+    client: &reqwest::Client,
+    url: &str,
+    proxies: &[String],
+    tmp_path: &Path,
+    core_bytes: u64,
 ) -> Result<DownloadResult, String> {
-    async fn load(r: reqwest::Response, path: &Path, source: &str) -> Result<DownloadResult, String> {
-        let size = r.content_length().unwrap_or(0) as usize;
-        let (mut stream, is_disk) = (r.bytes_stream(), size > 50 * 1024 * 1024);
-        let mut file = if is_disk {
+    ensure_free_space(
+        &[OPT_TMP, OPT_SBIN],
+        peak_update_need(UNKNOWN_DOWNLOAD_ASSUME, core_bytes),
+    )?;
+
+    async fn load(
+        r: reqwest::Response, path: &Path, source: &str, core_bytes: u64,
+    ) -> Result<DownloadResult, String> {
+        if let Some(cl) = r.content_length() {
+            if cl > MAX_DOWNLOAD_BYTES {
+                log(
+                    "WARN",
+                    format!(
+                        "Content-Length {:.1} МБ превышает лимит {:.1} МБ ({})",
+                        cl as f64 / 1048576.0,
+                        MAX_DOWNLOAD_BYTES as f64 / 1048576.0,
+                        source
+                    ),
+                );
+                return Err("download_too_large".into());
+            }
+            ensure_free_space(&[OPT_TMP, OPT_SBIN], peak_update_need(cl, core_bytes))?;
+        }
+
+        let declared = r.content_length().unwrap_or(0) as usize;
+        let mut use_disk = declared == 0 || declared > MAX_RAM_DOWNLOAD;
+        let mut stream = r.bytes_stream();
+        let mut file = if use_disk {
             Some(fs::File::create(path).await.map_err(|_| "download_write_failed".to_string())?)
         } else {
             None
         };
-        let mut buf = if is_disk {
+        let mut buf = if use_disk {
             Vec::new()
         } else {
-            Vec::with_capacity(if size > 0 { size } else { 5 * 1024 * 1024 })
+            Vec::with_capacity(declared.min(MAX_RAM_DOWNLOAD).max(1024 * 1024))
         };
+        let mut total: u64 = 0;
 
         loop {
             match tokio::time::timeout(Duration::from_secs(DOWNLOAD_IDLE_SECS), stream.next()).await {
                 Ok(Some(Ok(chunk))) => {
+                    total = total.saturating_add(chunk.len() as u64);
+                    if total > MAX_DOWNLOAD_BYTES {
+                        log("WARN", format!("Превышен лимит загрузки ({})", source));
+                        if use_disk {
+                            _ = fs::remove_file(path).await;
+                        }
+                        return Err("download_too_large".into());
+                    }
                     if let Some(f) = &mut file {
                         if let Err(e) = f.write_all(&chunk).await {
                             log("WARN", format!("Ошибка записи на диск ({}): {}", source, e));
                             _ = fs::remove_file(path).await;
                             return Err("download_write_failed".into());
                         }
+                    } else if buf.len().saturating_add(chunk.len()) > MAX_RAM_DOWNLOAD {
+                        // Spill before growing past the RAM ceiling (ZK-23).
+                        log(
+                            "INFO",
+                            format!(
+                                "Сброс загрузки на диск после {:.1} МБ ({})",
+                                buf.len() as f64 / 1048576.0,
+                                source
+                            ),
+                        );
+                        let mut f = fs::File::create(path)
+                            .await
+                            .map_err(|_| "download_write_failed".to_string())?;
+                        f.write_all(&buf)
+                            .await
+                            .map_err(|_| "download_write_failed".to_string())?;
+                        f.write_all(&chunk)
+                            .await
+                            .map_err(|_| "download_write_failed".to_string())?;
+                        buf.clear();
+                        buf.shrink_to_fit();
+                        file = Some(f);
+                        use_disk = true;
                     } else {
                         buf.extend_from_slice(&chunk);
                     }
                 }
                 Ok(None) => {
-                    if !is_disk && buf.is_empty() {
+                    if !use_disk && buf.is_empty() {
                         log("WARN", format!("Загрузка вернула 0 байт ({})", source));
                         return Err("download_empty".into());
                     }
+                    let stored = if use_disk { total } else { buf.len() as u64 };
                     log(
                         "INFO",
                         format!(
                             "Файл загружен {} ({:.1} МБ)",
-                            if is_disk { "на диск" } else { "в ОЗУ" },
-                            (if is_disk { size } else { buf.len() }) as f64 / 1048576.0
+                            if use_disk { "на диск" } else { "в ОЗУ" },
+                            stored as f64 / 1048576.0
                         ),
                     );
-                    return Ok(if is_disk {
+                    return Ok(if use_disk {
                         DownloadResult::Disk(path.to_path_buf())
                     } else {
                         DownloadResult::RAM(buf)
@@ -542,7 +683,7 @@ async fn download(
                 }
                 Ok(Some(Err(e))) => {
                     log("WARN", format!("Соединение оборвалось ({}): {}", source, e));
-                    if is_disk {
+                    if use_disk {
                         _ = fs::remove_file(path).await;
                     }
                     return Err("download_network".into());
@@ -555,7 +696,7 @@ async fn download(
                             DOWNLOAD_IDLE_SECS, source
                         ),
                     );
-                    if is_disk {
+                    if use_disk {
                         _ = fs::remove_file(path).await;
                     }
                     return Err("download_timeout".into());
@@ -626,13 +767,16 @@ async fn download(
                         last_err = download_fail_code("html", None);
                         continue;
                     }
-                    match load(r, tmp_path, &source).await {
+                    match load(r, tmp_path, &source, core_bytes).await {
                         Ok(res) => return Ok(res),
                         Err(e) => {
                             last_err = e.clone();
-                            // Disk full / write errors will not improve on the next mirror.
-                            if e == "download_write_failed" {
-                                log("ERROR", format!("Запись на диск не удалась ({})", source));
+                            // Disk / size errors will not improve on the next mirror.
+                            if matches!(
+                                e.as_str(),
+                                "download_write_failed" | "download_too_large" | "no_space"
+                            ) {
+                                log("ERROR", format!("Загрузка остановлена ({source}): {e}"));
                                 return Err(e);
                             }
                         }
@@ -736,22 +880,238 @@ async fn remove_op_dir(dir: &Path) {
     }
 }
 
+fn update_marker_path(core: &str) -> String {
+    format!("{OPT_SBIN}/{core}.zkeen-updating")
+}
+
+async fn clear_update_marker(core: &str) {
+    let _ = fs::remove_file(update_marker_path(core)).await;
+}
+
+/// Remove leftover permanent copies from older panel versions (`core-backup/<core>-*`).
+/// After a successful update they must not remain on flash (REC-01 / ZK-23).
+async fn cleanup_legacy_core_backups(core: &str) {
+    let bk_dir = PathBuf::from(format!("{OPT_SBIN}/core-backup"));
+    let Ok(mut entries) = fs::read_dir(&bk_dir).await else {
+        return;
+    };
+    let prefix = format!("{core}-");
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        match fs::remove_file(entry.path()).await {
+            Ok(()) => log("INFO", format!("Удалён устаревший core-backup: {}", entry.path().display())),
+            Err(e) => log("WARN", format!("Не удалось удалить {}: {e}", entry.path().display())),
+        }
+    }
+    // Drop empty directory if nothing else remains.
+    if let Ok(mut left) = fs::read_dir(&bk_dir).await {
+        if left.next_entry().await.ok().flatten().is_none() {
+            let _ = fs::remove_dir(&bk_dir).await;
+        }
+    }
+}
+
+/// Publish rollback via temp + fsync + rename so a power loss mid-copy cannot leave a half file.
+async fn publish_rollback_copy(target: &str, rollback: &str) -> Result<(), String> {
+    let tmp = format!("{rollback}.tmp");
+    let _ = fs::remove_file(&tmp).await;
+    fs::copy(target, &tmp)
+        .await
+        .map_err(|e| format!("backup_failed:{e}"))?;
+    let tmp_path = tmp.clone();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let f = std::fs::File::open(&tmp_path)?;
+        f.sync_all()?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("backup_failed:{e}"))?
+    .map_err(|e| format!("backup_failed:{e}"))?;
+    fs::rename(&tmp, rollback)
+        .await
+        .map_err(|e| format!("backup_failed:{e}"))?;
+    // Best-effort directory fsync so the rename itself survives power loss (ZK-21).
+    let _ = tokio::task::spawn_blocking(|| {
+        let dir = std::fs::File::open(OPT_SBIN)?;
+        dir.sync_all()
+    })
+    .await;
+    Ok(())
+}
+
 /// Restore `/opt/sbin/<core>` from the single rollback file and optionally restart.
 async fn restore_core_rollback(rollback: &str, target: &str, core: &str, was_running: bool) -> Result<(), String> {
+    match restore_core_rollback_inner(rollback, target, core, was_running).await {
+        Ok(()) => {
+            clear_update_marker(core).await;
+            Ok(())
+        }
+        // Keep `.zkeen-updating` so the next boot can retry recovery (ZK-21).
+        Err(e) => Err(e),
+    }
+}
+
+async fn restore_core_rollback_inner(
+    rollback: &str, target: &str, core: &str, was_running: bool,
+) -> Result<(), String> {
     if !Path::new(rollback).exists() {
         return Err("rollback_missing".into());
     }
     log("WARN", format!("Откат {} из {}", target, rollback));
-    fs::copy(rollback, target)
-        .await
-        .map_err(|e| format!("rollback_failed:{e}"))?;
-    _ = fs::set_permissions(target, std::fs::Permissions::from_mode(0o755)).await;
-    if was_running {
-        crate::controller::soft_restart(core)
+    let broken = format!("{target}.zkeen-bad");
+    let _ = fs::rename(target, &broken).await;
+    let restored = if fs::rename(rollback, target).await.is_ok() {
+        true
+    } else {
+        match fs::copy(rollback, target).await {
+            Ok(_) => {
+                let _ = fs::remove_file(rollback).await;
+                true
+            }
+            Err(e) => {
+                log("ERROR", format!("Откат не удался: {e}"));
+                let _ = fs::rename(&broken, target).await;
+                return Err(format!("rollback_failed:{e}"));
+            }
+        }
+    };
+    if restored {
+        // Keep .zkeen-bad until the restored binary is chmod'd / optionally restarted.
+        fs::set_permissions(target, std::fs::Permissions::from_mode(0o755))
             .await
-            .map_err(|e| format!("rollback_restart_failed:{e}"))?;
+            .map_err(|e| format!("chmod_failed:{e}"))?;
+        if was_running {
+            crate::controller::soft_restart(core)
+                .await
+                .map_err(|e| format!("rollback_restart_failed:{e}"))?;
+        }
+        let _ = fs::remove_file(&broken).await;
     }
     Ok(())
+}
+
+/// Finish incomplete core updates left after power loss / crash (marker + rollback).
+pub async fn recover_interrupted_core_updates() {
+    for core in ["mihomo", "xray"] {
+        let marker = update_marker_path(core);
+        if !Path::new(&marker).exists() {
+            continue;
+        }
+        let rollback = format!("{OPT_SBIN}/{core}.zkeen-rollback");
+        let target = format!("{OPT_SBIN}/{core}");
+        log(
+            "WARN",
+            format!("Обнаружено незавершённое обновление {core} — восстанавливаю предыдущую версию"),
+        );
+        if Path::new(&rollback).exists() {
+            match restore_core_rollback(&rollback, &target, core, false).await {
+                Ok(()) => log("INFO", format!("Откат {core} после сбоя обновления выполнен")),
+                Err(e) => log("ERROR", format!("Откат {core} после сбоя обновления: {e}")),
+            }
+        } else {
+            log(
+                "WARN",
+                format!("Маркер обновления {core} без rollback — удаляю маркер"),
+            );
+            clear_update_marker(core).await;
+        }
+    }
+}
+
+/// Confirm the installed binary at least runs and prints a version line.
+async fn verify_core_binary(core: &str) -> Result<(), String> {
+    let bin = format!("{OPT_SBIN}/{core}");
+    let mut cmd = Command::new(&bin);
+    if core == "mihomo" {
+        cmd.arg("-v");
+    } else {
+        cmd.arg("version");
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let out = match tokio::time::timeout(Duration::from_secs(5), cmd.output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(format!("verify_failed:{e}")),
+        Err(_) => return Err("verify_failed:timeout".into()),
+    };
+    if !out.status.success() {
+        return Err(format!(
+            "verify_failed:exit:{}",
+            out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into())
+        ));
+    }
+    if out.stdout.is_empty() && out.stderr.is_empty() {
+        return Err("verify_failed:empty".into());
+    }
+    Ok(())
+}
+
+/// Run `mihomo -t` against the live config when present (catches wrong arch/config beyond `-v`).
+async fn verify_core_config(core: &str) -> Result<(), String> {
+    if core != "mihomo" {
+        return Ok(());
+    }
+    let cfg = Path::new(crate::types::MIHOMO_CONF_DIR).join("config.yaml");
+    if !cfg.exists() {
+        return Ok(());
+    }
+    let bin = format!("{OPT_SBIN}/{core}");
+    let mut cmd = Command::new(&bin);
+    cmd.args(["-t", "-f"]).arg(&cfg);
+    cmd.env("CLASH_HOME_DIR", crate::types::MIHOMO_CONF_DIR);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let out = match tokio::time::timeout(Duration::from_secs(20), cmd.output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(format!("verify_failed:config:{e}")),
+        Err(_) => return Err("verify_failed:config:timeout".into()),
+    };
+    if !out.status.success() {
+        return Err("verify_failed:config".into());
+    }
+    Ok(())
+}
+
+fn read_mihomo_controller_port() -> Option<u16> {
+    let cfg = Path::new(crate::types::MIHOMO_CONF_DIR).join("config.yaml");
+    let content = std::fs::read_to_string(cfg).ok()?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix("external-controller:") else {
+            continue;
+        };
+        let addr = rest.trim().trim_matches('"').trim_matches('\'');
+        let port = addr.rsplit_once(':')?.1.trim().parse().ok()?;
+        return Some(port);
+    }
+    None
+}
+
+/// After restart, confirm Clash API answers on the configured external-controller port.
+async fn verify_mihomo_api(client: &reqwest::Client) -> Result<(), String> {
+    let Some(port) = read_mihomo_controller_port() else {
+        return Ok(());
+    };
+    let url = format!("http://127.0.0.1:{port}/version");
+    for _ in 0..12 {
+        match client.get(&url).timeout(Duration::from_secs(2)).send().await {
+            Ok(r) if r.status().is_success() => return Ok(()),
+            _ => tokio::time::sleep(Duration::from_millis(400)).await,
+        }
+    }
+    Err("verify_failed:api".into())
+}
+
+async fn verify_installed_core(core: &str) -> Result<(), String> {
+    verify_core_binary(core).await?;
+    verify_core_config(core).await
 }
 
 async fn install_jq() -> Result<(), String> {
@@ -842,7 +1202,14 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
         log("INFO", "Загрузка исполняемого файла...".into());
         set_stage("downloading", "zkeen-ui");
         let bin_url = format!("{GITHUB_RELEASE}/{repo}/releases/download/{ver}/zkeen-ui-{arch_suffix}");
-        let bin_d = match download(&state.http_client, &bin_url, &proxies, &tmp_dir.join("bin.tmp")).await {
+        let bin_d = match download(
+            &state.http_client,
+            &bin_url,
+            &proxies,
+            &tmp_dir.join("bin.tmp"),
+            0,
+        )
+        .await {
             Ok(d) => d,
             Err(e) => return response(false, Some(e)),
         };
@@ -972,9 +1339,18 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
         _ => {}
     }
 
+    let core_bytes = current_core_bytes(&req.core);
     log("INFO", format!("Загрузка: {}", url));
     set_stage("downloading", &asset);
-    let dl_res = match download(&state.http_client, &url, &proxies, &tmp_dir.join("download.tmp")).await {
+    let dl_res = match download(
+        &state.http_client,
+        &url,
+        &proxies,
+        &tmp_dir.join("download.tmp"),
+        core_bytes,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => return response(false, Some(e)),
     };
@@ -986,12 +1362,24 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
     fn unpack<R: Read + Seek>(rdr: R, out_path: &Path, core: &str, is_zip: bool) -> std::io::Result<()> {
         let mut out = File::create(out_path)?;
         if is_zip {
-            std::io::copy(&mut zip::ZipArchive::new(rdr)?.by_name(core)?, &mut out)?;
+            let mut z = zip::ZipArchive::new(rdr)?;
+            let mut entry = z.by_name(core)?;
+            copy_limited(&mut entry, &mut out, MAX_UNPACKED_BYTES)?;
         } else {
-            std::io::copy(&mut flate2::read::GzDecoder::new(rdr), &mut out)?;
+            let mut gz = flate2::read::GzDecoder::new(rdr);
+            copy_limited(&mut gz, &mut out, MAX_UNPACKED_BYTES)?;
         }
         out.sync_data()?;
         Ok(())
+    }
+
+    let downloaded = match &dl_res {
+        DownloadResult::RAM(b) => b.len() as u64,
+        DownloadResult::Disk(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+    };
+    if let Err(e) = ensure_free_space(&[OPT_TMP, OPT_SBIN], peak_update_need(downloaded.max(1), core_bytes))
+    {
+        return response(false, Some(e));
     }
 
     let bin = tmp_dir.join(format!("{}_{}", core_name, ver));
@@ -1007,57 +1395,77 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
     })
     .await;
 
-    if let Ok(Err(_e)) | Err(_e) = unpack.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) {
-        return response(false, Some("unpack_failed".to_string()));
+    match unpack {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) if e.to_string().contains("unpack_too_large") => {
+            return response(false, Some("unpack_too_large".into()));
+        }
+        Ok(Err(_)) | Err(_) => {
+            return response(false, Some("unpack_failed".to_string()));
+        }
     }
 
     set_stage("installing", &req.core);
-    let target = format!("/opt/sbin/{}", req.core);
-    // Single rollback file for this operation (REC-01). Deleted only after a healthy start.
-    let rollback = format!("/opt/sbin/{}.zkeen-rollback", req.core);
+    let target = format!("{OPT_SBIN}/{}", req.core);
+    // Single rollback file for this operation (REC-01). Deleted only after verified health.
+    let rollback = format!("{OPT_SBIN}/{}.zkeen-rollback", req.core);
     let source = tmp_dir.join(format!("{}_{}", req.core, ver));
     let was_running = !crate::controller::get_pid(&req.core).is_empty();
+    let marker = update_marker_path(&req.core);
 
     if Path::new(&target).exists() {
-        if let Err(e) = fs::copy(&target, &rollback).await {
+        if let Err(e) = publish_rollback_copy(&target, &rollback).await {
             log("ERROR", format!("Не удалось создать rollback-копию: {}", e));
             return response(false, Some("backup_failed".into()));
         }
         log("INFO", format!("Rollback-копия: {}", rollback));
-        if req.backup_core {
-            let bk = format!(
-                "/opt/sbin/core-backup/{}-{}",
-                req.core,
-                (chrono::Utc::now()
-                    + chrono::Duration::hours(state.settings.read().unwrap().log.timezone as i64))
-                .format("%Y%m%d-%H%M%S")
-            );
-            _ = fs::create_dir_all("/opt/sbin/core-backup").await;
-            if let Err(e) = fs::copy(&target, &bk).await {
-                log("WARN", format!("Дополнительный бэкап {} не создан: {}", bk, e));
-            } else {
-                log("INFO", format!("Создание бэкапа: {}", bk));
-            }
-        }
+        // Permanent core-backup/… is never created (REC-01 / ZK-23): only this transactional rollback.
     }
 
-    let installed = if fs::rename(&source, &target).await.is_ok() {
-        _ = fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).await;
+    if let Err(e) = fs::write(&marker, b"1").await {
+        log("ERROR", format!("Не удалось записать маркер обновления: {e}"));
+        let _ = fs::remove_file(&rollback).await;
+        return response(false, Some("backup_failed".into()));
+    }
+    let marker_path = marker.clone();
+    let _ = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let f = std::fs::File::open(&marker_path)?;
+        f.sync_all()?;
+        let dir = std::fs::File::open(OPT_SBIN)?;
+        dir.sync_all()?;
         Ok(())
+    })
+    .await;
+
+    let installed = if fs::rename(&source, &target).await.is_ok() {
+        if let Err(e) = fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).await {
+            log("ERROR", format!("chmod после rename не удался: {e}"));
+            let _ = restore_core_rollback(&rollback, &target, &req.core, false).await;
+            Err("chmod_failed".to_string())
+        } else {
+            Ok(())
+        }
     } else {
         log("WARN", "Атомарная замена не удалась, фолбек на копирование...".into());
         if was_running {
             log("INFO", "Остановка XKeen...".into());
             if let Err(e) = crate::controller::run_init_command(state, &["stop"]).await {
                 log("ERROR", format!("Остановка перед установкой не удалась: {}", e));
+                clear_update_marker(&req.core).await;
+                let _ = fs::remove_file(&rollback).await;
                 return response(false, Some(e));
             }
         }
         match fs::copy(&source, &target).await {
             Ok(_) => {
                 _ = fs::remove_file(&source).await;
-                _ = fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).await;
-                Ok(())
+                if let Err(e) = fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).await {
+                    log("ERROR", format!("chmod после copy не удался: {e}"));
+                    let _ = restore_core_rollback(&rollback, &target, &req.core, was_running).await;
+                    Err("chmod_failed".to_string())
+                } else {
+                    Ok(())
+                }
             }
             Err(e) => {
                 log("ERROR", format!("Не удалось скопировать бинарник: {}", e));
@@ -1071,6 +1479,16 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
 
     if let Err(e) = installed {
         return response(false, Some(e));
+    }
+
+    // Always verify binary (+ config test) before dropping rollback (covers was_running=false).
+    set_stage("verifying", &req.core);
+    if let Err(e) = verify_installed_core(&req.core).await {
+        log("ERROR", format!("Проверка нового бинарника не прошла: {e}"));
+        match restore_core_rollback(&rollback, &target, &req.core, was_running).await {
+            Ok(()) => return response(false, Some(e)),
+            Err(re) => return response(false, Some(format!("{e};{re}"))),
+        }
     }
 
     if was_running {
@@ -1097,15 +1515,26 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
                 Err(re) => return response(false, Some(format!("restart_failed:{re}"))),
             }
         }
+        if req.core == "mihomo" {
+            if let Err(e) = verify_mihomo_api(&state.http_client).await {
+                log("ERROR", format!("Clash API после обновления недоступен: {e}"));
+                match restore_core_rollback(&rollback, &target, &req.core, true).await {
+                    Ok(()) => return response(false, Some(e)),
+                    Err(re) => return response(false, Some(format!("{e};{re}"))),
+                }
+            }
+        }
     }
 
-    // Health confirmed (or core was stopped before update) — drop the rollback file.
+    // Health confirmed — drop the rollback file, update marker, and any legacy permanent backups.
     if Path::new(&rollback).exists() {
         match fs::remove_file(&rollback).await {
             Ok(()) => log("INFO", format!("Rollback-файл удалён: {}", rollback)),
             Err(e) => log("WARN", format!("Не удалось удалить {}: {}", rollback, e)),
         }
     }
+    clear_update_marker(&req.core).await;
+    cleanup_legacy_core_backups(&req.core).await;
 
     log("INFO", format!("Обновление {} до {} завершено", core_cap, ver));
     {
@@ -1119,4 +1548,49 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
     *state.update_checker.last_core_toast.write().unwrap() = None;
 
     response(true, None)
+}
+
+#[cfg(test)]
+mod audit_regression_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn copy_limited_accepts_limit_and_rejects_larger_input() {
+        let mut exact = Cursor::new(vec![7u8; 1024]);
+        let mut exact_out = Vec::new();
+        assert_eq!(copy_limited(&mut exact, &mut exact_out, 1024).unwrap(), 1024);
+        assert_eq!(exact_out.len(), 1024);
+
+        let mut oversized = Cursor::new(vec![9u8; 1025]);
+        let mut oversized_out = Vec::new();
+        let error = copy_limited(&mut oversized, &mut oversized_out, 1024).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "unpack_too_large");
+    }
+
+    #[tokio::test]
+    async fn rollback_rename_restores_previous_binary() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("audit-test-rollback");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("mihomo");
+        let rollback = root.join("mihomo.zkeen-rollback");
+        std::fs::write(&target, b"new-binary").unwrap();
+        std::fs::write(&rollback, b"old-binary").unwrap();
+
+        restore_core_rollback(
+            rollback.to_str().unwrap(),
+            target.to_str().unwrap(),
+            "mihomo",
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"old-binary");
+        assert!(!rollback.exists());
+        assert!(!root.join("mihomo.zkeen-bad").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

@@ -325,7 +325,8 @@ export function GroupsPoliciesPage({
     const policy: UserPolicy = { kind, value, target: target.trim() };
     const id = userPolicyId(policy);
     setError("");
-    setPolicyDrafts((prev) => [...prev.filter((p) => p.id !== id), { ...policy, id }]);
+    // Same domain/IP with a new target replaces the old row (ZK-42).
+    setPolicyDrafts((prev) => [...prev.filter((p) => userPolicyId(p) !== id), { ...policy, id }]);
     setPoliciesDirty(true);
   };
 

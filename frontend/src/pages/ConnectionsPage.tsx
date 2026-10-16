@@ -4,7 +4,7 @@ import { Button, Card, CardHeader, Select, StatTile } from "../components/ui";
 import { useApp } from "../lib/store";
 import { useT } from "../lib/i18n";
 import { useSession } from "../lib/session";
-import { clashJson, clashWsUrl } from "../lib/api";
+import { clashJson, clashWsUrl, type ClashConnection } from "../lib/api";
 import { useApiError } from "../lib/errors";
 import {
   commitMihomoConfig,
@@ -19,6 +19,14 @@ import {
   type ClashConnectionItem,
   type ClashConnectionsResponse,
 } from "../lib/clash";
+import {
+  ensurePolicyGroups,
+  normalizePolicyDomain,
+  parseUserPolicies,
+  replaceUserPolicies,
+  userPolicyId,
+  type UserPolicy,
+} from "../lib/mihomoYaml";
 
 type PageTab = "connections" | "logs";
 type ConnTab = "active" | "closed";
@@ -89,6 +97,142 @@ function formatClosedAgo(ts: number): string {
   if (sec < 60) return `${sec}s`;
   if (sec < 3600) return `${Math.floor(sec / 60)}m`;
   return `${Math.floor(sec / 3600)}h`;
+}
+
+/** Destination host suitable for DOMAIN-SUFFIX policy */
+function domainFromConnectionHost(raw: string): string | null {
+  let h = raw.trim();
+  if (!h || h === "—") return null;
+  if (/^\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?$/.test(h)) return null;
+  if (h.startsWith("[") && h.includes("]")) return null;
+  // hostname:port (not IPv6)
+  if (/^[A-Za-z0-9.-]+:\d+$/.test(h)) h = h.replace(/:\d+$/, "");
+  const domain = normalizePolicyDomain(h);
+  if (!domain || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(domain)) return null;
+  return domain;
+}
+
+function HostPolicyModal({
+  host,
+  onClose,
+  onAdded,
+}: {
+  host: string;
+  onClose: () => void;
+  onAdded: (clash: ClashConnection) => void;
+}) {
+  const t = useT();
+  const apiErr = useApiError();
+  const { clash } = useSession();
+  const domain = domainFromConnectionHost(host);
+  const [busy, setBusy] = useState<"PROXY" | "STRAIGHT" | "copy" | null>(null);
+  const [error, setError] = useState("");
+  const [copied, setCopied] = useState(false);
+
+  const copyHost = async () => {
+    setError("");
+    try {
+      await navigator.clipboard.writeText(host);
+      setCopied(true);
+      setBusy("copy");
+      window.setTimeout(() => {
+        setCopied(false);
+        setBusy(null);
+      }, 1200);
+    } catch {
+      setError(t("conn.hostCopyError"));
+    }
+  };
+
+  const addToGroup = async (target: "PROXY" | "STRAIGHT") => {
+    if (!domain) return;
+    setBusy(target);
+    setError("");
+    try {
+      const loaded = await fetchMihomoConfig();
+      if (!loaded) throw new Error(t("config.notFound"));
+      const policy: UserPolicy = { kind: "domain", value: domain, target };
+      const existing = parseUserPolicies(loaded.content);
+      const id = userPolicyId(policy);
+      // Replace any prior target for the same domain (ZK-42: PROXY→STRAIGHT must not stack).
+      const nextPolicies = [...existing.filter((p) => userPolicyId(p) !== id), { ...policy, id }];
+      const nextYaml = replaceUserPolicies(
+        ensurePolicyGroups(loaded.content),
+        nextPolicies.map(({ kind, value, target: tg }) => ({ kind, value, target: tg })),
+      );
+      const res = await commitMihomoConfig(clash, {
+        path: loaded.path,
+        content: nextYaml,
+        previous: loaded.content,
+        validate: true,
+      });
+      onAdded(res.clash);
+      onClose();
+    } catch (err) {
+      setError(apiErr(err, "conn.hostPolicyError"));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[250] flex items-end justify-center bg-black/50 p-0 sm:items-center sm:p-4"
+      onClick={onClose}
+      role="presentation"
+    >
+      <div
+        className="flex w-full max-w-md flex-col overflow-hidden rounded-t-2xl border border-zk-border-soft bg-zk-surface shadow-2xl sm:rounded-2xl"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+      >
+        <CardHeader title={t("conn.hostPolicyTitle")} subtitle={t("conn.hostPolicySub")} />
+        <div className="space-y-3 p-4 sm:p-5">
+          <div className="break-all rounded-xl border border-zk-border-soft bg-zk-bg-elevated px-3 py-2 font-mono text-xs text-zk-text">
+            {host}
+          </div>
+          {domain ? (
+            <p className="text-[11px] text-zk-muted">
+              {t("conn.hostPolicyRule", { domain })}
+            </p>
+          ) : (
+            <p className="text-[11px] text-zk-amber">{t("conn.hostPolicyIpOnly")}</p>
+          )}
+          {error && (
+            <div className="rounded-lg border border-zk-coral/25 bg-zk-coral/10 px-2.5 py-1.5 text-xs text-zk-coral">
+              {error}
+            </div>
+          )}
+          <div className="flex flex-wrap gap-2">
+            <Button size="sm" variant="secondary" disabled={busy !== null} onClick={() => void copyHost()}>
+              {copied ? t("conn.hostCopied") : t("conn.hostCopy")}
+            </Button>
+            <Button
+              size="sm"
+              variant="primary"
+              disabled={!domain || busy !== null}
+              onClick={() => void addToGroup("PROXY")}
+            >
+              {busy === "PROXY" ? t("app.loading") : t("conn.hostAddProxy")}
+            </Button>
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={!domain || busy !== null}
+              onClick={() => void addToGroup("STRAIGHT")}
+            >
+              {busy === "STRAIGHT" ? t("app.loading") : t("conn.hostAddStraight")}
+            </Button>
+          </div>
+          <Button size="sm" variant="ghost" className="w-full" disabled={busy !== null} onClick={onClose}>
+            {t("groups.cancel")}
+          </Button>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
 }
 
 function IpDropdown({
@@ -242,6 +386,7 @@ export function ConnectionsPage() {
   const [busy, setBusy] = useState(false);
   const [ipFilter, setIpFilter] = useState("");
   const [hostFilter, setHostFilter] = useState("");
+  const [hostModal, setHostModal] = useState<string | null>(null);
 
   const [logLevel, setLogLevel] = useState("silent");
   const [logLines, setLogLines] = useState<LogLine[]>([]);
@@ -663,8 +808,21 @@ export function ConnectionsPage() {
                             {c.sourceIp}
                           </button>
                         </td>
-                        <td className="max-w-[120px] truncate px-3 py-2 font-mono text-xs text-zk-muted sm:max-w-[160px] sm:px-5" title={c.host}>
-                          {c.host}
+                        <td className="max-w-[120px] truncate px-3 py-2 font-mono text-xs sm:max-w-[160px] sm:px-5">
+                          {mode === "expert" && c.host !== "—" ? (
+                            <button
+                              type="button"
+                              title={t("conn.hostClickHint")}
+                              onClick={() => setHostModal(c.host)}
+                              className="max-w-full truncate text-left text-zk-text underline-offset-2 hover:text-zk-accent hover:underline"
+                            >
+                              {c.host}
+                            </button>
+                          ) : (
+                            <span className="text-zk-muted" title={c.host}>
+                              {c.host}
+                            </span>
+                          )}
                         </td>
                         <td className="hidden px-3 py-2 text-xs md:table-cell md:px-5">{c.rule}</td>
                         <td className="px-3 py-2 text-xs leading-snug text-zk-text sm:px-5">
@@ -684,6 +842,14 @@ export function ConnectionsPage() {
             </div>
           </Card>
         </>
+      )}
+
+      {hostModal && (
+        <HostPolicyModal
+          host={hostModal}
+          onClose={() => setHostModal(null)}
+          onAdded={(next) => setClash(next)}
+        />
       )}
     </div>
   );

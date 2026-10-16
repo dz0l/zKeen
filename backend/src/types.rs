@@ -153,7 +153,8 @@ impl Default for UpdaterSettings {
     fn default() -> Self {
         Self {
             github_proxy: vec!["https://gh-proxy.com".into(), "https://ghfast.top".into()],
-            backup_core: true,
+            // Permanent core backups are not kept (REC-01); field retained for settings JSON compat.
+            backup_core: false,
             auto_check_ui: true,
             auto_check_core: true,
         }
@@ -288,6 +289,8 @@ pub struct ApiResponse<T> {
 pub struct UpdateReq {
     pub core: String,
     pub version: String,
+    /// Ignored: permanent core-backup is never created; only transactional `.zkeen-rollback`.
+    #[serde(default)]
     pub backup_core: bool,
     #[serde(default)]
     pub assets: Vec<String>,

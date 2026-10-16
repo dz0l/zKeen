@@ -499,7 +499,11 @@ async fn main() {
             }
         }));
 
+    // Finish core updates interrupted by power loss / crash before accepting traffic.
+    updater::recover_interrupted_core_updates().await;
+
     let unsecure_api = Router::new()
+        .route("/api/health", get(panel::get_health))
         .route("/api/auth/setup", post(auth::post_setup))
         .route("/api/auth/login", get(auth::get_login_info).post(auth::post_login));
 
