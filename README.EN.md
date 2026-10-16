@@ -51,6 +51,8 @@ Beta builds are published as Pre-releases on the [Releases](https://github.com/d
 
 The channel is switched in the panel: **Settings → Updates → zkeen-ui beta versions** (visible in Expert mode).
 
+To move from a beta build to a regular release, turn this switch off and check for updates again.
+
 ## If the panel does not open
 
 ```sh
