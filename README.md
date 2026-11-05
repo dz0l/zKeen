@@ -4,7 +4,7 @@
 
 Веб-панель для **XKeen** и **Mihomo** на роутерах Keenetic с Entware. Подписка, выбор серверов, правила и обновления настраиваются в браузере, без правки файлов по SSH.
 
-![Меню zKeen UI](screenshots/zkeenmenu.gif)
+![Меню zKeen UI](screenshots/UI.png)
 
 ## Возможности
 
