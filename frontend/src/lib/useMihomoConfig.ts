@@ -22,6 +22,8 @@ export function useMihomoConfig() {
   const [dirty, setDirty] = useState(false);
   /** Content known to be on disk (last load or successful save). */
   const [savedYaml, setSavedYaml] = useState("");
+  /** Revision of `savedYaml` as reported by the server (ZK-16). */
+  const [savedRevision, setSavedRevision] = useState("");
   const yamlRef = useRef(yaml);
   yamlRef.current = yaml;
 
@@ -34,10 +36,12 @@ export function useMihomoConfig() {
         setError(t("config.notFound"));
         setConfigPath("");
         setYaml("");
+        setSavedRevision("");
       } else {
         setConfigPath(data.path);
         setYaml(data.content);
         setSavedYaml(data.content);
+        setSavedRevision(data.revision);
         setDirty(false);
       }
     } catch (err) {
@@ -63,8 +67,9 @@ export function useMihomoConfig() {
   const commit = useCallback(
     async (clash: ClashConnection, content: string, validate: boolean) => {
       if (!configPath) throw new Error("config not found");
-      const markSaved = (text: string) => {
+      const markSaved = (text: string, revision?: string) => {
         setSavedYaml(text);
+        if (revision !== undefined) setSavedRevision(revision);
         setDirty(yamlRef.current !== text);
       };
       try {
@@ -72,16 +77,17 @@ export function useMihomoConfig() {
           path: configPath,
           content,
           previous: savedYaml,
+          previousRevision: savedRevision,
           validate,
         });
-        markSaved(content);
+        markSaved(content, res.revision);
         return res;
       } catch (err) {
-        if (err instanceof ConfigApplyError && !err.rolledBack) markSaved(content);
+        if (err instanceof ConfigApplyError && !err.rolledBack) markSaved(content, err.savedRevision);
         throw err;
       }
     },
-    [configPath, savedYaml],
+    [configPath, savedYaml, savedRevision],
   );
 
   const subscriptionUrl = getSubscriptionUrl(yaml);

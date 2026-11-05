@@ -70,6 +70,57 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
       });
   }, []);
 
+  // Resume watching an update that outlived a page reload or a panel restart (ZK-34):
+  // the backend persists the operation outcome, so the phone sees the same verdict
+  // instead of silently losing it.
+  useEffect(() => {
+    let cancelled = false;
+    void apiJson<{ core?: string; stage?: string; running?: boolean }>("/api/update/status")
+      .then(async (st) => {
+        if (cancelled || !st.running || !st.core) return;
+        const core = st.core;
+        setUpdating(core);
+        setUpdateStage(st.stage || "starting");
+        try {
+          for (;;) {
+            await new Promise((r) => setTimeout(r, 1500));
+            const cur = await apiJson<{
+              stage?: string;
+              error?: string | null;
+              running?: boolean;
+            }>("/api/update/status").catch(() => null);
+            if (cancelled || !cur) continue;
+            if (cur.stage) setUpdateStage(cur.stage);
+            if (cur.running === false) {
+              if (cur.error) {
+                setCheckError(displayApiError(cur.error, t, "settings.updateError", locale));
+              } else {
+                if (core === "mihomo") {
+                  setUpdateStage("restarting");
+                  await waitForClashApi(clash, 40, 500).catch(() => {});
+                }
+                await checkUpdates({ soft: true });
+              }
+              break;
+            }
+          }
+        } finally {
+          if (!cancelled) {
+            setUpdating("");
+            setUpdateStage("");
+          }
+        }
+      })
+      .catch(() => {
+        /* status is best-effort */
+      });
+    return () => {
+      cancelled = true;
+    };
+    // Mount-only resume; checkUpdates/clash are stable enough for this one-shot effect.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   async function checkUpdates(opts?: { soft?: boolean }) {
     setChecking(true);
     if (!opts?.soft) setCheckError("");
@@ -108,7 +159,7 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
     }
   }
 
-  async function runUpdate(core: string, version: string) {
+  async function runUpdate(core: string, version: string, asset?: string) {
     if (!version || version === "—") return;
     setUpdating(core);
     setUpdateStage("starting");
@@ -135,7 +186,8 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
           version,
           // No permanent core-backup: only in-flight .zkeen-rollback on the router (REC-01).
           backup_core: false,
-          assets: [],
+          // Asset name verified against the release by the backend checker (ZK-28).
+          assets: asset ? [asset] : [],
         }),
       });
       if (core === "self") {
@@ -461,14 +513,11 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
               name="mihomo"
               version={stripV(mihomo?.version)}
               latest={displayLatest(mihomo)}
-              outdated={
-                !!mihomo?.outdated ||
-                (stripV(mihomo?.version) !== displayLatest(mihomo) && displayLatest(mihomo) !== "—")
-              }
+              outdated={!!mihomo?.outdated}
               updating={updating === "mihomo"}
               updateStage={updating === "mihomo" ? updateStage : ""}
               restarting={restarting === "mihomo"}
-              onUpdate={() => void runUpdate("mihomo", displayLatest(mihomo))}
+              onUpdate={() => void runUpdate("mihomo", displayLatest(mihomo), mihomo?.asset)}
               onRestart={() => void runRestart("hardRestart", "mihomo")}
             />
             <UpdateRow
@@ -485,13 +534,10 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean }) {
                 name="xray"
                 version={stripV(xray?.version)}
                 latest={displayLatest(xray)}
-                outdated={
-                  !!xray?.outdated ||
-                  (stripV(xray?.version) !== displayLatest(xray) && displayLatest(xray) !== "—")
-                }
+                outdated={!!xray?.outdated}
                 updating={updating === "xray"}
                 updateStage={updating === "xray" ? updateStage : ""}
-                onUpdate={() => void runUpdate("xray", displayLatest(xray))}
+                onUpdate={() => void runUpdate("xray", displayLatest(xray), xray?.asset)}
               />
             )}
           </div>

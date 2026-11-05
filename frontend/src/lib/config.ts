@@ -14,6 +14,8 @@ export interface ControlInfo {
 export interface ConfigItem {
   file: string;
   content: string;
+  /** Server-side content revision for optimistic concurrency (ZK-16). */
+  revision?: string;
 }
 
 /** @deprecated Was browser-local; onboarding is gated by empty subscription URL in YAML. */
@@ -92,28 +94,34 @@ export function setTopLevelScalar(yaml: string, key: string, value: string): str
   return `${line}\n${yaml}`;
 }
 
-export async function fetchMihomoConfig(): Promise<{ path: string; content: string } | null> {
+export async function fetchMihomoConfig(): Promise<{ path: string; content: string; revision: string } | null> {
   const res = await apiJson<{ configs: ConfigItem[] }>("/api/configs?core=mihomo");
   const item = pickMainConfig(res.configs ?? []);
   if (!item) return null;
-  return { path: item.file, content: item.content };
+  return { path: item.file, content: item.content, revision: item.revision ?? "" };
 }
 
 /**
  * Atomic save of exactly `path` as returned by the server (server keeps one `<file>.zkeen.bak`);
  * `validate` runs `mihomo -t` on this exact content first.
+ * `baseRevision` is the revision this edit is based on; a stale snapshot gets HTTP 409 (ZK-16).
  */
 export async function saveMihomoConfig(
   path: string,
   content: string,
   validate = false,
-): Promise<{ backup?: string }> {
+  baseRevision?: string,
+): Promise<{ backup?: string; revision?: string }> {
   const query = validate ? "?validate=mihomo" : "";
-  const res = await apiJson<{ backup?: string }>(`/api/configs${query}`, {
+  const res = await apiJson<{ backup?: string; revision?: string }>(`/api/configs${query}`, {
     method: "PUT",
-    body: JSON.stringify({ file: path, content }),
+    body: JSON.stringify({
+      file: path,
+      content,
+      ...(baseRevision !== undefined ? { base_revision: baseRevision } : {}),
+    }),
   });
-  return { backup: res.backup };
+  return { backup: res.backup, revision: res.revision };
 }
 
 /** Read-only check with the core: the working file is not touched. */
@@ -129,6 +137,8 @@ export class ConfigApplyError extends Error {
   readonly applyError: unknown;
   readonly rolledBack: boolean;
   readonly rollbackError?: unknown;
+  /** Revision of the file the failed apply left on disk (ZK-16). */
+  savedRevision?: string;
 
   constructor(applyError: unknown, rolledBack: boolean, rollbackError?: unknown) {
     super(applyError instanceof Error ? applyError.message : String(applyError));
@@ -139,9 +149,19 @@ export class ConfigApplyError extends Error {
   }
 }
 
+interface ApplyResponse {
+  success?: boolean;
+  error?: string;
+  backup?: string;
+  revision?: string;
+  rolled_back?: boolean;
+  rollback_error?: string;
+}
+
 /**
- * Save `content`, apply it, and when apply fails write `previous` back and apply it again,
- * so a config the core rejected does not stay as the working file.
+ * Server-side save → apply → rollback transaction (ZK-08): the router restores the
+ * previous file even when the browser tab dies between the write and the apply.
+ * A stale base_revision is rejected with HTTP 409 (ZK-16).
  */
 export async function commitMihomoConfig(
   clash: ClashConnection,
@@ -149,23 +169,63 @@ export async function commitMihomoConfig(
     path: string;
     content: string;
     previous: string;
+    /** Revision of `previous` as read from the server; stale snapshots get HTTP 409 (ZK-16). */
+    previousRevision?: string;
     validate: boolean;
     hardRestart?: boolean;
   },
-): Promise<{ clash: ClashConnection; backup?: string }> {
-  const { backup } = await saveMihomoConfig(opts.path, opts.content, opts.validate);
-  try {
-    return { clash: await applyMihomoConfigChanges(clash, { hardRestart: opts.hardRestart }), backup };
-  } catch (applyErr) {
-    if (opts.previous === opts.content) throw new ConfigApplyError(applyErr, false);
+): Promise<{ clash: ClashConnection; backup?: string; revision?: string }> {
+  let applied: ApplyResponse | undefined;
+  const doApply = async (): Promise<ClashConnection> => {
+    const res = await fetch("/api/configs/apply", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        file: opts.path,
+        content: opts.content,
+        ...(opts.previousRevision !== undefined ? { base_revision: opts.previousRevision } : {}),
+        validate: opts.validate,
+        hard_restart: opts.hardRestart ?? false,
+      }),
+    });
+    let data: ApplyResponse;
     try {
-      await saveMihomoConfig(opts.path, opts.previous, false);
-      await applyMihomoConfigChanges(clash, { hardRestart: opts.hardRestart });
-    } catch (rollbackErr) {
-      throw new ConfigApplyError(applyErr, false, rollbackErr);
+      data = await res.json();
+    } catch {
+      throw new ApiError(res.status, res.statusText || "Invalid JSON response");
     }
-    throw new ConfigApplyError(applyErr, true);
-  }
+    if (!res.ok || data.success === false) {
+      const applyErr = new ApiError(res.status, data.error || res.statusText || "apply_failed");
+      // Stale-snapshot conflict and validation failures are not apply failures.
+      if (res.status === 409 || data.rolled_back === undefined) throw applyErr;
+      if (data.rolled_back) {
+        const err = new ConfigApplyError(applyErr, true);
+        err.savedRevision = data.revision;
+        throw err;
+      }
+      const err = new ConfigApplyError(
+        applyErr,
+        false,
+        data.rollback_error ? new ApiError(res.status, data.rollback_error) : undefined,
+      );
+      err.savedRevision = data.revision;
+      throw err;
+    }
+    applied = data;
+    const conn = await resolveClashConnection(clash);
+    await refreshProxyProvider(DEFAULT_PROVIDER, conn).catch(() => {
+      /* empty subscription URL or provider not ready — core may still be fine */
+    });
+    return conn;
+  };
+  const conn = await withSelectionSnapshots(
+    opts.hardRestart ? "apply-config-restart" : "apply-config",
+    clash,
+    doApply,
+    (c) => c,
+  );
+  return { clash: conn, backup: applied?.backup, revision: applied?.revision };
 }
 
 async function resolveClashConnection(clash: ClashConnection): Promise<ClashConnection> {
@@ -242,14 +302,12 @@ export function isClashConnectionError(err: unknown): boolean {
 }
 
 async function reloadMihomoCore(): Promise<void> {
-  try {
-    await apiJson("/api/control", {
-      method: "POST",
-      body: JSON.stringify({ action: "softRestart", core: "mihomo" }),
-    });
-  } catch {
-    /* core may be stopped */
-  }
+  // Do not swallow restart errors (ZK-08): a still-running old process must not
+  // silently confirm an apply it never performed.
+  await apiJson("/api/control", {
+    method: "POST",
+    body: JSON.stringify({ action: "softRestart", core: "mihomo" }),
+  });
 }
 
 export async function reloadClashConfig(clash: ClashConnection): Promise<void> {
@@ -484,6 +542,7 @@ export async function applySubscriptionUrl(
     path: loaded.path,
     content: updated,
     previous: loaded.content,
+    previousRevision: loaded.revision,
     validate: true,
     hardRestart: bootstrapped,
   });

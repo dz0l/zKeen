@@ -102,6 +102,10 @@ async fn build_version_payload(state: &AppState) -> serde_json::Value {
         if let Some(link) = make_link(repo, tag) {
             obj["link"] = json!(link);
         }
+        // Verified asset name for this architecture; the update request sends it back (ZK-28).
+        if let Some(asset) = state.update_checker.core_latest_asset.read().unwrap().as_deref() {
+            obj["asset"] = json!(asset);
+        }
         obj
     };
 
@@ -155,15 +159,25 @@ pub fn start_update_checker(state: AppState) {
                 let core = state.core.read().unwrap().name.clone();
                 let cur_opt = get_local_core_version(&core).await;
                 let cur_str = cur_opt.as_deref().map(|v| v.trim_start_matches('v'));
-                if let Ok((latest, tag)) = updater::fetch_latest_version(&state.http_client, &core, &proxies, cur_str).await
-                {
-                    if let Some(cur) = cur_str {
-                        if !cur.is_empty() {
-                            *state.update_checker.core_outdated.write().unwrap() = compare_versions(&latest, cur);
+                match updater::fetch_latest_version(&state.http_client, &core, &proxies, cur_str).await {
+                    Ok((latest, tag, asset)) => {
+                        if let Some(cur) = cur_str {
+                            if !cur.is_empty() {
+                                *state.update_checker.core_outdated.write().unwrap() = compare_versions(&latest, cur);
+                            }
                         }
+                        *state.update_checker.core_latest_tag.write().unwrap() = Some(tag);
+                        *state.update_checker.core_latest_asset.write().unwrap() = asset;
+                        *state.update_checker.last_core_check.write().unwrap() = Some(Instant::now());
                     }
-                    *state.update_checker.core_latest_tag.write().unwrap() = Some(tag);
-                    *state.update_checker.last_core_check.write().unwrap() = Some(Instant::now());
+                    // A release without a binary for this architecture is not an offer (ZK-28).
+                    Err("no_suitable_asset") => {
+                        *state.update_checker.core_outdated.write().unwrap() = false;
+                        *state.update_checker.core_latest_tag.write().unwrap() = None;
+                        *state.update_checker.core_latest_asset.write().unwrap() = None;
+                        *state.update_checker.last_core_check.write().unwrap() = Some(Instant::now());
+                    }
+                    Err(_) => {}
                 }
             }
         }
@@ -176,14 +190,14 @@ async fn refresh_ui_latest(state: &AppState, proxies: &[String]) -> Result<(), &
     let res = updater::fetch_latest_version(&state.http_client, "self", proxies, Some(cur)).await;
     let checker = &state.update_checker;
     match res {
-        Ok((latest, tag)) => {
+        Ok((latest, tag, _asset)) => {
             *checker.ui_outdated.write().unwrap() = compare_versions(&latest, cur);
             *checker.ui_latest_tag.write().unwrap() = Some(tag);
             *checker.last_ui_check.write().unwrap() = Some(Instant::now());
             Ok(())
         }
         Err(code) => {
-            if code == "no_beta_release" {
+            if code == "no_beta_release" || code == "no_suitable_asset" {
                 *checker.ui_outdated.write().unwrap() = false;
                 *checker.ui_latest_tag.write().unwrap() = None;
                 *checker.last_ui_check.write().unwrap() = Some(Instant::now());
@@ -282,17 +296,26 @@ pub async fn check_updates_handler(State(state): State<AppState>) -> impl IntoRe
         let core = state.core.read().unwrap().name.clone();
         let cur_opt = get_local_core_version(&core).await;
         let cur_str = cur_opt.as_deref().map(|v| v.trim_start_matches('v'));
-        if let Ok((latest, tag)) =
-            updater::fetch_latest_version(&state.http_client, &core, &proxies, cur_str).await
-        {
-            if let Some(cur) = cur_str {
-                if !cur.is_empty() {
-                    *state.update_checker.core_outdated.write().unwrap() = compare_versions(&latest, cur);
+        match updater::fetch_latest_version(&state.http_client, &core, &proxies, cur_str).await {
+            Ok((latest, tag, asset)) => {
+                if let Some(cur) = cur_str {
+                    if !cur.is_empty() {
+                        *state.update_checker.core_outdated.write().unwrap() = compare_versions(&latest, cur);
+                    }
                 }
+                *state.update_checker.core_latest_tag.write().unwrap() = Some(tag);
+                *state.update_checker.core_latest_asset.write().unwrap() = asset;
+                *state.update_checker.last_core_check.write().unwrap() = Some(Instant::now());
+                core_ok = true;
             }
-            *state.update_checker.core_latest_tag.write().unwrap() = Some(tag);
-            *state.update_checker.last_core_check.write().unwrap() = Some(Instant::now());
-            core_ok = true;
+            Err("no_suitable_asset") => {
+                *state.update_checker.core_outdated.write().unwrap() = false;
+                *state.update_checker.core_latest_tag.write().unwrap() = None;
+                *state.update_checker.core_latest_asset.write().unwrap() = None;
+                *state.update_checker.last_core_check.write().unwrap() = Some(Instant::now());
+                core_ok = true;
+            }
+            Err(_) => {}
         }
     }
 

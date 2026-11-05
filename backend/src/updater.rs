@@ -5,7 +5,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json};
 use futures_util::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, Write};
@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 const GITHUB_API: &str = "https://api.github.com/repos";
@@ -38,12 +38,16 @@ const MAX_RAM_DOWNLOAD: usize = 32 * 1024 * 1024;
 const MAX_DOWNLOAD_BYTES: u64 = 96 * 1024 * 1024;
 /// Hard cap for unpacked binary size.
 const MAX_UNPACKED_BYTES: u64 = 128 * 1024 * 1024;
-/// When Content-Length is unknown, assume a modest artifact (not the hard 96+128 caps).
-const UNKNOWN_DOWNLOAD_ASSUME: u64 = 32 * 1024 * 1024;
+/// Minimal working reserve; actual artifact sizes are enforced while streaming to staging.
+const UPDATE_WORK_RESERVE: u64 = 1024 * 1024;
 
 static UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
 
-#[derive(Clone, Default)]
+/// Durable copy of the last update operation; a panel restart must not lose the outcome (ZK-34).
+const UPDATE_STATUS_FILE: &str = "/opt/etc/xkeen/zkeen-ui-update-status.json";
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct OpStatus {
     id: String,
     core: String,
@@ -52,14 +56,46 @@ struct OpStatus {
     detail: String,
     error: Option<String>,
     running: bool,
+    updated_at: u64,
 }
 
 static OP_STATUS: LazyLock<Mutex<OpStatus>> = LazyLock::new(|| Mutex::new(OpStatus::default()));
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Atomic persist of the operation status (tmp + fsync + rename + dir fsync).
+/// Failures are logged but never fail the update itself.
+fn persist_status(s: &OpStatus) {
+    let Ok(body) = serde_json::to_string(s) else {
+        return;
+    };
+    let path = Path::new(UPDATE_STATUS_FILE);
+    let tmp = path.with_extension("json.tmp");
+    let result = (|| -> std::io::Result<()> {
+        std::fs::write(&tmp, &body)?;
+        std::fs::File::open(&tmp)?.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        if let Some(dir) = path.parent() {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        log("WARN", format!("Не удалось сохранить статус обновления: {e}"));
+    }
+}
 
 fn set_stage(stage: &str, detail: &str) {
     if let Ok(mut s) = OP_STATUS.lock() {
         s.stage = stage.to_string();
         s.detail = detail.to_string();
+        s.updated_at = unix_now();
+        persist_status(&s);
     }
 }
 
@@ -73,7 +109,9 @@ fn begin_op(id: String, core: &str, version: &str) {
             detail: String::new(),
             error: None,
             running: true,
+            updated_at: unix_now(),
         };
+        persist_status(&s);
     }
 }
 
@@ -86,6 +124,59 @@ fn finish_op(error: Option<String>) {
         } else {
             "done".into()
         };
+        s.updated_at = unix_now();
+        persist_status(&s);
+    }
+}
+
+/// Persist the final outcome of an in-flight self-update (ZK-34): the process that
+/// started the operation is usually dead by the time the result is known, so the
+/// watchdog / boot recovery write the verdict directly to the status file.
+fn record_self_update_outcome(error: Option<&str>) {
+    let Ok(raw) = std::fs::read_to_string(UPDATE_STATUS_FILE) else {
+        return;
+    };
+    let Ok(mut s) = serde_json::from_str::<OpStatus>(&raw) else {
+        return;
+    };
+    if !s.running || s.core != "self" {
+        return;
+    }
+    s.running = false;
+    s.error = error.map(str::to_string);
+    s.stage = if error.is_some() { "failed".into() } else { "done".into() };
+    s.updated_at = unix_now();
+    persist_status(&s);
+}
+
+/// Restore the persisted operation after a panel restart (ZK-34). A still-"running"
+/// entry means the panel died mid-operation; only a pending self-update marker may
+/// still be committed by recovery — everything else is reported as interrupted
+/// instead of silently disappearing.
+pub async fn load_persisted_status() {
+    let Ok(raw) = std::fs::read_to_string(UPDATE_STATUS_FILE) else {
+        return;
+    };
+    let mut s: OpStatus = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            log("WARN", format!("Статус обновления повреждён и сброшен: {e}"));
+            return;
+        }
+    };
+    if s.running {
+        let self_pending =
+            s.core == "self" && Path::new(&update_marker_path("zkeen-ui")).exists();
+        if !self_pending {
+            s.running = false;
+            s.stage = "failed".into();
+            s.error = Some("update_interrupted".into());
+            s.updated_at = unix_now();
+            persist_status(&s);
+        }
+    }
+    if let Ok(mut g) = OP_STATUS.lock() {
+        *g = s;
     }
 }
 
@@ -101,6 +192,7 @@ pub async fn get_update_status() -> Json<Value> {
         "detail": s.detail,
         "error": s.error,
         "running": s.running,
+        "updated_at": s.updated_at,
     }))
 }
 
@@ -194,11 +286,16 @@ fn github_http_clients<'a>(direct: &'a reqwest::Client) -> Vec<reqwest::Client> 
     out
 }
 
-/// Latest release of the requested channel: `(version, tag)`.
-/// Errors: `no_beta_release` (beta channel, GitHub reachable, no pre-release) or `github_unreachable`.
+/// Latest release of the requested channel: `(version, tag, asset)`.
+/// `asset` is the verified name for this architecture; `None` means the release was
+/// resolved through a path that cannot enumerate assets (redirect) and the updater
+/// falls back to the constructed name.
+/// Errors: `no_beta_release` (beta channel, GitHub reachable, no pre-release),
+/// `no_suitable_asset` (release found, but it has no binary for this architecture)
+/// or `github_unreachable`.
 pub async fn fetch_latest_version(
     client: &reqwest::Client, core: &str, proxies: &[String], current_ver: Option<&str>,
-) -> Result<(String, String), &'static str> {
+) -> Result<(String, String, Option<String>), &'static str> {
     let repo = get_repo(core).ok_or("unknown_core")?;
     let is_alpha = current_ver.map_or(false, |v| v.contains("alpha"));
     let mihomo_alpha = is_alpha && core == "mihomo";
@@ -217,7 +314,7 @@ pub async fn fetch_latest_version(
             vec![proxies]
         };
         for mirrors in mirror_pass {
-            match fetch_latest_from_api(&c, repo, mirrors, mihomo_alpha, prefer_prerelease).await {
+            match fetch_latest_from_api(&c, repo, core, mirrors, mihomo_alpha, prefer_prerelease).await {
                 Lookup::Found(v) => {
                     if via_mihomo {
                         log("INFO", "Версия получена через Mihomo mixed-port".into());
@@ -228,6 +325,13 @@ pub async fn fetch_latest_version(
                     log("INFO", "Beta-версий zKeen UI на GitHub нет".into());
                     return Err("no_beta_release");
                 }
+                Lookup::NoAsset => {
+                    log(
+                        "WARN",
+                        format!("Подходящий asset для {} отсутствует в найденных релизах", std::env::consts::ARCH),
+                    );
+                    return Err("no_suitable_asset");
+                }
                 Lookup::Failed => {}
             }
             if !prefer_prerelease {
@@ -235,7 +339,7 @@ pub async fn fetch_latest_version(
                     if via_mihomo {
                         log("INFO", "Версия получена через Mihomo mixed-port (redirect)".into());
                     }
-                    return Ok(v);
+                    return Ok((v.0, v.1, None));
                 }
             }
         }
@@ -263,10 +367,58 @@ pub fn set_ui_update_channel(channel: &str) -> std::io::Result<()> {
 }
 
 enum Lookup {
-    Found((String, String)),
+    /// `(version, tag, asset)`: asset is the verified name for this architecture when known.
+    Found((String, String, Option<String>)),
     /// The release list was read, but it has no pre-release.
     NoBeta,
+    /// Releases were read, but none has a usable asset for this architecture (ZK-28).
+    NoAsset,
     Failed,
+}
+
+/// Expected release asset name for this router's architecture (ZK-28); a release
+/// without it must not be offered as an update.
+fn expected_asset_name(core: &str, tag: &str) -> Option<String> {
+    let arch = std::env::consts::ARCH;
+    match core {
+        "self" => match arch {
+            "aarch64" => Some("zkeen-ui-arm64-v8a".into()),
+            "mips" if cfg!(target_endian = "little") => Some("zkeen-ui-mips32le".into()),
+            "mips" => Some("zkeen-ui-mips32".into()),
+            _ => None,
+        },
+        "xray" => match arch {
+            "aarch64" => Some("Xray-linux-arm64-v8a.zip".into()),
+            "mips" if cfg!(target_endian = "little") => Some("Xray-linux-mips32le.zip".into()),
+            "mips" => Some("Xray-linux-mips32.zip".into()),
+            _ => None,
+        },
+        "mihomo" => mihomo_arch_suffix().map(|m| format!("mihomo-linux-{m}-{tag}.gz")),
+        _ => None,
+    }
+}
+
+fn mihomo_arch_suffix() -> Option<&'static str> {
+    match std::env::consts::ARCH {
+        "aarch64" => Some("arm64"),
+        "mips" if cfg!(target_endian = "little") => Some("mipsle-softfloat"),
+        "mips" => Some("mips-softfloat"),
+        _ => None,
+    }
+}
+
+/// Exact asset match for the expected name, or the alpha variant for this architecture.
+fn find_matching_asset<'a>(core: &str, tag: &str, assets: &'a [GhAsset]) -> Option<&'a str> {
+    if core == "mihomo" && tag == "Prerelease-Alpha" {
+        let suffix = mihomo_arch_suffix()?;
+        let prefix = format!("mihomo-linux-{suffix}");
+        return assets
+            .iter()
+            .map(|a| a.name.as_str())
+            .find(|n| n.contains(&prefix) && n.contains("alpha-") && n.ends_with(".gz"));
+    }
+    let expected = expected_asset_name(core, tag)?;
+    assets.iter().find(|a| a.name == expected).map(|a| a.name.as_str())
 }
 
 fn github_url_candidates(url: &str, proxies: &[String]) -> Vec<String> {
@@ -284,6 +436,7 @@ fn github_url_candidates(url: &str, proxies: &[String]) -> Vec<String> {
 async fn fetch_latest_from_api(
     client: &reqwest::Client,
     repo: &str,
+    core: &str,
     proxies: &[String],
     mihomo_alpha: bool,
     prefer_prerelease: bool,
@@ -291,7 +444,7 @@ async fn fetch_latest_from_api(
     if !prefer_prerelease {
         let latest_url = format!("{}/{}/releases/latest", GITHUB_API, repo);
         for u in github_url_candidates(&latest_url, proxies) {
-            if let Some(v) = parse_single_release_json(client, &u).await {
+            if let Some(v) = parse_single_release_json(client, &u, core).await {
                 return Lookup::Found(v);
             }
         }
@@ -324,34 +477,52 @@ async fn fetch_latest_from_api(
 
         if mihomo_alpha {
             if let Some(r) = rels.iter().find(|r| r.tag_name == "Prerelease-Alpha") {
-                for asset in &r.assets {
-                    if let Some(idx) = asset.name.find("alpha-") {
-                        let hash = asset.name[idx..].trim_end_matches(".gz").trim_end_matches(".zip");
-                        return Lookup::Found((hash.to_string(), "Prerelease-Alpha".into()));
+                // Only assets matching THIS architecture are usable (ZK-28).
+                if let Some(asset) = find_matching_asset(core, &r.tag_name, &r.assets) {
+                    if let Some(idx) = asset.find("alpha-") {
+                        let hash = asset[idx..].trim_end_matches(".gz").trim_end_matches(".zip");
+                        return Lookup::Found((hash.to_string(), "Prerelease-Alpha".into(), Some(asset.to_string())));
                     }
                 }
             }
         }
 
         if prefer_prerelease {
-            return match rels.iter().find(|r| r.prerelease && !r.tag_name.is_empty()) {
+            // First pre-release that actually ships a binary for this architecture (ZK-28).
+            return match rels
+                .iter()
+                .find(|r| r.prerelease && !r.tag_name.is_empty() && find_matching_asset(core, &r.tag_name, &r.assets).is_some())
+            {
                 Some(r) => {
                     let tag = r.tag_name.clone();
-                    Lookup::Found((tag.trim_start_matches('v').to_string(), tag))
+                    let asset = find_matching_asset(core, &tag, &r.assets).map(str::to_string);
+                    Lookup::Found((tag.trim_start_matches('v').to_string(), tag, asset))
                 }
+                None if rels.iter().any(|r| r.prerelease) => Lookup::NoAsset,
                 None => Lookup::NoBeta,
             };
         }
 
-        if let Some(r) = rels.into_iter().find(|r| !r.prerelease && !r.tag_name.is_empty()) {
+        let stable: Vec<&GhRelease> = rels
+            .iter()
+            .filter(|r| !r.prerelease && !r.tag_name.is_empty())
+            .collect();
+        if let Some(r) = stable
+            .iter()
+            .find(|r| find_matching_asset(core, &r.tag_name, &r.assets).is_some())
+        {
             let tag = r.tag_name.clone();
-            return Lookup::Found((tag.trim_start_matches('v').to_string(), tag));
+            let asset = find_matching_asset(core, &tag, &r.assets).map(str::to_string);
+            return Lookup::Found((tag.trim_start_matches('v').to_string(), tag, asset));
+        }
+        if !stable.is_empty() {
+            return Lookup::NoAsset;
         }
     }
     Lookup::Failed
 }
 
-async fn parse_single_release_json(client: &reqwest::Client, url: &str) -> Option<(String, String)> {
+async fn parse_single_release_json(client: &reqwest::Client, url: &str, core: &str) -> Option<(String, String, Option<String>)> {
     let res = client
         .get(url)
         .header("Accept", "application/vnd.github+json")
@@ -374,8 +545,10 @@ async fn parse_single_release_json(client: &reqwest::Client, url: &str) -> Optio
     if r.prerelease || r.tag_name.is_empty() {
         return None;
     }
+    // Release without a binary for this architecture is not an update candidate (ZK-28).
+    let asset = find_matching_asset(core, &r.tag_name, &r.assets).map(str::to_string);
     let tag = r.tag_name;
-    Some((tag.trim_start_matches('v').to_string(), tag))
+    Some((tag.trim_start_matches('v').to_string(), tag, asset))
 }
 
 /// Follow `/releases/latest` redirect — works when API is blocked but github.com/proxy is reachable.
@@ -443,7 +616,6 @@ fn http_for_error(code: &str) -> StatusCode {
         | "download_timeout"
         | "download_network"
         | "download_empty"
-        | "download_write_failed"
         | "download_budget"
         | "download_too_large"
         | "update_failed"
@@ -460,6 +632,8 @@ fn http_for_error(code: &str) -> StatusCode {
         | "restart_failed"
         | "rollback_failed"
         | "rollback_missing" => StatusCode::INTERNAL_SERVER_ERROR,
+        // Local disk write failures are server-side faults, not upstream 502 (ZK-34).
+        e if e.starts_with("download_write_failed") => StatusCode::INTERNAL_SERVER_ERROR,
         e if e.starts_with("init_failed")
           || e.starts_with("restart_failed")
           || e.starts_with("rollback_")
@@ -506,18 +680,16 @@ fn download_fail_code(kind: &str, status: Option<u16>) -> String {
     }
 }
 
-fn current_core_bytes(core: &str) -> u64 {
-    std::fs::metadata(format!("{OPT_SBIN}/{core}"))
-        .map(|m| m.len())
-        .unwrap_or(0)
+fn is_no_space(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(nix::libc::ENOSPC)
 }
 
-/// Peak disk need: download + estimated unpack + rollback copy of the current core (ZK-23).
-fn peak_update_need(download_bytes: u64, core_bytes: u64) -> u64 {
-    let dl = download_bytes.min(MAX_DOWNLOAD_BYTES).max(1);
-    // gzip often expands; stay within the unpack hard cap.
-    let unpack_est = dl.saturating_mul(2).min(MAX_UNPACKED_BYTES).max(dl);
-    dl.saturating_add(unpack_est).saturating_add(core_bytes)
+fn write_error(error: std::io::Error, fallback: &str) -> String {
+    if is_no_space(&error) {
+        "no_space".into()
+    } else {
+        format!("{fallback}:{error}")
+    }
 }
 
 fn ensure_free_space(paths: &[&str], need: u64) -> Result<(), String> {
@@ -576,17 +748,14 @@ async fn download(
     url: &str,
     proxies: &[String],
     tmp_path: &Path,
-    core_bytes: u64,
 ) -> Result<DownloadResult, String> {
-    ensure_free_space(
-        &[OPT_TMP, OPT_SBIN],
-        peak_update_need(UNKNOWN_DOWNLOAD_ASSUME, core_bytes),
-    )?;
+    ensure_free_space(&[OPT_TMP], UPDATE_WORK_RESERVE)?;
 
     async fn load(
-        r: reqwest::Response, path: &Path, source: &str, core_bytes: u64,
+        r: reqwest::Response, path: &Path, source: &str,
     ) -> Result<DownloadResult, String> {
-        if let Some(cl) = r.content_length() {
+        let content_length = r.content_length();
+        if let Some(cl) = content_length {
             if cl > MAX_DOWNLOAD_BYTES {
                 log(
                     "WARN",
@@ -599,14 +768,19 @@ async fn download(
                 );
                 return Err("download_too_large".into());
             }
-            ensure_free_space(&[OPT_TMP, OPT_SBIN], peak_update_need(cl, core_bytes))?;
         }
 
-        let declared = r.content_length().unwrap_or(0) as usize;
+        let declared = content_length.unwrap_or(0) as usize;
         let mut use_disk = declared == 0 || declared > MAX_RAM_DOWNLOAD;
+        if use_disk {
+            ensure_free_space(
+                &[OPT_TMP],
+                content_length.unwrap_or(0).saturating_add(UPDATE_WORK_RESERVE),
+            )?;
+        }
         let mut stream = r.bytes_stream();
         let mut file = if use_disk {
-            Some(fs::File::create(path).await.map_err(|_| "download_write_failed".to_string())?)
+            Some(fs::File::create(path).await.map_err(|e| write_error(e, "download_write_failed"))?)
         } else {
             None
         };
@@ -632,7 +806,7 @@ async fn download(
                         if let Err(e) = f.write_all(&chunk).await {
                             log("WARN", format!("Ошибка записи на диск ({}): {}", source, e));
                             _ = fs::remove_file(path).await;
-                            return Err("download_write_failed".into());
+                            return Err(write_error(e, "download_write_failed"));
                         }
                     } else if buf.len().saturating_add(chunk.len()) > MAX_RAM_DOWNLOAD {
                         // Spill before growing past the RAM ceiling (ZK-23).
@@ -646,13 +820,15 @@ async fn download(
                         );
                         let mut f = fs::File::create(path)
                             .await
-                            .map_err(|_| "download_write_failed".to_string())?;
-                        f.write_all(&buf)
-                            .await
-                            .map_err(|_| "download_write_failed".to_string())?;
-                        f.write_all(&chunk)
-                            .await
-                            .map_err(|_| "download_write_failed".to_string())?;
+                            .map_err(|e| write_error(e, "download_write_failed"))?;
+                        if let Err(e) = f.write_all(&buf).await {
+                            _ = fs::remove_file(path).await;
+                            return Err(write_error(e, "download_write_failed"));
+                        }
+                        if let Err(e) = f.write_all(&chunk).await {
+                            _ = fs::remove_file(path).await;
+                            return Err(write_error(e, "download_write_failed"));
+                        }
                         buf.clear();
                         buf.shrink_to_fit();
                         file = Some(f);
@@ -717,7 +893,8 @@ async fn download(
         let via_mihomo = mihomo_first && ci == 0;
         let via_label = if via_mihomo { "mihomo" } else { "direct" };
         for (i, u) in urls.iter().enumerate() {
-            if budget.elapsed() > Duration::from_secs(DOWNLOAD_BUDGET_SECS) {
+            let elapsed = budget.elapsed();
+            if elapsed >= Duration::from_secs(DOWNLOAD_BUDGET_SECS) {
                 log(
                     "ERROR",
                     format!(
@@ -731,6 +908,10 @@ async fn download(
                     last_err
                 });
             }
+            // Hard deadline for the whole download (ZK-34): the final attempt is
+            // capped by the remaining budget too, not only the idle-per-chunk timeout.
+            let deadline = tokio::time::Instant::now()
+                + Duration::from_secs(DOWNLOAD_BUDGET_SECS).saturating_sub(elapsed);
 
             let (source, is_cdn) = if i == 0 {
                 (format!("напрямую/{via_label}"), false)
@@ -750,7 +931,18 @@ async fn download(
                 );
             }
 
-            match http.get(u).send().await {
+            let sent = match tokio::time::timeout_at(deadline, http.get(u).send()).await {
+                Ok(v) => v,
+                Err(_) => {
+                    log(
+                        "ERROR",
+                        format!("Жёсткий дедлайн загрузки {} с ({source})", DOWNLOAD_BUDGET_SECS),
+                    );
+                    let _ = fs::remove_file(tmp_path).await;
+                    return Err(download_fail_code("budget", None));
+                }
+            };
+            match sent {
                 Ok(r) if r.status().is_success() => {
                     if r.headers()
                         .get("content-type")
@@ -767,15 +959,26 @@ async fn download(
                         last_err = download_fail_code("html", None);
                         continue;
                     }
-                    match load(r, tmp_path, &source, core_bytes).await {
+                    let loaded = match tokio::time::timeout_at(deadline, load(r, tmp_path, &source)).await {
+                        Ok(v) => v,
+                        Err(_) => {
+                            log(
+                                "ERROR",
+                                format!("Жёсткий дедлайн загрузки {} с ({source})", DOWNLOAD_BUDGET_SECS),
+                            );
+                            let _ = fs::remove_file(tmp_path).await;
+                            return Err(download_fail_code("budget", None));
+                        }
+                    };
+                    match loaded {
                         Ok(res) => return Ok(res),
                         Err(e) => {
                             last_err = e.clone();
                             // Disk / size errors will not improve on the next mirror.
-                            if matches!(
-                                e.as_str(),
-                                "download_write_failed" | "download_too_large" | "no_space"
-                            ) {
+                            if e == "download_too_large"
+                                || e == "no_space"
+                                || e.starts_with("download_write_failed")
+                            {
                                 log("ERROR", format!("Загрузка остановлена ({source}): {e}"));
                                 return Err(e);
                             }
@@ -806,25 +1009,31 @@ async fn download(
     log("ERROR", format!("Не удалось выполнить обновление ({})", last_err));
     Err(last_err)
 }
-async fn save(dl: DownloadResult, out_path: PathBuf) -> std::io::Result<()> {
-    tokio::task::spawn_blocking(move || {
-        let mut out = File::create(&out_path)?;
+async fn save(dl: DownloadResult, out_path: PathBuf) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         match dl {
-            DownloadResult::RAM(d) => out.write_all(&d)?,
+            DownloadResult::RAM(d) => {
+                let mut out = File::create(&out_path)?;
+                out.write_all(&d)?;
+                out.sync_data()
+            }
             DownloadResult::Disk(p) => {
-                std::io::copy(&mut File::open(&p)?, &mut out)?;
-                _ = std::fs::remove_file(p);
+                if std::fs::rename(&p, &out_path).is_ok() {
+                    return Ok(());
+                }
+                std::io::copy(&mut File::open(&p)?, &mut File::create(&out_path)?)?;
+                std::fs::remove_file(p)
             }
         }
-        out.sync_data()
     })
     .await
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+    .map_err(|e| format!("save_failed:{e}"))?
+    .map_err(|e| write_error(e, "save_failed"))
 }
 
 /// Names this updater itself leaves behind: operation dirs and the fixed staging
 fn is_own_leftover(name: &str) -> bool {
-    if name.starts_with(OP_DIR_PREFIX) {
+    if name.starts_with(OP_DIR_PREFIX) || name.starts_with(SELF_WATCHDOG_PREFIX) {
         return true;
     }
     if matches!(name, "bin.tmp" | "download.tmp" | "yq.tmp" | "yq.bin" | "mihomo_Prerelease-Alpha") {
@@ -884,8 +1093,61 @@ fn update_marker_path(core: &str) -> String {
     format!("{OPT_SBIN}/{core}.zkeen-updating")
 }
 
-async fn clear_update_marker(core: &str) {
-    let _ = fs::remove_file(update_marker_path(core)).await;
+async fn sync_file(path: &Path, code: &str) -> Result<(), String> {
+    let path = path.to_path_buf();
+    let code = code.to_string();
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&path)?;
+        file.sync_all()
+    })
+    .await
+    .map_err(|e| format!("{code}:{e}"))?
+    .map_err(|e| format!("{code}:{e}"))
+}
+
+async fn sync_parent_dir(path: &Path, code: &str) -> Result<(), String> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("/")).to_path_buf();
+    let code = code.to_string();
+    tokio::task::spawn_blocking(move || {
+        let dir = std::fs::File::open(&dir)?;
+        dir.sync_all()
+    })
+    .await
+    .map_err(|e| format!("{code}:{e}"))?
+    .map_err(|e| format!("{code}:{e}"))
+}
+
+async fn write_update_marker(core: &str, state: &str) -> Result<(), String> {
+    // Atomic state change: a power loss must never leave a half-written marker (ZK-21).
+    let marker = PathBuf::from(update_marker_path(core));
+    let tmp = PathBuf::from(format!("{}.tmp", marker.display()));
+    fs::write(&tmp, format!("{state}\n"))
+        .await
+        .map_err(|e| format!("backup_failed:{e}"))?;
+    sync_file(&tmp, "backup_failed").await?;
+    fs::rename(&tmp, &marker)
+        .await
+        .map_err(|e| format!("backup_failed:{e}"))?;
+    sync_parent_dir(&marker, "backup_failed").await
+}
+
+async fn clear_update_marker(core: &str) -> Result<(), String> {
+    let marker = PathBuf::from(update_marker_path(core));
+    match fs::remove_file(&marker).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("backup_failed:{e}")),
+    }
+    sync_parent_dir(&marker, "backup_failed").await
+}
+
+async fn remove_file_durable(path: &Path, code: &str) -> Result<(), String> {
+    match fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{code}:{e}")),
+    }
+    sync_parent_dir(path, code).await
 }
 
 /// Remove leftover permanent copies from older panel versions (`core-backup/<core>-*`).
@@ -917,109 +1179,353 @@ async fn cleanup_legacy_core_backups(core: &str) {
     }
 }
 
-/// Publish rollback via temp + fsync + rename so a power loss mid-copy cannot leave a half file.
-async fn publish_rollback_copy(target: &str, rollback: &str) -> Result<(), String> {
-    let tmp = format!("{rollback}.tmp");
-    let _ = fs::remove_file(&tmp).await;
-    fs::copy(target, &tmp)
+/// Move the previous core aside atomically; this avoids a second 50+ MiB copy on small UBIFS.
+async fn publish_rollback(target: &Path, rollback: &Path) -> Result<(), String> {
+    if rollback.exists() {
+        remove_file_durable(rollback, "backup_failed").await?;
+    }
+    fs::rename(target, rollback)
         .await
         .map_err(|e| format!("backup_failed:{e}"))?;
-    let tmp_path = tmp.clone();
-    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        let f = std::fs::File::open(&tmp_path)?;
-        f.sync_all()?;
-        Ok(())
-    })
-    .await
-    .map_err(|e| format!("backup_failed:{e}"))?
-    .map_err(|e| format!("backup_failed:{e}"))?;
-    fs::rename(&tmp, rollback)
-        .await
-        .map_err(|e| format!("backup_failed:{e}"))?;
-    // Best-effort directory fsync so the rename itself survives power loss (ZK-21).
-    let _ = tokio::task::spawn_blocking(|| {
-        let dir = std::fs::File::open(OPT_SBIN)?;
-        dir.sync_all()
-    })
-    .await;
-    Ok(())
+    sync_parent_dir(rollback, "backup_failed").await?;
+    sync_parent_dir(target, "backup_failed").await
 }
 
-/// Restore `/opt/sbin/<core>` from the single rollback file and optionally restart.
-async fn restore_core_rollback(rollback: &str, target: &str, core: &str, was_running: bool) -> Result<(), String> {
-    match restore_core_rollback_inner(rollback, target, core, was_running).await {
-        Ok(()) => {
-            clear_update_marker(core).await;
-            Ok(())
+async fn copy_file_synced(from: &Path, to: &Path, code: &str) -> Result<(), String> {
+    let from = from.to_path_buf();
+    let to_tmp = to.with_extension("zkeen-restore-tmp");
+    let to_final = to.to_path_buf();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let _ = std::fs::remove_file(&to_tmp);
+        std::fs::copy(&from, &to_tmp)?;
+        let staged = std::fs::File::open(&to_tmp)?;
+        staged.sync_all()?;
+        std::fs::rename(&to_tmp, &to_final)
+    })
+    .await
+    .map_err(|e| format!("{code}:{e}"))?
+    .map_err(|e| format!("{code}:{e}"))?;
+    sync_parent_dir(to, code).await
+}
+
+/// Restore `to` from `from` as a hard link + atomic rename: no extra data blocks, so the
+/// restore works even when the filesystem cannot fit a second copy (ZK-21 ENOSPC).
+/// Returns Ok(false) when the filesystem does not support hard links.
+async fn link_file_synced(from: &Path, to: &Path, code: &str) -> Result<bool, String> {
+    let from = from.to_path_buf();
+    let to_tmp = to.with_extension("zkeen-restore-tmp");
+    let to_final = to.to_path_buf();
+    let linked = tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
+        let _ = std::fs::remove_file(&to_tmp);
+        match std::fs::hard_link(&from, &to_tmp) {
+            Ok(()) => {
+                let staged = std::fs::File::open(&to_tmp)?;
+                staged.sync_all()?;
+                std::fs::rename(&to_tmp, &to_final)?;
+                Ok(true)
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::CrossesDevices
+                    || matches!(e.raw_os_error(), Some(nix::libc::EPERM) | Some(nix::libc::ENOSYS) | Some(nix::libc::EOPNOTSUPP)) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(e),
         }
-        // Keep `.zkeen-updating` so the next boot can retry recovery (ZK-21).
-        Err(e) => Err(e),
+    })
+    .await
+    .map_err(|e| format!("{code}:{e}"))?
+    .map_err(|e| format!("{code}:{e}"))?;
+    if linked {
+        sync_parent_dir(to, code).await?;
     }
+    Ok(linked)
+}
+
+/// Restore `/opt/sbin/<core>` while keeping rollback reusable until chmod/restart succeeds.
+async fn restore_core_rollback(rollback: &str, target: &str, core: &str, was_running: bool) -> Result<(), String> {
+    restore_core_rollback_inner(rollback, target, core, was_running).await?;
+    if target.starts_with(OPT_SBIN) {
+        clear_update_marker(core).await?;
+    }
+    let rollback_path = Path::new(rollback);
+    if let Err(e) = remove_file_durable(rollback_path, "rollback_failed").await {
+        log("WARN", format!("Откат выполнен, но файл {} не удалён: {e}", rollback_path.display()));
+    }
+    Ok(())
 }
 
 async fn restore_core_rollback_inner(
     rollback: &str, target: &str, core: &str, was_running: bool,
 ) -> Result<(), String> {
-    if !Path::new(rollback).exists() {
+    let rollback_path = Path::new(rollback);
+    let target_path = Path::new(target);
+    if !rollback_path.exists() {
         return Err("rollback_missing".into());
     }
     log("WARN", format!("Откат {} из {}", target, rollback));
-    let broken = format!("{target}.zkeen-bad");
-    let _ = fs::rename(target, &broken).await;
-    let restored = if fs::rename(rollback, target).await.is_ok() {
-        true
-    } else {
-        match fs::copy(rollback, target).await {
-            Ok(_) => {
-                let _ = fs::remove_file(rollback).await;
-                true
+    let broken = PathBuf::from(format!("{target}.zkeen-bad"));
+    if target_path.exists() {
+        if broken.exists() {
+            remove_file_durable(&broken, "rollback_failed").await?;
+        }
+        fs::rename(target_path, &broken)
+            .await
+            .map_err(|e| format!("rollback_failed:{e}"))?;
+        sync_parent_dir(target_path, "rollback_failed").await?;
+    }
+
+    // Prefer a hard link: restoring then needs no extra data blocks, so recovery works
+    // even on an almost full filesystem (ZK-21). Falls back to a copy only when the
+    // filesystem cannot hard-link; the rejected binary is freed first in that case.
+    let linked = match link_file_synced(rollback_path, target_path, "rollback_failed").await {
+        Ok(linked) => linked,
+        Err(e) => {
+            log("ERROR", format!("Откат не удался: {e}"));
+            if broken.exists() {
+                let _ = fs::rename(&broken, target_path).await;
+                let _ = sync_parent_dir(target_path, "rollback_failed").await;
             }
-            Err(e) => {
-                log("ERROR", format!("Откат не удался: {e}"));
-                let _ = fs::rename(&broken, target).await;
-                return Err(format!("rollback_failed:{e}"));
-            }
+            return Err(e);
         }
     };
-    if restored {
-        // Keep .zkeen-bad until the restored binary is chmod'd / optionally restarted.
+    if !linked {
+        log("WARN", "Hard link не поддержан, откат копированием после освобождения отвергнутого файла".into());
+        if broken.exists() {
+            // Free the rejected binary so the last working version fits (ZK-21).
+            remove_file_durable(&broken, "rollback_failed").await?;
+        }
+        if let Err(e) = copy_file_synced(rollback_path, target_path, "rollback_failed").await {
+            log("ERROR", format!("Откат не удался: {e}"));
+            // The rejected file is already gone; the rollback itself is intact and the
+            // marker stays, so the next boot retries the restore instead of losing both.
+            return Err(e);
+        }
+    }
+
+    fs::set_permissions(target_path, std::fs::Permissions::from_mode(0o755))
+        .await
+        .map_err(|e| format!("chmod_failed:{e}"))?;
+    if was_running {
+        crate::controller::soft_restart(core)
+            .await
+            .map_err(|e| format!("rollback_restart_failed:{e}"))?;
+    }
+    if broken.exists() {
+        remove_file_durable(&broken, "rollback_failed").await?;
+    }
+    Ok(())
+}
+
+/// Temporary copy of the NEW panel binary running the self-update watchdog; init stops
+/// processes by name `zkeen-ui`, so the watchdog must run under a different name (ZK-21).
+const SELF_WATCHDOG_PREFIX: &str = "zkeen-self-watchdog-";
+
+/// Self-update recovery: if the panel is running at all, the installed binary is serving;
+/// complete the commit the watchdog could not finish (e.g. power loss after restart).
+pub async fn recover_interrupted_self_update() {
+    let marker = PathBuf::from(update_marker_path("zkeen-ui"));
+    if !marker.exists() {
+        return;
+    }
+    let rollback = PathBuf::from(format!("{OPT_SBIN}/zkeen-ui.zkeen-rollback"));
+    if rollback.exists() {
+        match remove_file_durable(&rollback, "rollback_failed").await {
+            Ok(()) => log("INFO", "Self-update подтверждён запущенной панелью, rollback удалён".into()),
+            Err(e) => log("WARN", format!("Не удалось удалить rollback self-update: {e}")),
+        }
+    }
+    match clear_update_marker("zkeen-ui").await {
+        Ok(()) => log("INFO", "Маркер self-update очищен".into()),
+        Err(e) => log("ERROR", format!("Не удалось очистить маркер self-update: {e}")),
+    }
+    record_self_update_outcome(None);
+}
+
+/// Health check that requires the expected version: the OLD still-running process must
+/// not confirm the update it never performed (ZK-21).
+async fn wait_self_health(client: &reqwest::Client, url: &str, expect_version: &str, attempts: u32) -> bool {
+    for _ in 0..attempts {
+        if let Ok(r) = client.get(url).send().await {
+            if r.status().is_success() {
+                if let Ok(body) = r.json::<Value>().await {
+                    let served = body.get("version").and_then(|v| v.as_str()).unwrap_or("");
+                    if expect_version.is_empty() || served == expect_version {
+                        return true;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    false
+}
+
+/// External finisher for self-update: after the restart, confirm the NEW binary serves
+/// the expected version and commit; otherwise atomically restore the previous binary,
+/// restart it, and only then clean up (ZK-21).
+pub async fn run_self_update_watchdog(
+    rollback: &Path,
+    target: &Path,
+    port: u16,
+    expect_version: &str,
+    marker: &Path,
+) -> Result<(), String> {
+    let own_exe = std::env::current_exe().unwrap_or_default();
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .map_err(|e| format!("watchdog_client:{e}"))?;
+    let url = format!("http://127.0.0.1:{port}/api/health");
+
+    if wait_self_health(&client, &url, expect_version, 15).await {
+        if let Err(e) = remove_file_durable(rollback, "rollback_failed").await {
+            log("WARN", format!("Commit self-update: rollback не удалён: {e}"));
+        }
+        if let Err(e) = remove_file_durable(marker, "backup_failed").await {
+            log("WARN", format!("Commit self-update: маркер не удалён: {e}"));
+        }
+        record_self_update_outcome(None);
+        let _ = fs::remove_file(&own_exe).await;
+        return Ok(());
+    }
+
+    log("WARN", "Новая панель не подтвердила версию — откат self-update".into());
+    if rollback.exists() {
+        fs::rename(rollback, target)
+            .await
+            .map_err(|e| format!("rollback_failed:{e}"))?;
+        sync_parent_dir(target, "rollback_failed").await?;
         fs::set_permissions(target, std::fs::Permissions::from_mode(0o755))
             .await
             .map_err(|e| format!("chmod_failed:{e}"))?;
-        if was_running {
-            crate::controller::soft_restart(core)
-                .await
-                .map_err(|e| format!("rollback_restart_failed:{e}"))?;
-        }
-        let _ = fs::remove_file(&broken).await;
+    } else {
+        return Err("rollback_missing".into());
     }
+    let restarted = Command::new(S99ZKEEN_UI)
+        .arg("restart")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !restarted {
+        // Keep the marker so the next boot reports the unfinished rollback.
+        return Err("self_update_rollback:restart".into());
+    }
+    if !wait_self_health(&client, &url, "", 15).await {
+        return Err("self_update_rollback:unhealthy".into());
+    }
+    if let Err(e) = remove_file_durable(marker, "backup_failed").await {
+        log("WARN", format!("Откат self-update: маркер не удалён: {e}"));
+    }
+    record_self_update_outcome(Some("self_update_rollback"));
+    let _ = fs::remove_file(&own_exe).await;
     Ok(())
+}
+
+/// Stage the watchdog from the verified NEW binary and spawn it before the running
+/// process is replaced; returns the child so the caller can kill it on abort.
+async fn spawn_self_update_watchdog(
+    source: &Path,
+    port: u16,
+    expect_version: &str,
+) -> Result<(tokio::process::Child, PathBuf), String> {
+    let staged_len = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
+    ensure_free_space(&[OPT_TMP], staged_len.saturating_add(UPDATE_WORK_RESERVE))?;
+    let copy = PathBuf::from(format!("{OPT_TMP}/{SELF_WATCHDOG_PREFIX}{}", std::process::id()));
+    let src = source.to_path_buf();
+    let dst = copy.clone();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        std::fs::copy(&src, &dst)?;
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::File::open(&dst)?.sync_all()
+    })
+    .await
+    .map_err(|e| format!("watchdog_spawn_failed:{e}"))?
+    .map_err(|e| write_error(e, "watchdog_spawn_failed"))?;
+
+    match Command::new(&copy)
+        .arg("self-update-watchdog")
+        .arg("--rollback")
+        .arg(format!("{OPT_SBIN}/zkeen-ui.zkeen-rollback"))
+        .arg("--target")
+        .arg(format!("{OPT_SBIN}/zkeen-ui"))
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--expect-version")
+        .arg(expect_version)
+        .arg("--marker")
+        .arg(update_marker_path("zkeen-ui"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => Ok((child, copy)),
+        Err(e) => {
+            let _ = std::fs::remove_file(&copy);
+            Err(format!("watchdog_spawn_failed:{e}"))
+        }
+    }
 }
 
 /// Finish incomplete core updates left after power loss / crash (marker + rollback).
 pub async fn recover_interrupted_core_updates() {
     for core in ["mihomo", "xray"] {
-        let marker = update_marker_path(core);
-        if !Path::new(&marker).exists() {
+        let marker = PathBuf::from(update_marker_path(core));
+        if !marker.exists() {
             continue;
         }
-        let rollback = format!("{OPT_SBIN}/{core}.zkeen-rollback");
-        let target = format!("{OPT_SBIN}/{core}");
+        let rollback = PathBuf::from(format!("{OPT_SBIN}/{core}.zkeen-rollback"));
+        let target = PathBuf::from(format!("{OPT_SBIN}/{core}"));
+        let state = std::fs::read_to_string(&marker).unwrap_or_default();
+        let state = state.trim();
+
+        if state == "commit" {
+            if let Err(e) = remove_file_durable(&rollback, "rollback_failed").await {
+                log("ERROR", format!("Cleanup rollback {core} после commit: {e}"));
+                continue;
+            }
+            match clear_update_marker(core).await {
+                Ok(()) => log("INFO", format!("Cleanup незавершённого обновления {core} выполнен")),
+                Err(e) => log("ERROR", format!("Cleanup маркера обновления {core}: {e}")),
+            }
+            continue;
+        }
+
         log(
             "WARN",
             format!("Обнаружено незавершённое обновление {core} — восстанавливаю предыдущую версию"),
         );
-        if Path::new(&rollback).exists() {
-            match restore_core_rollback(&rollback, &target, core, false).await {
+        if rollback.exists() {
+            let rollback_s = rollback.to_string_lossy().into_owned();
+            let target_s = target.to_string_lossy().into_owned();
+            match restore_core_rollback(&rollback_s, &target_s, core, false).await {
                 Ok(()) => log("INFO", format!("Откат {core} после сбоя обновления выполнен")),
                 Err(e) => log("ERROR", format!("Откат {core} после сбоя обновления: {e}")),
             }
+        } else if target.exists() {
+            // Marker without rollback: clear only after the installed binary proves it runs;
+            // a corrupted marker must not silently bless a broken core (ZK-21).
+            match verify_core_binary(core).await {
+                Ok(()) => match clear_update_marker(core).await {
+                    Ok(()) => log("WARN", format!("Маркер {core} относился к подготовке обновления и очищен")),
+                    Err(e) => log("ERROR", format!("Не удалось очистить маркер {core}: {e}")),
+                },
+                Err(e) => log(
+                    "ERROR",
+                    format!("Маркер {core} без rollback, бинарник не проходит проверку ({e}) — восстановление отложено"),
+                ),
+            }
         } else {
             log(
-                "WARN",
-                format!("Маркер обновления {core} без rollback — удаляю маркер"),
+                "ERROR",
+                format!("Маркер обновления {core} без rollback и рабочего бинарника — восстановление отложено"),
             );
-            clear_update_marker(core).await;
         }
     }
 }
@@ -1076,34 +1582,234 @@ async fn verify_core_config(core: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn read_mihomo_controller_port() -> Option<u16> {
-    let cfg = Path::new(crate::types::MIHOMO_CONF_DIR).join("config.yaml");
-    let content = std::fs::read_to_string(cfg).ok()?;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('#') {
-            continue;
-        }
-        let Some(rest) = trimmed.strip_prefix("external-controller:") else {
-            continue;
-        };
-        let addr = rest.trim().trim_matches('"').trim_matches('\'');
-        let port = addr.rsplit_once(':')?.1.trim().parse().ok()?;
-        return Some(port);
-    }
-    None
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MihomoController {
+    Tcp { port: u16, secret: String },
+    Unix { path: PathBuf, secret: String },
 }
 
-/// After restart, confirm Clash API answers on the configured external-controller port.
-async fn verify_mihomo_api(client: &reqwest::Client) -> Result<(), String> {
-    let Some(port) = read_mihomo_controller_port() else {
+fn parse_yaml_scalar(raw: &str) -> String {
+    let mut value = raw.trim();
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        let quote = bytes[0] as char;
+        if (quote == '\'' || quote == '"') && bytes[value.len() - 1] as char == quote {
+            value = &value[1..value.len() - 1];
+            return if quote == '\'' {
+                value.replace("''", "'")
+            } else {
+                value.replace("\\\"", "\"").replace("\\\\", "\\")
+            };
+        }
+    }
+    let mut out = String::new();
+    for (idx, ch) in value.char_indices() {
+        if ch == '#' && idx > 0 && value[..idx].ends_with(char::is_whitespace) {
+            break;
+        }
+        out.push(ch);
+    }
+    let out = out.trim();
+    if out == "null" || out == "~" { String::new() } else { out.to_string() }
+}
+
+fn yaml_top_level_scalar(content: &str, key: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let trimmed = line.trim_start();
+        if line.len() != trimmed.len() || trimmed.starts_with('#') {
+            return None;
+        }
+        trimmed
+            .strip_prefix(key)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .map(parse_yaml_scalar)
+            .filter(|value| !value.is_empty())
+    })
+}
+
+pub(crate) fn read_mihomo_controller() -> Result<Option<MihomoController>, String> {
+    let cfg = Path::new(crate::types::MIHOMO_CONF_DIR).join("config.yaml");
+    let content = match std::fs::read_to_string(&cfg) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("verify_failed:config:{e}")),
+    };
+    parse_mihomo_controller(&content, Path::new(crate::types::MIHOMO_CONF_DIR))
+}
+
+fn parse_mihomo_controller(content: &str, conf_dir: &Path) -> Result<Option<MihomoController>, String> {
+    let secret = yaml_top_level_scalar(content, "secret").unwrap_or_default();
+    if secret.contains('\r') || secret.contains('\n') {
+        return Err("verify_failed:secret".into());
+    }
+
+    if let Some(unix) = yaml_top_level_scalar(content, "external-controller-unix") {
+        let path = PathBuf::from(&unix);
+        let path = if path.is_absolute() { path } else { conf_dir.join(path) };
+        return Ok(Some(MihomoController::Unix { path, secret }));
+    }
+    if let Some(addr) = yaml_top_level_scalar(content, "external-controller") {
+        let Some((_, port)) = addr.rsplit_once(':') else {
+            return Err("verify_failed:controller".into());
+        };
+        let port = port
+            .trim()
+            .parse::<u16>()
+            .map_err(|_| "verify_failed:controller".to_string())?;
+        return Ok(Some(MihomoController::Tcp { port, secret }));
+    }
+    Ok(None)
+}
+
+async fn verify_unix_controller(path: &Path, secret: &str) -> Result<(), String> {
+    let mut stream = tokio::net::UnixStream::connect(path)
+        .await
+        .map_err(|e| format!("verify_failed:api:{e}"))?;
+    let auth = if secret.is_empty() {
+        String::new()
+    } else {
+        format!("Authorization: Bearer {secret}\r\n")
+    };
+    let request = format!(
+        "GET /version HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{auth}\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| format!("verify_failed:api:{e}"))?;
+    let mut response = Vec::with_capacity(4096);
+    stream
+        .take(16 * 1024)
+        .read_to_end(&mut response)
+        .await
+        .map_err(|e| format!("verify_failed:api:{e}"))?;
+    let head = String::from_utf8_lossy(&response);
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(0);
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(format!("verify_failed:api:{status}"))
+    }
+}
+
+async fn verify_mihomo_controller(client: &reqwest::Client, controller: &MihomoController) -> Result<(), String> {
+    match controller {
+        MihomoController::Tcp { port, secret } => {
+            let url = format!("http://127.0.0.1:{port}/version");
+            let mut request = client.get(&url).timeout(Duration::from_secs(2));
+            if !secret.is_empty() {
+                request = request.bearer_auth(secret);
+            }
+            match request.send().await {
+                Ok(r) if r.status().is_success() => Ok(()),
+                Ok(r) => Err(format!("verify_failed:api:{}", r.status())),
+                Err(e) => Err(format!("verify_failed:api:{e}")),
+            }
+        }
+        MihomoController::Unix { path, secret } => {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                verify_unix_controller(path, secret),
+            )
+            .await
+            .map_err(|_| "verify_failed:api:timeout".to_string())?
+        }
+    }
+}
+
+/// Result of asking the running Mihomo to reload a config file (ZK-08).
+pub(crate) enum ReloadOutcome {
+    /// The core parsed and accepted the new file (2xx on PUT /configs).
+    Applied,
+    /// The core answered but rejected the config — the old config is still active.
+    Rejected(String),
+    /// The controller did not answer at all; the caller may restart the core instead.
+    Unreachable(String),
+}
+
+/// Ask the running core to reload `file`. Mihomo parses the config during reload and
+/// answers with an error status for an invalid file, so 2xx proves the NEW config is
+/// active — a stale process cannot confirm an apply it never performed (ZK-08).
+pub(crate) async fn mihomo_reload_config(client: &reqwest::Client, file: &str) -> ReloadOutcome {
+    let controller = match read_mihomo_controller() {
+        Ok(Some(c)) => c,
+        Ok(None) => return ReloadOutcome::Unreachable("no_controller".into()),
+        Err(e) => return ReloadOutcome::Unreachable(e),
+    };
+    let body = json!({ "path": file, "payload": "" }).to_string();
+    match controller {
+        MihomoController::Tcp { port, secret } => {
+            let url = format!("http://127.0.0.1:{port}/configs?reload=true");
+            let mut request = client
+                .put(&url)
+                .timeout(Duration::from_secs(15))
+                .header("Content-Type", "application/json")
+                .body(body);
+            if !secret.is_empty() {
+                request = request.bearer_auth(secret);
+            }
+            match request.send().await {
+                Ok(r) if r.status().is_success() => ReloadOutcome::Applied,
+                Ok(r) => ReloadOutcome::Rejected(format!("http:{}", r.status())),
+                Err(e) => ReloadOutcome::Unreachable(format!("{e}")),
+            }
+        }
+        MihomoController::Unix { path, secret } => {
+            let auth = if secret.is_empty() {
+                String::new()
+            } else {
+                format!("Authorization: Bearer {secret}\r\n")
+            };
+            let request = format!(
+                "PUT /configs?reload=true HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{auth}\r\n{body}",
+                body.len()
+            );
+            let exchange = async {
+                let mut stream = tokio::net::UnixStream::connect(&path)
+                    .await
+                    .map_err(|e| format!("{e}"))?;
+                stream
+                    .write_all(request.as_bytes())
+                    .await
+                    .map_err(|e| format!("{e}"))?;
+                let mut response = Vec::with_capacity(4096);
+                stream
+                    .take(16 * 1024)
+                    .read_to_end(&mut response)
+                    .await
+                    .map_err(|e| format!("{e}"))?;
+                let head = String::from_utf8_lossy(&response);
+                Ok::<u16, String>(
+                    head.split_whitespace()
+                        .nth(1)
+                        .and_then(|v| v.parse::<u16>().ok())
+                        .unwrap_or(0),
+                )
+            };
+            match tokio::time::timeout(Duration::from_secs(15), exchange).await {
+                Err(_) => ReloadOutcome::Unreachable("timeout".into()),
+                Ok(Err(e)) => ReloadOutcome::Unreachable(e),
+                Ok(Ok(status)) if (200..300).contains(&status) => ReloadOutcome::Applied,
+                Ok(Ok(status)) => ReloadOutcome::Rejected(format!("http:{status}")),
+            }
+        }
+    }
+}
+
+/// After restart, confirm Clash API answers through the configured TCP or Unix controller.
+pub(crate) async fn verify_mihomo_api(client: &reqwest::Client) -> Result<(), String> {
+    let Some(controller) = read_mihomo_controller()? else {
+        log("WARN", "Mihomo external-controller не настроен — API health неприменим".into());
         return Ok(());
     };
-    let url = format!("http://127.0.0.1:{port}/version");
     for _ in 0..12 {
-        match client.get(&url).timeout(Duration::from_secs(2)).send().await {
-            Ok(r) if r.status().is_success() => return Ok(()),
-            _ => tokio::time::sleep(Duration::from_millis(400)).await,
+        match verify_mihomo_controller(client, &controller).await {
+            Ok(()) => return Ok(()),
+            Err(_) => tokio::time::sleep(Duration::from_millis(400)).await,
         }
     }
     Err("verify_failed:api".into())
@@ -1207,7 +1913,6 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
             &bin_url,
             &proxies,
             &tmp_dir.join("bin.tmp"),
-            0,
         )
         .await {
             Ok(d) => d,
@@ -1218,8 +1923,8 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
         set_stage("installing", "zkeen-ui");
 
         let source = tmp_dir.join(format!("zkeen-ui_{}", ver));
-        if let Err(_e) = save(bin_d, source.clone()).await {
-            return response(false, Some("save_failed".to_string()));
+        if let Err(e) = save(bin_d, source.clone()).await {
+            return response(false, Some(e));
         }
 
         let integrity_check = tokio::task::spawn_blocking({
@@ -1250,12 +1955,74 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
             return response(false, Some(e));
         }
 
-        let target = "/opt/sbin/zkeen-ui";
-        if let Err(_e) = fs::rename(&source, target).await {
-            return response(false, Some("install_failed".to_string()));
+        let target = PathBuf::from("/opt/sbin/zkeen-ui");
+        let rollback = PathBuf::from("/opt/sbin/zkeen-ui.zkeen-rollback");
+        let rollback_s = rollback.to_string_lossy().into_owned();
+        let target_s = target.to_string_lossy().into_owned();
+        let self_core = "zkeen-ui";
+
+        // Transactional self-update (ZK-21): durable marker + rollback + external watchdog
+        // that commits or restores the previous binary after the restart.
+        if let Err(e) = write_update_marker(self_core, "prepared").await {
+            log("ERROR", format!("Не удалось записать маркер обновления: {e}"));
+            return response(false, Some(e));
+        }
+        if target.exists() {
+            if let Err(e) = publish_rollback(&target, &rollback).await {
+                log("ERROR", format!("Не удалось подготовить rollback: {e}"));
+                if rollback.exists() {
+                    let _ = restore_core_rollback(&rollback_s, &target_s, self_core, false).await;
+                } else {
+                    let _ = clear_update_marker(self_core).await;
+                }
+                return response(false, Some(e));
+            }
+            if let Err(e) = write_update_marker(self_core, "rollback").await {
+                log("ERROR", format!("Не удалось подтвердить маркер rollback: {e}"));
+                let _ = restore_core_rollback(&rollback_s, &target_s, self_core, false).await;
+                return response(false, Some(e));
+            }
         }
 
-        _ = fs::set_permissions(target, std::fs::Permissions::from_mode(0o755)).await;
+        // The watchdog is staged from the NEW binary (the running one may lack the
+        // command) and must be alive BEFORE this process is replaced/restarted.
+        let (mut watchdog, watchdog_exe) =
+            match spawn_self_update_watchdog(&source, state.listen_port, &ver).await {
+                Ok(v) => v,
+                Err(e) => {
+                    log("ERROR", format!("Watchdog self-update не запущен: {e}"));
+                    if rollback.exists() {
+                        let _ = restore_core_rollback(&rollback_s, &target_s, self_core, false).await;
+                    } else {
+                        let _ = clear_update_marker(self_core).await;
+                    }
+                    return response(false, Some(e));
+                }
+            };
+
+        let installed = async {
+            fs::rename(&source, &target)
+                .await
+                .map_err(|e| format!("install_failed:{e}"))?;
+            sync_parent_dir(&target, "install_failed").await?;
+            fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+                .await
+                .map_err(|e| format!("chmod_failed:{e}"))
+        }
+        .await;
+        if let Err(e) = installed {
+            log("ERROR", format!("Установка self-update не завершена: {e}"));
+            let _ = watchdog.kill().await;
+            let _ = fs::remove_file(&watchdog_exe).await;
+            if rollback.exists() {
+                let _ = restore_core_rollback(&rollback_s, &target_s, self_core, false).await;
+            } else {
+                let _ = fs::remove_file(&target).await;
+                let _ = clear_update_marker(self_core).await;
+            }
+            return response(false, Some(e));
+        }
+
         // Short CLI: /opt/sbin/zkeen → zkeen-ui
         _ = fs::remove_file("/opt/sbin/zkeen").await;
         #[cfg(unix)]
@@ -1270,11 +2037,22 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
 
         if Path::new(S99ZKEEN_UI).exists() {
             log("INFO", "Перезапуск...".into());
-            _ = Command::new(S99ZKEEN_UI)
+            if let Err(e) = Command::new(S99ZKEEN_UI)
                 .arg("restart")
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .spawn();
+                .spawn()
+            {
+                log("ERROR", format!("Не удалось запустить restart панели: {e}"));
+                let _ = watchdog.kill().await;
+                let _ = fs::remove_file(&watchdog_exe).await;
+                if rollback.exists() {
+                    let _ = restore_core_rollback(&rollback_s, &target_s, self_core, false).await;
+                } else {
+                    let _ = clear_update_marker(self_core).await;
+                }
+                return response(false, Some(format!("restart_failed:panel:{e}")));
+            }
         } else {
             log(
                 "WARN",
@@ -1339,7 +2117,6 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
         _ => {}
     }
 
-    let core_bytes = current_core_bytes(&req.core);
     log("INFO", format!("Загрузка: {}", url));
     set_stage("downloading", &asset);
     let dl_res = match download(
@@ -1347,7 +2124,6 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
         &url,
         &proxies,
         &tmp_dir.join("download.tmp"),
-        core_bytes,
     )
     .await
     {
@@ -1373,15 +2149,6 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
         Ok(())
     }
 
-    let downloaded = match &dl_res {
-        DownloadResult::RAM(b) => b.len() as u64,
-        DownloadResult::Disk(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
-    };
-    if let Err(e) = ensure_free_space(&[OPT_TMP, OPT_SBIN], peak_update_need(downloaded.max(1), core_bytes))
-    {
-        return response(false, Some(e));
-    }
-
     let bin = tmp_dir.join(format!("{}_{}", core_name, ver));
     let unpack = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         match dl_res {
@@ -1400,79 +2167,135 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
         Ok(Err(e)) if e.to_string().contains("unpack_too_large") => {
             return response(false, Some("unpack_too_large".into()));
         }
-        Ok(Err(_)) | Err(_) => {
-            return response(false, Some("unpack_failed".to_string()));
+        Ok(Err(e)) if is_no_space(&e) => {
+            return response(false, Some("no_space".into()));
+        }
+        Ok(Err(e)) => {
+            return response(false, Some(format!("unpack_failed:{e}")));
+        }
+        Err(e) => {
+            return response(false, Some(format!("unpack_failed:{e}")));
         }
     }
 
     set_stage("installing", &req.core);
-    let target = format!("{OPT_SBIN}/{}", req.core);
+    let target = PathBuf::from(format!("{OPT_SBIN}/{}", req.core));
     // Single rollback file for this operation (REC-01). Deleted only after verified health.
-    let rollback = format!("{OPT_SBIN}/{}.zkeen-rollback", req.core);
+    let rollback = PathBuf::from(format!("{OPT_SBIN}/{}.zkeen-rollback", req.core));
     let source = tmp_dir.join(format!("{}_{}", req.core, ver));
     let was_running = !crate::controller::get_pid(&req.core).is_empty();
     let marker = update_marker_path(&req.core);
+    let rollback_s = rollback.to_string_lossy().into_owned();
+    let target_s = target.to_string_lossy().into_owned();
 
-    if Path::new(&target).exists() {
-        if let Err(e) = publish_rollback_copy(&target, &rollback).await {
-            log("ERROR", format!("Не удалось создать rollback-копию: {}", e));
-            return response(false, Some("backup_failed".into()));
-        }
-        log("INFO", format!("Rollback-копия: {}", rollback));
-        // Permanent core-backup/… is never created (REC-01 / ZK-23): only this transactional rollback.
+    if Path::new(&marker).exists() {
+        return response(false, Some("update_in_progress".into()));
     }
-
-    if let Err(e) = fs::write(&marker, b"1").await {
+    if let Err(e) = write_update_marker(&req.core, "prepared").await {
         log("ERROR", format!("Не удалось записать маркер обновления: {e}"));
-        let _ = fs::remove_file(&rollback).await;
-        return response(false, Some("backup_failed".into()));
+        return response(false, Some(e));
     }
-    let marker_path = marker.clone();
-    let _ = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        let f = std::fs::File::open(&marker_path)?;
-        f.sync_all()?;
-        let dir = std::fs::File::open(OPT_SBIN)?;
-        dir.sync_all()?;
-        Ok(())
-    })
-    .await;
 
-    let installed = if fs::rename(&source, &target).await.is_ok() {
-        if let Err(e) = fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).await {
-            log("ERROR", format!("chmod после rename не удался: {e}"));
-            let _ = restore_core_rollback(&rollback, &target, &req.core, false).await;
-            Err("chmod_failed".to_string())
-        } else {
-            Ok(())
+    if target.exists() {
+        if let Err(e) = publish_rollback(&target, &rollback).await {
+            log("ERROR", format!("Не удалось подготовить rollback: {e}"));
+            // rename(target, rollback) may already have succeeded while the fsync failed;
+            // restore it instead of orphaning the rollback with no marker.
+            if rollback.exists() {
+                if let Err(re) =
+                    restore_core_rollback(&rollback_s, &target_s, &req.core, false).await
+                {
+                    log("ERROR", format!("Откат после ошибки backup: {re}"));
+                }
+            } else {
+                let _ = clear_update_marker(&req.core).await;
+            }
+            return response(false, Some(e));
         }
-    } else {
-        log("WARN", "Атомарная замена не удалась, фолбек на копирование...".into());
-        if was_running {
-            log("INFO", "Остановка XKeen...".into());
-            if let Err(e) = crate::controller::run_init_command(state, &["stop"]).await {
-                log("ERROR", format!("Остановка перед установкой не удалась: {}", e));
-                clear_update_marker(&req.core).await;
-                let _ = fs::remove_file(&rollback).await;
-                return response(false, Some(e));
+        log("INFO", format!("Rollback-копия: {}", rollback.display()));
+        // Permanent core-backup/… is never created (REC-01 / ZK-23): only this transactional rollback.
+        if let Err(e) = write_update_marker(&req.core, "rollback").await {
+            log("ERROR", format!("Не удалось подтвердить маркер rollback: {e}"));
+            if let Err(re) = restore_core_rollback(&rollback_s, &target_s, &req.core, false).await {
+                log("ERROR", format!("Откат после ошибки маркера: {re}"));
+            }
+            return response(false, Some(e));
+        }
+    }
+
+    let installed = match fs::rename(&source, &target).await {
+        Ok(()) => {
+            let install = async {
+                sync_parent_dir(&target, "install_failed").await?;
+                fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+                    .await
+                    .map_err(|e| format!("chmod_failed:{e}"))
+            }
+            .await;
+            match install {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    log("ERROR", format!("Установка после rename не завершена: {e}"));
+                    if rollback.exists() {
+                        let _ = restore_core_rollback(&rollback_s, &target_s, &req.core, false).await;
+                    } else {
+                        let _ = fs::remove_file(&target).await;
+                        let _ = clear_update_marker(&req.core).await;
+                    }
+                    Err(e)
+                }
             }
         }
-        match fs::copy(&source, &target).await {
-            Ok(_) => {
-                _ = fs::remove_file(&source).await;
-                if let Err(e) = fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).await {
-                    log("ERROR", format!("chmod после copy не удался: {e}"));
-                    let _ = restore_core_rollback(&rollback, &target, &req.core, was_running).await;
-                    Err("chmod_failed".to_string())
-                } else {
+        Err(_) => {
+            log("WARN", "Атомарная замена не удалась, фолбек на копирование...".into());
+            if was_running {
+                log("INFO", "Остановка XKeen...".into());
+                if let Err(e) = crate::controller::run_init_command(state, &["stop"]).await {
+                    log("ERROR", format!("Остановка перед установкой не удалась: {e}"));
+                    if rollback.exists() {
+                        if let Err(re) =
+                            restore_core_rollback(&rollback_s, &target_s, &req.core, false).await
+                        {
+                            log("ERROR", format!("Восстановление после отказа stop: {re}"));
+                            return response(false, Some(format!("{e};{re}")));
+                        }
+                    } else if let Err(re) = clear_update_marker(&req.core).await {
+                        return response(false, Some(format!("{e};{re}")));
+                    }
+                    return response(false, Some(e));
+                }
+            }
+            let copied = async {
+                fs::copy(&source, &target)
+                    .await
+                    .map_err(|e| write_error(e, "install_failed"))?;
+                sync_file(&target, "install_failed").await?;
+                sync_parent_dir(&target, "install_failed").await?;
+                fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+                    .await
+                    .map_err(|e| format!("chmod_failed:{e}"))
+            }
+            .await;
+            match copied {
+                Ok(()) => {
+                    let _ = fs::remove_file(&source).await;
                     Ok(())
                 }
-            }
-            Err(e) => {
-                log("ERROR", format!("Не удалось скопировать бинарник: {}", e));
-                if let Err(re) = restore_core_rollback(&rollback, &target, &req.core, was_running).await {
-                    log("ERROR", format!("Откат после install_failed: {}", re));
+                Err(e) => {
+                    log("ERROR", format!("Не удалось установить бинарник: {e}"));
+                    if rollback.exists() {
+                        if let Err(re) =
+                            restore_core_rollback(&rollback_s, &target_s, &req.core, was_running).await
+                        {
+                            log("ERROR", format!("Откат после install_failed: {re}"));
+                            return response(false, Some(format!("{e};{re}")));
+                        }
+                    } else {
+                        let _ = fs::remove_file(&target).await;
+                        let _ = clear_update_marker(&req.core).await;
+                    }
+                    Err(e)
                 }
-                Err("install_failed".to_string())
             }
         }
     };
@@ -1485,7 +2308,7 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
     set_stage("verifying", &req.core);
     if let Err(e) = verify_installed_core(&req.core).await {
         log("ERROR", format!("Проверка нового бинарника не прошла: {e}"));
-        match restore_core_rollback(&rollback, &target, &req.core, was_running).await {
+        match restore_core_rollback(&rollback_s, &target_s, &req.core, was_running).await {
             Ok(()) => return response(false, Some(e)),
             Err(re) => return response(false, Some(format!("{e};{re}"))),
         }
@@ -1510,7 +2333,7 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
             }
         };
         if !restart_ok {
-            match restore_core_rollback(&rollback, &target, &req.core, true).await {
+            match restore_core_rollback(&rollback_s, &target_s, &req.core, true).await {
                 Ok(()) => return response(false, Some("restart_failed".into())),
                 Err(re) => return response(false, Some(format!("restart_failed:{re}"))),
             }
@@ -1518,7 +2341,7 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
         if req.core == "mihomo" {
             if let Err(e) = verify_mihomo_api(&state.http_client).await {
                 log("ERROR", format!("Clash API после обновления недоступен: {e}"));
-                match restore_core_rollback(&rollback, &target, &req.core, true).await {
+                match restore_core_rollback(&rollback_s, &target_s, &req.core, true).await {
                     Ok(()) => return response(false, Some(e)),
                     Err(re) => return response(false, Some(format!("{e};{re}"))),
                 }
@@ -1526,14 +2349,24 @@ async fn run_update(state: &AppState, req: UpdateReq, tmp_dir: &Path) -> (Status
         }
     }
 
-    // Health confirmed — drop the rollback file, update marker, and any legacy permanent backups.
-    if Path::new(&rollback).exists() {
-        match fs::remove_file(&rollback).await {
-            Ok(()) => log("INFO", format!("Rollback-файл удалён: {}", rollback)),
-            Err(e) => log("WARN", format!("Не удалось удалить {}: {}", rollback, e)),
+    // Health confirmed — commit: marker first, then remove the rollback file.
+    // If the commit state cannot be persisted, keep BOTH the marker ("rollback") and the
+    // rollback file so boot recovery can still restore the last working version (ZK-21).
+    if let Err(e) = write_update_marker(&req.core, "commit").await {
+        log("ERROR", format!("Не удалось записать commit-маркер: {e}"));
+        return response(false, Some(e));
+    }
+    if let Err(e) = clear_update_marker(&req.core).await {
+        // Recovery finishes cleanup from the "commit" state on next boot.
+        log("WARN", format!("Не удалось очистить маркер обновления: {e}"));
+    }
+    if rollback.exists() {
+        match remove_file_durable(&rollback, "rollback_failed").await {
+            Ok(()) => log("INFO", format!("Rollback-файл удалён: {}", rollback.display())),
+            // A stale rollback without a marker is harmless; recover() will not touch it.
+            Err(e) => log("WARN", format!("Не удалось удалить {}: {}", rollback.display(), e)),
         }
     }
-    clear_update_marker(&req.core).await;
     cleanup_legacy_core_backups(&req.core).await;
 
     log("INFO", format!("Обновление {} до {} завершено", core_cap, ver));
@@ -1592,5 +2425,152 @@ mod audit_regression_tests {
         assert!(!rollback.exists());
         assert!(!root.join("mihomo.zkeen-bad").exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn inner_restore_keeps_rollback_until_wrapper_cleanup() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("audit-test-rollback-inner");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("xray");
+        let rollback = root.join("xray.zkeen-rollback");
+        std::fs::write(&target, b"broken-binary").unwrap();
+        std::fs::write(&rollback, b"good-binary").unwrap();
+
+        restore_core_rollback_inner(
+            rollback.to_str().unwrap(),
+            target.to_str().unwrap(),
+            "xray",
+            false,
+        )
+        .await
+        .unwrap();
+
+        // The rollback file must survive the restore itself so a crash between
+        // restore and cleanup can still recover (ZK-21).
+        assert_eq!(std::fs::read(&target).unwrap(), b"good-binary");
+        assert_eq!(std::fs::read(&rollback).unwrap(), b"good-binary");
+        assert!(!root.join("xray.zkeen-bad").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn controller_parser_tcp_with_secret() {
+        let content = "mixed-port: 1080\nexternal-controller: 0.0.0.0:9090 # api\nsecret: \"tok#en\"\n";
+        let parsed = parse_mihomo_controller(content, Path::new("/opt/etc/mihomo"))
+            .unwrap()
+            .expect("tcp controller");
+        assert_eq!(
+            parsed,
+            MihomoController::Tcp {
+                port: 9090,
+                secret: "tok#en".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn controller_parser_unix_relative_path() {
+        let content = "external-controller-unix: 'run/mihomo.sock'\nsecret: 's#t'\n";
+        let parsed = parse_mihomo_controller(content, Path::new("/opt/etc/mihomo"))
+            .unwrap()
+            .expect("unix controller");
+        assert_eq!(
+            parsed,
+            MihomoController::Unix {
+                path: PathBuf::from("/opt/etc/mihomo/run/mihomo.sock"),
+                secret: "s#t".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn controller_parser_absent() {
+        let parsed = parse_mihomo_controller("mixed-port: 1080\n", Path::new("/opt/etc/mihomo")).unwrap();
+        assert_eq!(parsed, None);
+    }
+
+    #[tokio::test]
+    async fn unix_controller_verify_sends_secret() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("audit-test-unix-sock");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let sock = root.join("ctrl.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = conn.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..n]);
+                if req.len() > 4096 {
+                    break;
+                }
+            }
+            let req = String::from_utf8_lossy(&req).into_owned();
+            assert!(req.starts_with("GET /version HTTP/1.1"), "request: {req}");
+            assert!(req.contains("Authorization: Bearer s3cr3t\r\n"), "request: {req}");
+            conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .await
+                .unwrap();
+            drop(conn);
+            req
+        });
+
+        let controller = MihomoController::Unix {
+            path: sock.clone(),
+            secret: "s3cr3t".into(),
+        };
+        let client = reqwest::Client::new();
+        verify_mihomo_controller(&client, &controller).await.unwrap();
+        server.await.unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ZK-34: the persisted status must round-trip and tolerate older files
+    // without the newer fields (serde default).
+    #[test]
+    fn op_status_serde_roundtrip_and_legacy_default() {
+        let s = OpStatus {
+            id: "op1".into(),
+            core: "mihomo".into(),
+            version: "v1.2.3".into(),
+            stage: "done".into(),
+            detail: String::new(),
+            error: None,
+            running: false,
+            updated_at: 42,
+        };
+        let body = serde_json::to_string(&s).unwrap();
+        let back: OpStatus = serde_json::from_str(&body).unwrap();
+        assert_eq!(back.id, "op1");
+        assert_eq!(back.updated_at, 42);
+
+        let legacy: OpStatus = serde_json::from_str(
+            r#"{"id":"op2","core":"self","version":"v0.1.9-beta.1","stage":"downloading","detail":"","error":null,"running":true}"#,
+        )
+        .unwrap();
+        assert!(legacy.running);
+        assert_eq!(legacy.updated_at, 0);
+    }
+
+    // ZK-34: local disk write failures are server faults (500), not upstream 502.
+    #[test]
+    fn write_failure_is_not_bad_gateway() {
+        assert_eq!(
+            http_for_error("download_write_failed"),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            http_for_error("download_write_failed:No space left on device"),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(http_for_error("no_space"), StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(http_for_error("download_budget"), StatusCode::BAD_GATEWAY);
     }
 }

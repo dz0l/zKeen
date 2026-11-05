@@ -41,6 +41,7 @@ const CODE_KEYS: Record<string, string> = {
   ping_timeout_invalid: "api.pingTimeoutInvalid",
   unsupported_yaml_layout: "api.unsupportedYamlLayout",
   update_in_progress: "api.updateInProgress",
+  config_conflict: "api.configConflict",
   no_beta_release: "settings.noBetaRelease",
   backup_failed: "api.backupFailed",
   init_failed: "api.initFailed",
@@ -54,6 +55,7 @@ const CODE_KEYS: Record<string, string> = {
   chmod_failed: "api.chmodFailed",
   unpack_too_large: "api.unpackTooLarge",
   port_in_use: "api.portInUse",
+  watchdog_spawn_failed: "api.watchdogSpawnFailed",
   download_http_404: "api.downloadHttp404",
   download_http_403: "api.downloadHttp403",
   download_http_429: "api.downloadHttp429",
@@ -64,6 +66,8 @@ const CODE_KEYS: Record<string, string> = {
   download_empty: "api.downloadEmpty",
   download_write_failed: "api.downloadWriteFailed",
   download_budget: "api.downloadBudget",
+  update_interrupted: "api.updateInterrupted",
+  self_update_rollback: "api.selfUpdateRollback",
   "group_in_use:match": "groups.inUseMatch",
   "group_in_use:sub-rules": "groups.inUseSubRules",
   "group_in_use:empty": "groups.inUseEmpty",
@@ -99,7 +103,7 @@ function resolveCode(raw: string): { code: string; params?: Record<string, strin
   if (withSec) return { code: "too_many_attempts", params: { sec: withSec[1] } };
 
   const withPrefix = raw.match(
-    /^(restart_failed|start_failed|save_failed|install_failed|unpack_failed|unpack_too_large|init_failed|stop_failed|backup_failed|rollback_failed|rollback_restart_failed|verify_failed|chmod_failed|port_bind_failed|no_space|space_check_failed|download_too_large)(?::|$)/,
+    /^(restart_failed|start_failed|save_failed|install_failed|unpack_failed|unpack_too_large|init_failed|stop_failed|backup_failed|rollback_failed|rollback_restart_failed|verify_failed|chmod_failed|port_bind_failed|no_space|space_check_failed|download_too_large|watchdog_spawn_failed)(?::|$)/,
   );
   if (withPrefix) {
     const code = withPrefix[1] === "rollback_restart_failed" ? "rollback_failed" : withPrefix[1];

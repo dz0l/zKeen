@@ -1,12 +1,13 @@
 use crate::logger::log;
 use crate::types::*;
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Prefix of per-request validation files in MIHOMO_CONF_DIR (hidden from the config list).
@@ -22,15 +23,43 @@ fn unique_suffix() -> String {
     format!("{}-{}-{}", std::process::id(), nanos, TEMP_SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
+/// FNV-1a 64 over the stored bytes: cheap optimistic-concurrency token (ZK-16).
+fn content_revision(content: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in content.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Serialize read-modify-write cycles so the revision check and the replace
+/// cannot interleave with a concurrent writer (ZK-16).
+static CONFIG_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// fsync the directory after rename so the new name is durable (ZK-16).
+fn sync_dir_of(path: &str) -> Result<(), String> {
+    let dir = Path::new(path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/"));
+    fs::File::open(&dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| format!("Directory sync error: {e}"))
+}
+
 #[derive(Serialize)]
 struct ConfigItem {
     file: String,
     content: String,
+    revision: String,
 }
 #[derive(Deserialize)]
 pub struct ConfigReq {
     file: String,
     content: String,
+    #[serde(default)]
+    base_revision: Option<String>,
 }
 #[derive(Deserialize)]
 pub struct DeleteReq {
@@ -70,6 +99,7 @@ async fn collect_configs(paths: &[String], is_mihomo: bool) -> Vec<ConfigItem> {
                             match tokio::fs::read_to_string(&entry_path).await {
                                 Ok(content) => results.push(ConfigItem {
                                     file: entry_path.to_string_lossy().into(),
+                                    revision: content_revision(&content),
                                     content,
                                 }),
                                 Err(e) => {
@@ -87,6 +117,7 @@ async fn collect_configs(paths: &[String], is_mihomo: bool) -> Vec<ConfigItem> {
             match tokio::fs::read_to_string(path).await {
                 Ok(content) => results.push(ConfigItem {
                     file: path_str.clone(),
+                    revision: content_revision(&content),
                     content,
                 }),
                 Err(e) => {
@@ -139,6 +170,7 @@ pub async fn get_configs(
                 if let Ok(content) = tokio::fs::read_to_string(&path).await {
                     lst_configs.push(ConfigItem {
                         file: path.to_string_lossy().into(),
+                        revision: content_revision(&content),
                         content,
                     });
                 }
@@ -196,6 +228,7 @@ async fn collect_validate_files(core_type: &str, file: &str, content: &str) -> V
         validate_files.push(ConfigReq {
             file: file.to_string(),
             content: content.to_string(),
+            base_revision: None,
         });
     } else if core_type == "xray" {
         if let Ok(mut entries) = tokio::fs::read_dir(XRAY_CONF_DIR).await {
@@ -213,6 +246,7 @@ async fn collect_validate_files(core_type: &str, file: &str, content: &str) -> V
                     validate_files.push(ConfigReq {
                         file: path_str,
                         content: file_content,
+                        base_revision: None,
                     });
                 }
             }
@@ -220,12 +254,14 @@ async fn collect_validate_files(core_type: &str, file: &str, content: &str) -> V
                 validate_files.push(ConfigReq {
                     file: file.to_string(),
                     content: content.to_string(),
+                    base_revision: None,
                 });
             }
         } else {
             validate_files.push(ConfigReq {
                 file: file.to_string(),
                 content: content.to_string(),
+                base_revision: None,
             });
         }
     }
@@ -267,6 +303,8 @@ fn write_config_atomic(file: &str, content: &str) -> Result<Option<String>, Stri
         _ = fs::remove_file(&tmp);
         return Err(format!("Replace error: {e}"));
     }
+    // Without the directory fsync the rename itself may be lost on power loss (ZK-16).
+    sync_dir_of(file)?;
     Ok(backup)
 }
 
@@ -274,6 +312,17 @@ fn write_config_atomic(file: &str, content: &str) -> Result<Option<String>, Stri
 struct SaveData {
     #[serde(skip_serializing_if = "Option::is_none")]
     backup: Option<String>,
+    /// Revision of the content now on disk; the next PUT must send it as base_revision.
+    revision: String,
+}
+
+fn save_response(
+    status: StatusCode,
+    success: bool,
+    error: Option<String>,
+    data: Option<SaveData>,
+) -> (StatusCode, Json<ApiResponse<SaveData>>) {
+    (status, Json(ApiResponse { success, error, data }))
 }
 
 pub async fn put_config(
@@ -282,11 +331,7 @@ pub async fn put_config(
     let is_lst = match check_access(&req.file, &state) {
         Ok(val) => val,
         Err(e) => {
-            return Json(ApiResponse::<SaveData> {
-                success: false,
-                error: Some(e.into()),
-                data: None,
-            });
+            return save_response(StatusCode::OK, false, Some(e.into()), None);
         }
     };
     let content = if is_lst {
@@ -295,29 +340,49 @@ pub async fn put_config(
         req.content
     };
 
+    // Hold the write lock across validate + revision check + replace so a
+    // concurrent writer cannot slip in between (ZK-16).
+    let _write_guard = CONFIG_WRITE_LOCK.lock().await;
+
+    // Optimistic concurrency: a PUT based on a stale snapshot is rejected (ZK-16).
+    if let Some(base) = req.base_revision.as_deref() {
+        let current = match fs::read_to_string(&req.file) {
+            Ok(existing) => content_revision(&existing),
+            Err(_) => String::new(),
+        };
+        if base != current {
+            log(
+                "WARN",
+                format!("Отклонена запись {} по устаревшему снимку", req.file),
+            );
+            return save_response(
+                StatusCode::CONFLICT,
+                false,
+                Some("config_conflict".into()),
+                None,
+            );
+        }
+    }
+
     if let Some(core_type) = params.get("validate") {
         if let Err(e) = run_validation(core_type, &req.file, &content).await {
-            return Json(ApiResponse::<SaveData> {
-                success: false,
-                error: Some(e),
-                data: None,
-            });
+            return save_response(StatusCode::OK, false, Some(e), None);
         }
     }
 
     match write_config_atomic(&req.file, &content) {
-        Ok(backup) => Json(ApiResponse {
-            success: true,
-            error: None,
-            data: Some(SaveData { backup }),
-        }),
+        Ok(backup) => save_response(
+            StatusCode::OK,
+            true,
+            None,
+            Some(SaveData {
+                backup,
+                revision: content_revision(&content),
+            }),
+        ),
         Err(e) => {
             log("ERROR", format!("Не удалось сохранить {}: {e}", req.file));
-            Json(ApiResponse::<SaveData> {
-                success: false,
-                error: Some(e),
-                data: None,
-            })
+            save_response(StatusCode::OK, false, Some(e), None)
         }
     }
 }
@@ -440,6 +505,13 @@ pub async fn patch_config(State(state): State<AppState>, Json(req): Json<RenameR
         return Json(ApiResponse::<()> {
             success: false,
             error: Some("Rename error".into()),
+            data: None,
+        });
+    }
+    if let Err(e) = sync_dir_of(&req.new_file) {
+        return Json(ApiResponse::<()> {
+            success: false,
+            error: Some(e),
             data: None,
         });
     }
@@ -768,4 +840,199 @@ pub async fn bootstrap_mihomo_config(
             file: path,
         }),
     })
+}
+
+#[cfg(test)]
+mod audit_revision_tests {
+    use super::*;
+
+    // ZK-16: the optimistic-concurrency token must be deterministic and content-sensitive.
+    #[test]
+    fn content_revision_is_stable_and_sensitive() {
+        assert_eq!(content_revision("abc"), content_revision("abc"));
+        assert_ne!(content_revision("abc"), content_revision("abd"));
+        assert_ne!(content_revision(""), content_revision("abc"));
+        assert_eq!(content_revision("abc").len(), 16);
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ApplyReq {
+    file: String,
+    content: String,
+    #[serde(default)]
+    base_revision: Option<String>,
+    #[serde(default)]
+    validate: bool,
+    #[serde(default)]
+    hard_restart: bool,
+}
+
+#[derive(Serialize)]
+struct ApplyData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup: Option<String>,
+    /// Revision of the content that is on disk after the transaction (ZK-16/ZK-08).
+    revision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rolled_back: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rollback_error: Option<String>,
+}
+
+fn apply_response(
+    status: StatusCode,
+    success: bool,
+    error: Option<String>,
+    data: Option<ApplyData>,
+) -> (StatusCode, Json<ApiResponse<ApplyData>>) {
+    (status, Json(ApiResponse { success, error, data }))
+}
+
+/// Push the on-disk config into the running Mihomo and prove the NEW file is active.
+/// A reload is confirmed by the core itself (it rejects invalid configs with an error
+/// status); a restart is confirmed by a new PID plus a live API (ZK-08/ZK-19).
+async fn apply_to_mihomo(state: &AppState, file: &str, hard_restart: bool) -> Result<(), String> {
+    let core_active = state.core.read().unwrap().name == "mihomo";
+    if !hard_restart {
+        match crate::updater::mihomo_reload_config(&state.http_client, file).await {
+            crate::updater::ReloadOutcome::Applied => return Ok(()),
+            crate::updater::ReloadOutcome::Rejected(detail) => {
+                return Err(format!("apply_failed:rejected:{detail}"));
+            }
+            crate::updater::ReloadOutcome::Unreachable(e) => {
+                log(
+                    "WARN",
+                    format!("Mihomo controller недоступен ({e}) — перезапуск ядра для apply"),
+                );
+            }
+        }
+    }
+    if !core_active {
+        return Err("apply_failed:core_not_running".into());
+    }
+    if hard_restart {
+        crate::controller::run_init_command(state, &["restart", "on"]).await?;
+        crate::controller::wait_core_running("mihomo", 20, 250).await?;
+    } else {
+        // soft_restart kills the old PID and spawns a fresh process that loads the NEW
+        // file; a config the core cannot start with never reaches the API check.
+        crate::controller::soft_restart("mihomo").await?;
+    }
+    crate::updater::verify_mihomo_api(&state.http_client).await
+}
+
+/// Restore the previous file after a failed apply and re-apply it, so a rejected
+/// candidate never stays as the working config (ZK-08). Runs entirely server-side:
+/// a closed browser tab cannot leave the router on the broken config.
+async fn rollback_apply(state: &AppState, file: &str, previous: Option<String>, hard_restart: bool) -> Result<(), String> {
+    match previous {
+        Some(prev) => {
+            write_config_atomic(file, &prev)?;
+        }
+        None => {
+            fs::remove_file(file).map_err(|e| format!("rollback_failed:{e}"))?;
+            sync_dir_of(file)?;
+        }
+    }
+    apply_to_mihomo(state, file, hard_restart).await
+}
+
+/// Server-side save → apply → rollback transaction for the Mihomo config (ZK-08).
+pub async fn post_config_apply(
+    State(state): State<AppState>,
+    Json(req): Json<ApplyReq>,
+) -> impl IntoResponse {
+    let is_lst = match check_access(&req.file, &state) {
+        Ok(val) => val,
+        Err(e) => return apply_response(StatusCode::OK, false, Some(e.into()), None),
+    };
+    if is_lst {
+        return apply_response(
+            StatusCode::OK,
+            false,
+            Some("apply_not_supported_for_lst".into()),
+            None,
+        );
+    }
+
+    let _write_guard = CONFIG_WRITE_LOCK.lock().await;
+
+    if let Some(base) = req.base_revision.as_deref() {
+        let current = match fs::read_to_string(&req.file) {
+            Ok(existing) => content_revision(&existing),
+            Err(_) => String::new(),
+        };
+        if base != current {
+            log(
+                "WARN",
+                format!("Отклонён apply {} по устаревшему снимку", req.file),
+            );
+            return apply_response(
+                StatusCode::CONFLICT,
+                false,
+                Some("config_conflict".into()),
+                None,
+            );
+        }
+    }
+
+    if req.validate {
+        if let Err(e) = run_validation("mihomo", &req.file, &req.content).await {
+            return apply_response(StatusCode::OK, false, Some(e), None);
+        }
+    }
+
+    let previous = fs::read_to_string(&req.file).ok();
+
+    let backup = match write_config_atomic(&req.file, &req.content) {
+        Ok(backup) => backup,
+        Err(e) => {
+            log("ERROR", format!("Не удалось сохранить {}: {e}", req.file));
+            return apply_response(StatusCode::OK, false, Some(e), None);
+        }
+    };
+
+    if let Err(e) = apply_to_mihomo(&state, &req.file, req.hard_restart).await {
+        log("ERROR", format!("Apply {} не подтверждён: {e} — откат", req.file));
+        return match rollback_apply(&state, &req.file, previous.clone(), req.hard_restart).await {
+            Ok(()) => apply_response(
+                StatusCode::OK,
+                false,
+                Some(e),
+                Some(ApplyData {
+                    backup,
+                    revision: content_revision(previous.as_deref().unwrap_or("")),
+                    rolled_back: Some(true),
+                    rollback_error: None,
+                }),
+            ),
+            Err(rb) => {
+                log("ERROR", format!("Откат {} не удался: {rb}", req.file));
+                apply_response(
+                    StatusCode::OK,
+                    false,
+                    Some(e),
+                    Some(ApplyData {
+                        backup,
+                        revision: content_revision(&req.content),
+                        rolled_back: Some(false),
+                        rollback_error: Some(rb),
+                    }),
+                )
+            }
+        };
+    }
+
+    apply_response(
+        StatusCode::OK,
+        true,
+        None,
+        Some(ApplyData {
+            backup,
+            revision: content_revision(&req.content),
+            rolled_back: None,
+            rollback_error: None,
+        }),
+    )
 }

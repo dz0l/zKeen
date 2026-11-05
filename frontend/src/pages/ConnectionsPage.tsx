@@ -164,6 +164,7 @@ function HostPolicyModal({
         path: loaded.path,
         content: nextYaml,
         previous: loaded.content,
+        previousRevision: loaded.revision,
         validate: true,
       });
       onAdded(res.clash);
@@ -588,6 +589,7 @@ export function ConnectionsPage() {
         path: loaded.path,
         content: updated,
         previous: loaded.content,
+        previousRevision: loaded.revision,
         validate: false,
       });
       setClash(res.clash);

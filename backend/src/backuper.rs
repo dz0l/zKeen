@@ -124,12 +124,29 @@ pub async fn put_backup(State(state): State<AppState>) -> impl IntoResponse {
     .await
 }
 
-pub async fn post_backup(Json(req): Json<BackupReq>) -> impl IntoResponse {
-    run_blocking(
-        tokio::task::spawn_blocking(move || restore_backup_sync(&req.name, req.contents).map(|_| None::<()>)),
-        "Не удалось восстановить бэкап",
-    )
-    .await
+pub async fn post_backup(State(state): State<AppState>, Json(req): Json<BackupReq>) -> impl IntoResponse {
+    let name = req.name.clone();
+    let contents = req.contents.clone();
+    let result = tokio::task::spawn_blocking(move || restore_backup_sync(&name, contents)).await;
+    match result {
+        Ok(Ok(restored)) => {
+            // A restored zkeen-ui.json must become the live settings, otherwise the old
+            // RAM state silently overwrites the restored file on the next PATCH (ZK-24).
+            if restored.contains("zkeen-ui") {
+                let _guard = state.app_config_lock.lock().await;
+                *state.settings.write().unwrap() = crate::load_settings();
+                log("INFO", "Настройки панели перечитаны после восстановления бэкапа".into());
+            }
+            Json(ApiResponse::<()> {
+                success: true,
+                error: None,
+                data: None,
+            })
+            .into_response()
+        }
+        Ok(Err(e)) => api_error(format!("Не удалось восстановить бэкап: {e}")).into_response(),
+        Err(e) => api_error(format!("Не удалось восстановить бэкап: {e}")).into_response(),
+    }
 }
 
 pub async fn delete_backup(Json(req): Json<BackupReq>) -> impl IntoResponse {
@@ -246,15 +263,32 @@ fn create_backup_sync(tz: i32) -> Result<BackupItem, String> {
     })
 }
 
-fn restore_backup_sync(name: &str, requested_contents: Option<Vec<String>>) -> Result<(), String> {
+fn restore_backup_sync(
+    name: &str, requested_contents: Option<Vec<String>>,
+) -> Result<HashSet<&'static str>, String> {
     let backup_path = resolve_backup_path(name)?;
     let requested_contents = normalize_requested_contents(requested_contents)?;
     validate_backup_entries(&backup_path)?;
 
-    let file = File::open(&backup_path).map_err(io_error)?;
+    // Pass 1 stages and validates EVERYTHING before any live file changes (ZK-24):
+    // composition errors and damaged configs must not leave a half-restored system.
+    let staging = Path::new(BACKUP_DIR).join(format!(".restore-staging-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(&staging).map_err(io_error)?;
+
+    let result = restore_staged(&backup_path, &requested_contents, &staging);
+    let _ = fs::remove_dir_all(&staging);
+    result
+}
+
+fn restore_staged(
+    backup_path: &Path, requested_contents: &Option<HashSet<&'static str>>, staging: &Path,
+) -> Result<HashSet<&'static str>, String> {
+    let file = File::open(backup_path).map_err(io_error)?;
     let mut archive = Archive::new(file);
     let entries = archive.entries().map_err(io_error)?;
     let mut restored_contents = HashSet::new();
+    let mut staged: Vec<(PathBuf, PathBuf, u32)> = Vec::new();
 
     for entry in entries {
         let mut entry = entry.map_err(io_error)?;
@@ -276,24 +310,90 @@ fn restore_backup_sync(name: &str, requested_contents: Option<Vec<String>>) -> R
         let target =
             archive_relative_to_target(&relative).ok_or_else(|| format!("недопустимый путь в архиве: {relative}"))?;
 
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(io_error)?;
+        let staged_path = staging.join(format!("new-{:03}", staged.len()));
+        {
+            let mut output = File::create(&staged_path).map_err(io_error)?;
+            io::copy(&mut entry, &mut output).map_err(io_error)?;
+            output.sync_all().map_err(io_error)?;
         }
-
-        let mut output = File::create(&target).map_err(io_error)?;
-        io::copy(&mut entry, &mut output).map_err(io_error)?;
-
-        #[cfg(unix)]
-        if let Ok(mode) = entry.header().mode() {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&target, fs::Permissions::from_mode(mode));
-        }
-
+        validate_config_content(content, &staged_path, &target)?;
+        let mode = entry.header().mode().unwrap_or(0o644);
+        staged.push((target, staged_path, mode));
         restored_contents.insert(content);
     }
 
-    validate_restored_contents(&requested_contents, &restored_contents)?;
-    log("INFO", restore_log_message(&backup_path, &requested_contents));
+    // Composition is confirmed before any live file changes (ZK-24).
+    validate_restored_contents(requested_contents, &restored_contents)?;
+
+    // Pass 2: snapshot current files, publish staged ones atomically, roll back on error.
+    let mut originals: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut published: Vec<PathBuf> = Vec::new();
+    let publish = (|| -> Result<(), String> {
+        for (i, (target, staged_path, mode)) in staged.iter().enumerate() {
+            if target.exists() {
+                let snap = staging.join(format!("orig-{i:03}"));
+                fs::copy(target, &snap).map_err(io_error)?;
+                originals.push((target.clone(), snap));
+            } else if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(io_error)?;
+            }
+            publish_restored_file(staged_path, target, *mode)?;
+            published.push(target.clone());
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = publish {
+        for target in &published {
+            if let Some((_, snap)) = originals.iter().find(|(t, _)| t == target) {
+                let _ = fs::copy(snap, target);
+            } else {
+                let _ = fs::remove_file(target);
+            }
+        }
+        return Err(e);
+    }
+
+    log("INFO", restore_log_message(backup_path, requested_contents));
+    Ok(restored_contents)
+}
+
+/// Damaged configs are rejected while still in staging, before any live write (ZK-24).
+fn validate_config_content(content: &str, staged: &Path, target: &Path) -> Result<(), String> {
+    let bytes = fs::read(staged).map_err(io_error)?;
+    if bytes.is_empty() || bytes.contains(&0) {
+        return Err(format!("повреждённый конфиг в архиве: {content}"));
+    }
+    let is_json = content == "zkeen-ui"
+        || target
+            .extension()
+            .and_then(|v| v.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("json"));
+    if is_json {
+        // JSON configs must parse; a broken file must never replace a working one.
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|e| format!("повреждённый JSON в архиве ({content}): {e}"))?;
+    } else {
+        // YAML gets a structural check at apply time (mihomo -t); here require valid UTF-8.
+        std::str::from_utf8(&bytes).map_err(|_| format!("повреждённый конфиг в архиве: {content}"))?;
+    }
+    Ok(())
+}
+
+/// Publish a staged file next to its target: copy + fsync + atomic rename + dir fsync.
+fn publish_restored_file(staged: &Path, target: &Path, mode: u32) -> Result<(), String> {
+    let tmp = target.with_extension("zkeen-restore-tmp");
+    fs::copy(staged, &tmp).map_err(io_error)?;
+    File::open(&tmp).map_err(io_error)?.sync_all().map_err(io_error)?;
+    fs::rename(&tmp, target).map_err(io_error)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(target, fs::Permissions::from_mode(mode));
+    }
+    if let Some(dir) = target.parent() {
+        File::open(dir).map_err(io_error)?.sync_all().map_err(io_error)?;
+    }
     Ok(())
 }
 

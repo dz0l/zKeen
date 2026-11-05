@@ -154,6 +154,7 @@ export function GroupsPoliciesPage({
   const [tab, setTab] = useState<Tab>(forceTab || "groups");
   const [yaml, setYaml] = useState("");
   const [configPath, setConfigPath] = useState("");
+  const [revision, setRevision] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -184,6 +185,7 @@ export function GroupsPoliciesPage({
       const content = data.content;
       setYaml(content);
       setConfigPath(data.path);
+      setRevision(data.revision);
       setPolicyDrafts(parseUserPolicies(content));
       setPoliciesDirty(false);
     } catch (err) {
@@ -229,10 +231,12 @@ export function GroupsPoliciesPage({
         path: configPath,
         content: nextYaml,
         previous: yaml,
+        previousRevision: revision,
         validate: true,
       });
       setClash(res.clash);
       setYaml(nextYaml);
+      if (res.revision) setRevision(res.revision);
     } finally {
       setSaving(false);
     }

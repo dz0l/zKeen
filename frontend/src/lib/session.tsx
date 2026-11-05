@@ -53,6 +53,8 @@ export interface VersionEntry {
   latest?: string;
   outdated?: boolean;
   link?: string;
+  /** Release asset matching this router's arch, verified by the backend checker (ZK-28). */
+  asset?: string;
   /** zkeen-ui only: update channel shared with `zkeen --update`. */
   channel?: "stable" | "beta";
 }

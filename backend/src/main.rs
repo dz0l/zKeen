@@ -26,7 +26,7 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{exit};
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
@@ -72,6 +72,28 @@ enum Command {
     ResetPassword,
     /// Запустить установочный скрипт
     Setup,
+    /// Внутренний watchdog смены порта панели (ZK-29); запускается только самой панелью
+    #[command(hide = true)]
+    PortWatchdog {
+        #[arg(long)]
+        port: u16,
+        #[arg(long)]
+        backup: PathBuf,
+    },
+    /// Внутренний watchdog self-update (ZK-21); запускается только самой панелью
+    #[command(hide = true)]
+    SelfUpdateWatchdog {
+        #[arg(long)]
+        rollback: PathBuf,
+        #[arg(long)]
+        target: PathBuf,
+        #[arg(long)]
+        port: u16,
+        #[arg(long)]
+        expect_version: String,
+        #[arg(long)]
+        marker: PathBuf,
+    },
 }
 
 const ZKEEN_UI_INIT_CONTENT: &str = r#"#!/bin/sh
@@ -285,6 +307,22 @@ async fn main() {
 
     if let Some(command) = cli.command {
         match command {
+            Command::PortWatchdog { port, backup } => {
+                let ok = panel::run_port_watchdog(port, &backup).await.is_ok();
+                exit(if ok { 0 } else { 1 });
+            }
+            Command::SelfUpdateWatchdog {
+                rollback,
+                target,
+                port,
+                expect_version,
+                marker,
+            } => {
+                let ok = updater::run_self_update_watchdog(&rollback, &target, port, &expect_version, &marker)
+                    .await
+                    .is_ok();
+                exit(if ok { 0 } else { 1 });
+            }
             Command::Setup => {
                 eprintln!("{}", " Setup скрипт будет доступен в следующих версиях".yellow().bold());
                 exit(0);
@@ -453,6 +491,7 @@ async fn main() {
             post(configs::bootstrap_mihomo_config),
         )
         .route("/api/configs/validate", post(configs::validate_config))
+        .route("/api/configs/apply", post(configs::post_config_apply))
         .route(
             "/api/configs",
             get(configs::get_configs)
@@ -499,8 +538,12 @@ async fn main() {
             }
         }));
 
+    // Restore the persisted update operation first (ZK-34): a still-running self-update
+    // with a pending marker stays "running" so recovery below can commit its outcome.
+    updater::load_persisted_status().await;
     // Finish core updates interrupted by power loss / crash before accepting traffic.
     updater::recover_interrupted_core_updates().await;
+    updater::recover_interrupted_self_update().await;
 
     let unsecure_api = Router::new()
         .route("/api/health", get(panel::get_health))
@@ -554,7 +597,7 @@ fn detect_core(init_file: Option<&str>) -> CoreInfo {
     }
 }
 
-fn load_settings() -> AppSettings {
+pub(crate) fn load_settings() -> AppSettings {
     let (content, path) = match std::fs::read_to_string(APP_CONFIG) {
         Ok(c) => (c, APP_CONFIG),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

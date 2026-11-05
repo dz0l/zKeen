@@ -123,6 +123,8 @@ pub struct UpdateChecker {
     pub last_core_toast: Arc<RwLock<Option<Instant>>>,
     pub ui_latest_tag: Arc<RwLock<Option<String>>>,
     pub core_latest_tag: Arc<RwLock<Option<String>>>,
+    /// Verified release asset name for the current core's latest tag (ZK-28).
+    pub core_latest_asset: Arc<RwLock<Option<String>>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -290,7 +292,9 @@ pub struct UpdateReq {
     pub core: String,
     pub version: String,
     /// Ignored: permanent core-backup is never created; only transactional `.zkeen-rollback`.
+    /// Retained so older frontends sending `backup_core` still deserialize.
     #[serde(default)]
+    #[allow(dead_code)]
     pub backup_core: bool,
     #[serde(default)]
     pub assets: Vec<String>,

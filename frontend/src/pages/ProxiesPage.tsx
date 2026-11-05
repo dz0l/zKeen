@@ -408,6 +408,7 @@ export function ProxiesPage() {
         path: loaded.path,
         content: updated,
         previous: loaded.content,
+        previousRevision: loaded.revision,
         validate: true,
         hardRestart: bootstrapped,
       });
@@ -515,6 +516,7 @@ export function ProxiesPage() {
             path: loaded.path,
             content: updated,
             previous: loaded.content,
+            previousRevision: loaded.revision,
             validate: false,
           });
           journal({ id: newOpId(), op: "mode", from: coreMode, to: value, result: "ok" });

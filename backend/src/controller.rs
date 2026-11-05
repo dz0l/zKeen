@@ -6,10 +6,8 @@ use nix::sys::resource::{Resource, setrlimit};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::{Gid, Pid, setgid, setsid};
 use serde::Deserialize;
-use std::fs::Permissions;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use tokio::fs::{self, set_permissions};
+use tokio::fs;
 use tokio::process::Command;
 
 #[derive(Deserialize)]
@@ -69,21 +67,33 @@ async fn resolve_init_file(state: &AppState) -> Result<String, String> {
     Ok(new_path)
 }
 
+/// Hard cap for a single init invocation; a hung rc.func must not pin the API (ZK-19).
+const INIT_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
 pub async fn run_init_command(state: &AppState, args: &[&str]) -> Result<(), String> {
     let path = resolve_init_file(state).await?;
-    let result = if let Ok(f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(error_log_path())
-    {
-        Command::new(&path)
-            .args(args)
-            .stdout(f.try_clone().unwrap())
-            .stderr(f)
-            .status()
-            .await
-    } else {
-        Command::new(&path).args(args).status().await
+    let run = async {
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(error_log_path())
+        {
+            Command::new(&path)
+                .args(args)
+                .stdout(f.try_clone().unwrap())
+                .stderr(f)
+                .status()
+                .await
+        } else {
+            Command::new(&path).args(args).status().await
+        }
+    };
+    let result = match tokio::time::timeout(INIT_CMD_TIMEOUT, run).await {
+        Ok(r) => r,
+        Err(_) => {
+            log("ERROR", format!("Init {} {:?} завис ({} с)", path, args, INIT_CMD_TIMEOUT.as_secs()));
+            return Err(format!("init_failed:{}:timeout", path));
+        }
     };
     match result {
         Err(e) => {
@@ -117,6 +127,37 @@ pub async fn wait_core_running(core: &str, attempts: u32, delay_ms: u64) -> Resu
     Err(format!("restart_failed:{}:no_pid", core))
 }
 
+/// Wait until no `core` process remains; exit 0 from init stop alone is not proof (ZK-19).
+async fn wait_core_stopped(core: &str, attempts: u32, delay_ms: u64) -> Result<(), String> {
+    for _ in 0..attempts {
+        let name = core.to_string();
+        let pids = tokio::task::spawn_blocking(move || get_pid(&name))
+            .await
+            .unwrap_or_default();
+        if pids.is_empty() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    }
+    Err(format!("stop_failed:{}:still_running", core))
+}
+
+/// Wait until `core` runs with a PID that is not one of `previous`; a lingering old
+/// process must not confirm a restart it never performed (ZK-19).
+async fn wait_core_new_pid(core: &str, previous: &[i32], attempts: u32, delay_ms: u64) -> Result<(), String> {
+    for _ in 0..attempts {
+        let name = core.to_string();
+        let pids = tokio::task::spawn_blocking(move || get_pid(&name))
+            .await
+            .unwrap_or_default();
+        if pids.iter().any(|p| !previous.contains(p)) {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    }
+    Err(format!("restart_failed:{}:no_new_pid", core))
+}
+
 fn get_core_info(name: &str) -> CoreInfo {
     match name {
         "mihomo" => CoreInfo {
@@ -147,8 +188,9 @@ pub fn get_pid(name: &str) -> Vec<i32> {
 }
 
 pub async fn soft_restart(core: &str) -> Result<(), String> {
-    for pid in get_pid(core) {
-        _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+    let previous = get_pid(core);
+    for pid in &previous {
+        _ = kill(Pid::from_raw(*pid), Signal::SIGKILL);
     }
 
     let mut cmd = Command::new(core);
@@ -195,7 +237,7 @@ pub async fn soft_restart(core: &str) -> Result<(), String> {
         }
     }
 
-    wait_core_running(core, 20, 250).await
+    wait_core_new_pid(core, &previous, 20, 250).await
 }
 
 pub async fn get_control(State(state): State<AppState>) -> impl IntoResponse {
@@ -316,11 +358,29 @@ async fn check_core_config(core: &str) -> Result<(), String> {
 pub async fn post_control(State(state): State<AppState>, Json(req): Json<ControlReq>) -> impl IntoResponse {
     match req.action.as_str() {
         "switchCore" => {
+            // Allowlist first: the name is interpolated into the init script below (ZK-19/ZK-27).
+            if req.core != "xray" && req.core != "mihomo" {
+                return Json(ApiResponse {
+                    success: false,
+                    error: Some("unknown_core".into()),
+                    data: None,
+                });
+            }
             let old = state.core.read().unwrap().name.clone();
             if old == req.core {
                 return Json(ApiResponse {
                     success: true,
                     error: None,
+                    data: None,
+                });
+            }
+
+            // Validate the target config BEFORE touching the running core.
+            if let Err(e) = check_core_config(&req.core).await {
+                log("ERROR", e);
+                return Json(ApiResponse {
+                    success: false,
+                    error: Some("start_failed".into()),
                     data: None,
                 });
             }
@@ -335,27 +395,47 @@ pub async fn post_control(State(state): State<AppState>, Json(req): Json<Control
                     });
                 }
             };
-            _ = Command::new(&init_file).arg("stop").status().await;
 
-            if let Ok(content) = fs::read_to_string(&init_file).await {
-                let new_content = content.replace(
-                    &format!("name_client=\"{}\"", old),
-                    &format!("name_client=\"{}\"", req.core),
-                );
-                _ = fs::write(&init_file, new_content).await;
-                _ = set_permissions(&init_file, Permissions::from_mode(0o755)).await;
-            }
-
-            *state.core.write().unwrap() = get_core_info(&req.core);
-
-            if let Err(e) = check_core_config(&req.core).await {
-                log("ERROR", e);
+            // Stop must be confirmed: exit code AND a dead old PID, before any state change (ZK-19).
+            if let Err(e) = run_init_command(&state, &["stop"]).await {
                 return Json(ApiResponse {
                     success: false,
-                    error: Some("start_failed".into()),
+                    error: Some(e),
                     data: None,
                 });
             }
+            if let Err(e) = wait_core_stopped(&old, 20, 250).await {
+                return Json(ApiResponse {
+                    success: false,
+                    error: Some(e),
+                    data: None,
+                });
+            }
+
+            match fs::read_to_string(&init_file).await {
+                Ok(content) => {
+                    let new_content = content.replace(
+                        &format!("name_client=\"{}\"", old),
+                        &format!("name_client=\"{}\"", req.core),
+                    );
+                    if let Err(e) = crate::panel::write_file_atomic(&init_file, &new_content, 0o755).await {
+                        return Json(ApiResponse {
+                            success: false,
+                            error: Some(e),
+                            data: None,
+                        });
+                    }
+                }
+                Err(e) => {
+                    return Json(ApiResponse {
+                        success: false,
+                        error: Some(format!("read_init_failed:{e}")),
+                        data: None,
+                    });
+                }
+            }
+
+            *state.core.write().unwrap() = get_core_info(&req.core);
 
             if req.core != "xray" {
                 _ = fs::write(error_log_path(), b"").await;
@@ -437,14 +517,10 @@ pub async fn post_control(State(state): State<AppState>, Json(req): Json<Control
                     });
                 }
             } else if action == "stop" {
-                let name = cur_name.clone();
-                let still = tokio::task::spawn_blocking(move || get_pid(&name))
-                    .await
-                    .unwrap_or_default();
-                if !still.is_empty() {
+                if let Err(e) = wait_core_stopped(&cur_name, 10, 200).await {
                     return Json(ApiResponse {
                         success: false,
-                        error: Some(format!("stop_failed:{}:still_running", cur_name)),
+                        error: Some(e),
                         data: None,
                     });
                 }
@@ -473,6 +549,15 @@ pub async fn post_control(State(state): State<AppState>, Json(req): Json<Control
         }
         "restartXkeen" => {
             if let Err(e) = run_init_command(&state, &["restart", "on"]).await {
+                return Json(ApiResponse {
+                    success: false,
+                    error: Some(e),
+                    data: None,
+                });
+            }
+            // exit 0 alone is not proof: confirm the expected core is actually running (ZK-19).
+            let cur_name = state.core.read().unwrap().name.clone();
+            if let Err(e) = wait_core_running(&cur_name, 20, 250).await {
                 return Json(ApiResponse {
                     success: false,
                     error: Some(e),

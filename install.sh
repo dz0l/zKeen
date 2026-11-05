@@ -81,6 +81,7 @@ save_channel() {
 }
 
 # Re-fetch and re-exec with /dev/tty so XKeen interactive menus work over SSH.
+# The re-fetched file is executed, so it must pass TLS verification: no -k fallback (ZK-06).
 if [ -z "${ZKEEN_INSTALL_REEXEC:-}" ] && [ ! -t 0 ]; then
     if [ -c /dev/tty ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
         _reexec_dir="/opt/tmp"
@@ -89,17 +90,14 @@ if [ -z "${ZKEEN_INSTALL_REEXEC:-}" ] && [ ! -t 0 ]; then
         if command -v curl >/dev/null 2>&1; then
             if curl -fsSL --connect-timeout 15 --max-time 60 \
                 "https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/install.sh" \
-                -o "$_reexec_script" 2>/dev/null \
-                || curl -fsSLk --connect-timeout 15 --max-time 60 \
-                "https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/install.sh" \
-                -o "$_reexec_script" 2>/dev/null; then
-                if [ -s "$_reexec_script" ]; then
-                    chmod +x "$_reexec_script"
-                    export ZKEEN_INSTALL_REEXEC=1
-                    # shellcheck disable=SC2094
-                    exec sh "$_reexec_script" "$@" </dev/tty
-                fi
+                -o "$_reexec_script" 2>/dev/null && [ -s "$_reexec_script" ]; then
+                chmod +x "$_reexec_script"
+                export ZKEEN_INSTALL_REEXEC=1
+                # shellcheck disable=SC2094
+                exec sh "$_reexec_script" "$@" </dev/tty
             fi
+            rm -f "$_reexec_script" 2>/dev/null || true
+            log_warn "TLS-verified re-fetch failed; continuing without interactive TTY. Check CA: opkg install ca-certificates"
         fi
     fi
 fi
@@ -268,28 +266,35 @@ check_repo_available() {
 
 # Pick newest GitHub pre-release (BusyBox-safe: no jq, no awk multi-char RS).
 # Prefer "prerelease": true; fallback: tag name contains -beta / -rc / -alpha.
+# Order-aware: splitting on '{' loses tag_name in pretty-printed JSON because
+# nested author{}/assets[] blocks come between tag_name and prerelease (S02).
+# GitHub always emits tag_name before prerelease, so walk matched tokens in order.
 pick_beta_tag_from_list() {
     _list="$1"
     LATEST_TAG=""
 
-    # Split objects on '{' — works on BusyBox ash/awk/sed.
-    # Pass 1: official prerelease flag
-    LATEST_TAG=$(printf '%s' "$_list" | tr '{' '\n' | while IFS= read -r _block; do
-        [ -n "$_block" ] || continue
-        printf '%s' "$_block" | grep -q '"prerelease"[[:space:]]*:[[:space:]]*true' || continue
-        _tag=$(printf '%s' "$_block" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-        if [ -n "$_tag" ]; then
-            printf '%s\n' "$_tag"
-            break
-        fi
-    done)
+    # Pass 1: official prerelease flag, honouring document order of tag_name.
+    LATEST_TAG=$(printf '%s' "$_list" | tr '\n' ' ' | \
+        grep -oE '"(tag_name|prerelease)"[[:space:]]*:[[:space:]]*("[^"]*"|true|false)' | \
+        awk '
+            /"tag_name"/ {
+                sub(/.*"tag_name"[[:space:]]*:[[:space:]]*"/, "")
+                sub(/".*/, "")
+                tag = $0
+                next
+            }
+            /"prerelease"[[:space:]]*:[[:space:]]*true/ {
+                if (tag != "") { print tag; exit }
+            }
+        ')
 
     if [ -n "$LATEST_TAG" ]; then
         return 0
     fi
 
     # Pass 2: tag-name heuristic (CI marks -beta/-rc/-alpha as Pre-release)
-    LATEST_TAG=$(printf '%s' "$_list" | tr '{' '\n' | \
+    LATEST_TAG=$(printf '%s' "$_list" | tr '\n' ' ' | \
+        grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | \
         sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | \
         grep -E '\-(beta|rc|alpha)' | head -1)
 }
