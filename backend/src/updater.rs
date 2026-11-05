@@ -1429,18 +1429,35 @@ pub async fn run_self_update_watchdog(
 
 /// Stage the watchdog from the verified NEW binary and spawn it before the running
 /// process is replaced; returns the child so the caller can kill it on abort.
+/// The staging is a hard link, not a copy: on a small UBIFS a second ~20 MiB copy of
+/// the panel binary is what pushes self-update into no_space (router with ~40 MiB free).
 async fn spawn_self_update_watchdog(
     source: &Path,
     port: u16,
     expect_version: &str,
 ) -> Result<(tokio::process::Child, PathBuf), String> {
-    let staged_len = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
-    ensure_free_space(&[OPT_TMP], staged_len.saturating_add(UPDATE_WORK_RESERVE))?;
     let copy = PathBuf::from(format!("{OPT_TMP}/{SELF_WATCHDOG_PREFIX}{}", std::process::id()));
     let src = source.to_path_buf();
     let dst = copy.clone();
     tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        std::fs::copy(&src, &dst)?;
+        match std::fs::hard_link(&src, &dst) {
+            Ok(()) => {}
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(code)
+                        if code == nix::libc::EPERM
+                            || code == nix::libc::ENOSYS
+                            || code == nix::libc::EOPNOTSUPP
+                            || code == nix::libc::EXDEV
+                ) =>
+            {
+                // FS does not support hard links: fall back to a real copy
+                // (ENOSPC surfaces from the copy itself as no_space).
+                std::fs::copy(&src, &dst)?;
+            }
+            Err(e) => return Err(e),
+        }
         std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))?;
         std::fs::File::open(&dst)?.sync_all()
     })

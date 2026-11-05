@@ -1,6 +1,7 @@
 # === Local working files ===
 .local/
 refs/
+local.*
 
 # === Dependencies ===
 node_modules/
